@@ -59,8 +59,9 @@ from engine import (
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s',
+    level=logging.DEBUG,
+    format='%(asctime)s.%(msecs)03d  %(levelname)-5s  %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
         logging.FileHandler(os.path.join(os.path.dirname(__file__), 'bot.log')),
         logging.StreamHandler(sys.stdout),
@@ -1117,9 +1118,13 @@ class Dashboard(ctk.CTkFrame):
 
     # ── Logging (thread-safe) ─────────────────────────────────────────────────
     def log_message(self, message: str, level="info"):
-        ts    = datetime.now(pytz.UTC).strftime("%H:%M:%S")
-        entry = f"[{ts}] {message}\n"
-        logger.info(f"[{level.upper()}] {message}")
+        now   = datetime.now(pytz.UTC)
+        ts_ui = now.strftime("%H:%M:%S")
+        entry = f"[{ts_ui}] {message}\n"
+        # Write to bot.log with full date + ms and level tag
+        log_fn = {"error": logger.error, "warn": logger.warning,
+                  "trade": logger.info,  "info":  logger.info}.get(level, logger.info)
+        log_fn(f"[{level.upper():<5}] {message}")
         cmap  = {"error": C_RED, "warn": C_ORANGE, "trade": C_GREEN, "info": C_TEXT}
         color = cmap.get(level, C_TEXT)
         self._all_logs.append((entry, color, level))
@@ -2683,12 +2688,18 @@ class Dashboard(ctk.CTkFrame):
             raw   = resp.to_dict()
             usd   = 0.0
             pair_coins = {p.split('-')[0]: p for p in TRADING_PAIRS}
+            coin_log   = []
 
             # C3 fix: zero all pairs first so externally-sold coins clear properly
             for p in TRADING_PAIRS:
                 self.real_exposure[p] = 0.0
 
-            for a in raw.get('accounts', []):
+            accounts = raw.get('accounts', [])
+            if not accounts:
+                self.log_message("Balance fetch returned empty accounts list — skipping update", "warn")
+                return
+
+            for a in accounts:
                 cur = a.get('currency', '')
                 val = float(a.get('available_balance', {}).get('value', 0) or 0)
                 if cur in ('USD', 'USDC', 'USDT'):
@@ -2696,15 +2707,27 @@ class Dashboard(ctk.CTkFrame):
                 elif cur in pair_coins:
                     pair  = pair_coins[cur]
                     price = self.live_prices.get(pair, 0)
-                    if price > 0:   # C4-adjacent: skip if price feed not yet ready
+                    if price > 0:
                         self.real_exposure[pair] = val * price
+                        coin_log.append(f"{cur}={val:.4f} (${val*price:,.2f})")
+                    else:
+                        coin_log.append(f"{cur}={val:.4f} (price unknown)")
 
             self.usd_balance = usd
+            coin_str = "  |  ".join(coin_log) if coin_log else "none"
+            self.log_message(
+                f"Balance sync:  USD=${usd:,.2f}  |  Coins: {coin_str}  |  "
+                f"bot_balance=${self.bot_balance:.2f}  "
+                f"bot_alloc=${sum(self.bot_pair_alloc.values()):.2f}  "
+                f"bot_exposure=${sum(self.bot_exposure.values()):.2f}  "
+                f"bot_coin_qty={ {p.split('-')[0]: round(v,2) for p,v in self.bot_coin_qty.items() if v>0} }",
+                "info")
             if self.root_alive:
                 self.root.after(0, self._update_metrics)
                 self.root.after(0, self._update_pair_cards)
         except Exception as e:
             self.log_message(f"Balance error: {e}", "warn")
+            logger.error(traceback.format_exc())
 
     # ── Candles ───────────────────────────────────────────────────────────────
     async def _candles_loop(self):
@@ -2758,18 +2781,29 @@ class Dashboard(ctk.CTkFrame):
             if len(all_candles) < target:
                 await asyncio.sleep(0.35)  # rate-limit between batch calls
 
-        if all_candles and self.root_alive:
-            self.root.after(0, self._ingest_candles, pair, all_candles, timeframe)
+        if all_candles:
+            span_from = datetime.fromtimestamp(all_candles[0][0]/1000 if isinstance(all_candles[0], list) else all_candles[0]['start'] if isinstance(all_candles[0], dict) else 0, pytz.UTC).strftime('%Y-%m-%d %H:%M')
+            span_to   = datetime.fromtimestamp(all_candles[-1][0]/1000 if isinstance(all_candles[-1], list) else all_candles[-1]['start'] if isinstance(all_candles[-1], dict) else 0, pytz.UTC).strftime('%Y-%m-%d %H:%M')
+            self.log_message(
+                f"Candles fetched  {pair}/{timeframe}  "
+                f"count={len(all_candles)}  span={span_from} → {span_to}", "info")
+            if self.root_alive:
+                self.root.after(0, self._ingest_candles, pair, all_candles, timeframe)
 
     def _ingest_candles(self, pair: str, candles: list, timeframe: str):
         ha       = heikin_ashi(candles)
         if not ha:
+            self.log_message(f"Candle ingest  {pair}/{timeframe}  heikin_ashi returned empty — skipped", "warn")
             return
         existing = self.candle_history[timeframe][pair]
         last_ts  = existing[-1][0] if existing else 0
         new_ones = [c for c in ha if c[0] > last_ts]
         if new_ones:
             existing.extend(new_ones)
+        self.log_message(
+            f"Candle ingest  {pair}/{timeframe}  "
+            f"raw={len(candles)}  ha={len(ha)}  new={len(new_ones)}  "
+            f"total_stored={len(existing)}", "info")
 
         if len(ha) >= 2:
             op, np_ = ha[0][4], ha[-1][4]
@@ -2799,29 +2833,58 @@ class Dashboard(ctk.CTkFrame):
             _can_sell = (self.bot_exposure[pair] > 0
                          or self.bot_coin_qty.get(pair, 0) > 0)
             cap = _can_buy or _can_sell
+            # Log capital state on every signal-TF candle close for full traceability
+            self.log_message(
+                f"Candle close  {pair}/{timeframe}  "
+                f"can_buy={_can_buy}  can_sell={_can_sell}  locked={self.order_locks[pair]}  "
+                f"bot_balance=${self.bot_balance:.2f}  "
+                f"pair_alloc=${self.bot_pair_alloc.get(pair,0):.2f}  "
+                f"exposure=${self.bot_exposure[pair]:.2f}  "
+                f"coin_qty={self.bot_coin_qty.get(pair,0):.2f}  "
+                f"live_price={format_price(self.live_prices.get(pair,0))}  "
+                f"direction={self.signal_direction}",
+                "info")
             if cap and not self.order_locks[pair]:
                 conf_candles = list(self.candle_history[conf_tf][pair])
                 sig = (self.strategy.calculate_signals(pair, ha, conf_candles) or
                        self.strategy.calculate_breakout(pair, ha))
+                raw_sig = sig['action'] if sig else 'none'
                 # Filter by user's signal direction setting
                 if sig and self.signal_direction == 'Buy Only'  and sig['action'] != 'buy':
                     sig = None
                 if sig and self.signal_direction == 'Sell Only' and sig['action'] != 'sell':
                     sig = None
-                # Drop signals for which we have no matching capital — avoids
-                # "No funds" log spam and unnecessary order lock cycles.
+                # Drop signals for which we have no matching capital
                 if sig and sig['action'] == 'buy'  and not _can_buy:
+                    self.log_message(
+                        f"Signal {pair} BUY suppressed — no USD capital  "
+                        f"(bot_balance=${self.bot_balance:.2f}  pair_alloc=${self.bot_pair_alloc.get(pair,0):.2f}  reserve=${MINIMUM_RESERVE:.2f})",
+                        "warn")
                     sig = None
                 if sig and sig['action'] == 'sell' and not _can_sell:
+                    self.log_message(
+                        f"Signal {pair} SELL suppressed — no coin holdings  "
+                        f"(exposure=${self.bot_exposure[pair]:.2f}  coin_qty={self.bot_coin_qty.get(pair,0):.2f})",
+                        "warn")
                     sig = None
+                if not sig and raw_sig != 'none':
+                    self.log_message(
+                        f"Signal {pair} {raw_sig.upper()} filtered  "
+                        f"direction={self.signal_direction}  can_buy={_can_buy}  can_sell={_can_sell}",
+                        "info")
                 if sig:
                     self.order_locks[pair] = True
                     self._last_signal_source = sig['source']
                     self.log_message(
-                        f"Signal [{sig['source']}] {sig['action'].upper()} {pair} "
-                        f"@ {format_price(sig['price'])}", "trade")
+                        f"► SIGNAL [{sig['source']}] {sig['action'].upper()} {pair} "
+                        f"@ {format_price(sig['price'])}  "
+                        f"conf_candles={len(conf_candles)}  tf={timeframe}→{conf_tf}",
+                        "trade")
                     asyncio.run_coroutine_threadsafe(
                         self._place_order(pair, sig['action']), self.loop)
+            elif self.order_locks[pair]:
+                self.log_message(
+                    f"Signal check skipped — {pair} order lock active", "info")
 
         # Auto-refresh chart if this pair/tf is selected
         if self.root_alive:
@@ -2859,8 +2922,12 @@ class Dashboard(ctk.CTkFrame):
                             "channel":     channel,
                             "jwt":         jwt,
                         }))
-                    self.log_message("WebSocket connected — live prices active", "trade")
+                    self.log_message(
+                        f"WebSocket connected  url={COINBASE_WS_URL}  "
+                        f"pairs={TRADING_PAIRS}  channels=[ticker, ticker_batch]", "trade")
 
+                    _ws_ticks = 0
+                    _ws_last_log = time.time()
                     while self.running:
                         try:
                             raw  = await asyncio.wait_for(ws.recv(), timeout=30)
@@ -2880,25 +2947,45 @@ class Dashboard(ctk.CTkFrame):
                                     pid   = tick.get("product_id", "")
                                     price = tick.get("price", "")
                                     if pid in TRADING_PAIRS and price:
-                                        p = float(price)
+                                        try:
+                                            p = float(price)
+                                        except ValueError:
+                                            self.log_message(
+                                                f"WS bad price value '{price}' for {pid} — skipping tick", "warn")
+                                            continue
                                         self.live_prices[pid] = p
                                         self._price_ts[pid]   = time.time()
                                         self.price_history[pid].append(p)
+                                        _ws_ticks += 1
                                         if self.root_alive:
                                             self.root.after(0, self._update_pair_cards)
-                                        # Surge detection only on fresh trades (ticker),
-                                        # not on ticker_batch heartbeats (no new trade info)
                                         if chan == "ticker":
                                             await self._check_surge(pid)
 
+                            # Log WS tick rate every 60s
+                            _now = time.time()
+                            if _now - _ws_last_log >= 60:
+                                prices_str = "  ".join(
+                                    f"{p.split('-')[0]}={format_price(self.live_prices.get(p,0))}"
+                                    f"({time.time()-self._price_ts.get(p,0):.0f}s ago)"
+                                    for p in TRADING_PAIRS)
+                                self.log_message(
+                                    f"WS heartbeat  ticks_last_60s={_ws_ticks}  {prices_str}",
+                                    "info")
+                                _ws_ticks = 0
+                                _ws_last_log = _now
+
                         except asyncio.TimeoutError:
+                            self.log_message("WS recv timeout — sending ping", "info")
                             await ws.ping()
                         except Exception as e:
                             self.log_message(f"WS recv error: {e}", "warn")
+                            logger.error(traceback.format_exc())
                             break
 
             except Exception as e:
                 self.log_message(f"WS disconnected: {e} — reconnect in 5s", "warn")
+                logger.error(traceback.format_exc())
                 await asyncio.sleep(5)
 
     # ── REST price poll fallback (catches pairs WS misses) ────────────────────
@@ -2959,61 +3046,89 @@ class Dashboard(ctk.CTkFrame):
         move = (newest - oldest) / oldest   # signed % move
         if abs(move) < SURGE_PCT:
             return
-        # Cooldown — don't fire repeatedly during a sustained trend
         now = time.time()
-        if now - self.surge_last_time[pair] < SURGE_COOLDOWN:
-            return
-        # Need capital, an open position, or coin holdings handed to the bot
-        pair_cap = (self.bot_pair_alloc.get(pair, 0) >= MINIMUM_RESERVE
-                    or self.bot_balance >= MINIMUM_RESERVE)
+        action = 'buy' if move > 0 else 'sell'
+        pair_cap     = (self.bot_pair_alloc.get(pair, 0) >= MINIMUM_RESERVE
+                        or self.bot_balance >= MINIMUM_RESERVE)
         has_exposure = self.bot_exposure[pair] > 0
         has_coins    = self.bot_coin_qty.get(pair, 0) > 0
+        last_ts      = self.surge_last_buy[pair] if action == 'buy' else self.surge_last_sell[pair]
+        cd_remaining = max(0, SURGE_COOLDOWN - (now - last_ts))
+
+        # Log every surge candidate so we know why it was blocked or passed
+        self.log_message(
+            f"Surge candidate  {pair}  move={move*100:+.2f}%  ({SURGE_PCT*100:.1f}% threshold)  "
+            f"action={action}  oldest={format_price(oldest)}  newest={format_price(newest)}  "
+            f"pair_cap={pair_cap}  has_exposure={has_exposure}  has_coins={has_coins}  "
+            f"locked={self.order_locks[pair]}  cd_remaining={cd_remaining:.0f}s  "
+            f"direction={self.signal_direction}", "info")
+
         if not (pair_cap or has_exposure or has_coins):
+            self.log_message(f"Surge {pair} blocked — no capital/coins", "info")
             return
         if self.order_locks[pair]:
+            self.log_message(f"Surge {pair} blocked — order lock active", "info")
             return
-
-        action = 'buy' if move > 0 else 'sell'
-
-        # H3 fix: per-direction cooldown so a buy surge doesn't block a crash signal
-        last_ts = self.surge_last_buy[pair] if action == 'buy' else self.surge_last_sell[pair]
-        if now - last_ts < SURGE_COOLDOWN:
+        if cd_remaining > 0:
+            self.log_message(
+                f"Surge {pair} blocked — {action} cooldown {cd_remaining:.0f}s remaining", "info")
             return
 
         # Reversal guard: require majority of last 5 ticks to match direction
-        # (M2 fix: don't cancel on a single contrary tick)
         if len(ticks) >= 5:
             recent = ticks[-5:]
             dirs   = [recent[i] - recent[i-1] for i in range(1, len(recent))]
             bull   = sum(1 for d in dirs if d > 0)
             bear   = sum(1 for d in dirs if d < 0)
-            if action == 'buy'  and bear > bull:
-                return   # momentum has reversed
+            if action == 'buy' and bear > bull:
+                self.log_message(
+                    f"Surge {pair} BUY blocked — reversal guard  bull={bull} bear={bear}  "
+                    f"ticks={[round(t,8) for t in recent]}", "info")
+                return
             if action == 'sell' and bull > bear:
-                return   # momentum has reversed
+                self.log_message(
+                    f"Surge {pair} SELL blocked — reversal guard  bull={bull} bear={bear}  "
+                    f"ticks={[round(t,8) for t in recent]}", "info")
+                return
+
+        if self.signal_direction == 'Buy Only'  and action != 'buy':
+            self.log_message(f"Surge {pair} {action.upper()} blocked — direction=Buy Only", "info")
+            return
+        if self.signal_direction == 'Sell Only' and action != 'sell':
+            self.log_message(f"Surge {pair} {action.upper()} blocked — direction=Sell Only", "info")
+            return
 
         if action == 'buy':
             self.surge_last_buy[pair]  = now
         else:
             self.surge_last_sell[pair] = now
         self.order_locks[pair] = True
-        # Filter by signal direction setting
-        if self.signal_direction == 'Buy Only'  and action != 'buy':  return
-        if self.signal_direction == 'Sell Only' and action != 'sell': return
 
         self._last_signal_source = f"Surge⚡ {move*100:+.1f}%"
         self.log_message(
-            f"⚡ SURGE {'+' if move > 0 else ''}{move*100:.1f}%  "
-            f"{action.upper()} {pair}  @ {format_price(newest)}", "trade")
+            f"⚡ SURGE FIRING  {action.upper()} {pair}  "
+            f"move={move*100:+.2f}%  oldest={format_price(oldest)}→newest={format_price(newest)}  "
+            f"window={SURGE_WINDOW} ticks  bot_balance=${self.bot_balance:.2f}  "
+            f"coin_qty={self.bot_coin_qty.get(pair,0):.2f}", "trade")
         asyncio.create_task(self._place_order(pair, action))
 
     # ── Trade monitor ─────────────────────────────────────────────────────────
     async def _monitor_loop(self):
+        _monitor_tick = 0
         while self.running:
             try:
-                for tid, trade in list(self.trade_history.items()):
-                    if trade.get('event') != 'trade':
-                        continue
+                _monitor_tick += 1
+                active = [(tid, t) for tid, t in self.trade_history.items()
+                          if t.get('event') == 'trade']
+                # Log position summary every 12 ticks (~60s) or when positions exist
+                if active and _monitor_tick % 12 == 0:
+                    self.log_message(
+                        f"Monitor heartbeat — {len(active)} open position(s)  "
+                        f"bot_balance=${self.bot_balance:.2f}  "
+                        f"bot_exposure=${ sum(self.bot_exposure.values()):.2f }  "
+                        f"coin_qty={ {p.split('-')[0]:round(v,2) for p,v in self.bot_coin_qty.items() if v>0} }",
+                        "info")
+                for tid, trade in active:
                     pair  = trade['symbol']
                     cur   = self.live_prices.get(pair) or trade['current_price']
                     entry = trade['entry_price']
@@ -3028,36 +3143,59 @@ class Dashboard(ctk.CTkFrame):
 
                     # ── Trailing stop ───────────────────────────────────────
                     hit_trail = False
+                    trail_active = False
                     if trade['side'] == 'buy':
                         peak = max(trade.get('peak_price', entry), cur)
                         trade['peak_price'] = peak
                         trail_sl = peak * (1 - TRAIL_STOP_PCT)
-                        # Only activate once we're meaningfully in profit (>1%)
                         if peak > entry * 1.01:
                             trade['stop_loss'] = max(orig_sl, trail_sl)
-                            hit_trail = cur <= trail_sl
+                            hit_trail   = cur <= trail_sl
+                            trail_active = True
                     else:
                         trough = min(trade.get('peak_price', entry), cur)
                         trade['peak_price'] = trough
                         trail_sl = trough * (1 + TRAIL_STOP_PCT)
                         if trough < entry * 0.99:
                             trade['stop_loss'] = min(orig_sl, trail_sl)
-                            hit_trail = cur >= trail_sl
+                            hit_trail   = cur >= trail_sl
+                            trail_active = True
 
-                    # Use trade['stop_loss'] (may have been updated by trail above)
                     cur_sl = trade['stop_loss']
                     hit_sl = (trade['side'] == 'buy'  and cur <= cur_sl) or \
                              (trade['side'] == 'sell' and cur >= cur_sl)
                     hit_tp = (trade['side'] == 'buy'  and cur >= orig_tp) or \
                              (trade['side'] == 'sell' and cur <= orig_tp)
 
+                    # Log every position on every tick for full traceability
+                    trail_str = (f"  trail_sl={format_price(trail_sl)}"
+                                 f"  peak={format_price(trade.get('peak_price',entry))}"
+                                 if trail_active else "  trail=inactive")
+                    self.log_message(
+                        f"Monitor  {trade['side'].upper()} {pair}  "
+                        f"qty={trade['quantity']:.4f}  "
+                        f"entry={format_price(entry)}  cur={format_price(cur)}  "
+                        f"P&L=${pl:+.4f}  "
+                        f"SL={format_price(cur_sl)}  TP={format_price(orig_tp)}"
+                        f"{trail_str}  "
+                        f"hit_sl={hit_sl}  hit_tp={hit_tp}  hit_trail={hit_trail}",
+                        "info")
+
                     if hit_trail:
                         peak_str = format_price(trade.get('peak_price', cur))
+                        self.log_message(
+                            f"► TRAIL STOP firing  {pair}  cur={format_price(cur)}  "
+                            f"trail_sl={format_price(trail_sl)}  peak={peak_str}", "trade")
                         await self._close_trade(
                             tid, cur, f"Trailing Stop  (peak {peak_str})")
                     elif hit_sl or hit_tp:
-                        await self._close_trade(
-                            tid, cur, "Stop Loss" if hit_sl else "Take Profit")
+                        reason = "Stop Loss" if hit_sl else "Take Profit"
+                        self.log_message(
+                            f"► {reason.upper()} firing  {pair}  "
+                            f"cur={format_price(cur)}  "
+                            f"SL={format_price(cur_sl)}  TP={format_price(orig_tp)}  "
+                            f"entry={format_price(entry)}  P&L=${pl:+.4f}", "trade")
+                        await self._close_trade(tid, cur, reason)
 
                 if self.root_alive:
                     self.root.after(0, self._refresh_trade_rows)
@@ -3067,6 +3205,7 @@ class Dashboard(ctk.CTkFrame):
                 break
             except Exception as e:
                 self.log_message(f"Monitor error: {e}", "error")
+                logger.error(traceback.format_exc())
                 await asyncio.sleep(5)
 
     # ── Order placement ───────────────────────────────────────────────────────
@@ -3260,12 +3399,19 @@ class Dashboard(ctk.CTkFrame):
             }
             coin = pair.split('-')[0]
             self.log_message(
-                f"FILLED {side.upper()} {pair}  "
-                f"{qty_filled:.4f} {coin} @ {format_price(filled_price)}  "
-                f"(≈${spent:.2f})  "
-                f"SL {format_price(sl)}  TP {format_price(tp)}  "
-                f"bot_balance=${self.bot_balance:.2f}  "
-                f"coin_qty={self.bot_coin_qty[pair]:.2f}", "trade")
+                f"◆ FILLED {side.upper()} {pair}  "
+                f"qty={qty_filled:.6f} {coin}  "
+                f"fill_price={format_price(filled_price)}  "
+                f"live_price={format_price(price)}  "
+                f"spent=${spent:.4f}  "
+                f"SL={format_price(sl)}  TP={format_price(tp)}  "
+                f"sl_pct={sl_pct*100:.2f}%  tp_pct={tp_pct*100:.2f}%  "
+                f"─── POST-FILL STATE ───  "
+                f"bot_balance=${self.bot_balance:.4f}  "
+                f"pair_alloc=${self.bot_pair_alloc[pair]:.4f}  "
+                f"bot_exposure=${self.bot_exposure[pair]:.4f}  "
+                f"coin_qty={self.bot_coin_qty[pair]:.4f}  "
+                f"order_id={order_id}", "trade")
             if self.root_alive:
                 self.root.after(0, self._refresh_trade_rows)
                 self.root.after(0, self._update_metrics)
