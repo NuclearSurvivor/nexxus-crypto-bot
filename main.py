@@ -250,6 +250,7 @@ class Dashboard(ctk.CTkFrame):
         self.bot_exposure    = defaultdict(float)
         self.real_exposure   = defaultdict(float)
         self.live_prices     = defaultdict(float)
+        self._price_ts       = defaultdict(float)   # C4: timestamp of last price update
         self.price_history   = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
         self.candle_history  = {tf: defaultdict(lambda: deque(maxlen=MAX_HISTORY))
                                  for tf in TIMEFRAMES}
@@ -260,13 +261,18 @@ class Dashboard(ctk.CTkFrame):
 
         # ── Load persisted user settings ──────────────────────────────────────
         _s = load_user_settings()
-        self.signal_tf       = _s.get('signal_tf', '1h')
-        self.swap_targets    = {p: _s.get('swap_targets', {}).get(p, 'USDC')
-                                for p in TRADING_PAIRS}
+        self.signal_tf        = _s.get('signal_tf', '1h')
+        self.signal_direction = _s.get('signal_direction', 'Both')  # 'Both' | 'Buy Only' | 'Sell Only'
+        # Swap targets: '' means no swap (hold as USD). Default '' not 'USDC' so
+        # an explicit "USD" selection persists correctly across restarts.
+        _saved_swaps = _s.get('swap_targets', {})
+        self.swap_targets = {p: _saved_swaps.get(p, 'USDC') for p in TRADING_PAIRS}
+
         _saved_ma = _s.get('ma_periods')
         if _saved_ma and isinstance(_saved_ma, list) and len(_saved_ma) >= 2:
             import engine as _eng
             _eng.MA_PERIODS = _saved_ma
+            globals()['MA_PERIODS'] = list(_saved_ma)   # C1 fix: update local global too
         self.custom_ma_periods = list(MA_PERIODS)  # mutable — user can override
         # Restore numeric trading params if saved
         if 'stop_loss_pct'    in _s: globals()['STOP_LOSS_PCT']    = float(_s['stop_loss_pct'])
@@ -281,10 +287,13 @@ class Dashboard(ctk.CTkFrame):
         self.paused          = False
         self.root_alive      = True
 
+        self.last_executed_signal = None   # set when an order is confirmed filled
+
         self.indicator_engine = IndicatorEngine()
         self.strategy         = MACrossover(self.indicator_engine)
         self._ws_jwt_ts       = 0.0   # timestamp of last WS JWT
-        self.surge_last_time  = defaultdict(float)  # per-pair surge cooldown
+        self.surge_last_buy   = defaultdict(float)   # H3: per-pair per-direction cooldown
+        self.surge_last_sell  = defaultdict(float)
 
         # ── Pre-populate candle history from disk cache ───────────────────────
         # Charts render immediately on startup; live API fills in newer candles.
@@ -306,6 +315,7 @@ class Dashboard(ctk.CTkFrame):
         self._build_layout()
         self._start_backend()
         self._start_webhook()
+        self.root.after(1000, self._tick_status)
 
     # ── Layout ────────────────────────────────────────────────────────────────
     def _build_layout(self):
@@ -461,10 +471,13 @@ class Dashboard(ctk.CTkFrame):
 
         self.bal_label = ctk.CTkLabel(right, text="Portfolio  —",
                                        font=("Segoe UI", 11), text_color=C_MUTED)
-        self.bal_label.pack(anchor="e", pady=(14, 0))
+        self.bal_label.pack(anchor="e", pady=(10, 0))
         self.pnl_label = ctk.CTkLabel(right, text="P&L  —",
                                        font=("Segoe UI", 12, "bold"), text_color=C_TEXT)
         self.pnl_label.pack(anchor="e")
+        self.alloc_label = ctk.CTkLabel(right, text="",
+                                         font=("Segoe UI", 10), text_color=C_ACCENT2)
+        self.alloc_label.pack(anchor="e", pady=(1, 0))
 
     def _build_content(self):
         self.content = ctk.CTkFrame(self.main_area, fg_color=C_BG, corner_radius=0)
@@ -536,9 +549,66 @@ class Dashboard(ctk.CTkFrame):
             lbl.pack(side="left")
             return lbl
         self.bs_state_lbl  = _bs_row("State",        "Connecting…", C_ORANGE)
+        self.bs_mode_lbl   = _bs_row("Mode",         "—",           C_MUTED)
         self.bs_signal_lbl = _bs_row("Signal TF",    self.signal_tf, C_ACCENT)
+        self.bs_next_lbl   = _bs_row("Next Window",  "—",           C_MUTED)
+        self.bs_feed_lbl   = _bs_row("Price Feed",   "—",           C_MUTED)
         self.bs_trades_lbl = _bs_row("Active Trades", "0",           C_TEXT)
         self.bs_alloc_lbl  = _bs_row("Allocated",    "$0.00",        C_ACCENT2)
+
+        # Per-pair allocation breakdown (compact sub-rows)
+        self._bs_pair_alloc_rows = {}
+        for pair in TRADING_PAIRS:
+            coin = pair.split('-')[0]
+            r = ctk.CTkFrame(bs_grid, fg_color="transparent")
+            r.pack(fill="x", pady=1)
+            ctk.CTkLabel(r, text=f"  └ {coin}", width=130, anchor="w",
+                         font=("Segoe UI", 10), text_color=C_MUTED).pack(side="left")
+            lbl = ctk.CTkLabel(r, text="$0.00", font=("Segoe UI", 10, "bold"),
+                               text_color=C_MUTED)
+            lbl.pack(side="left")
+            self._bs_pair_alloc_rows[pair] = (r, lbl)
+
+        # ── Last Executed Signal (hidden until a real fill happens) ───────────
+        ctk.CTkFrame(bsc, height=1, fg_color=C_BORDER).pack(fill="x", padx=16, pady=(6, 6))
+        self._last_sig_frame = ctk.CTkFrame(bsc, fg_color="transparent")
+        # Only packed when last_executed_signal is set
+        ctk.CTkLabel(self._last_sig_frame, text="LAST EXECUTED SIGNAL",
+                     font=("Segoe UI", 9, "bold"), text_color=C_MUTED).pack(
+            anchor="w", padx=16, pady=(0, 4))
+        sig_inner = ctk.CTkFrame(self._last_sig_frame, fg_color=C_CARD2,
+                                  corner_radius=10, border_width=1, border_color=C_BORDER2)
+        sig_inner.pack(fill="x", padx=16, pady=(0, 10))
+
+        sig_top = ctk.CTkFrame(sig_inner, fg_color="transparent")
+        sig_top.pack(fill="x", padx=14, pady=(10, 4))
+        self._bs_sig_side_lbl = ctk.CTkLabel(sig_top, text="BUY",
+                                              font=("Segoe UI", 15, "bold"),
+                                              text_color=C_GREEN)
+        self._bs_sig_side_lbl.pack(side="left", padx=(0, 8))
+        self._bs_sig_pair_lbl = ctk.CTkLabel(sig_top, text="BTC-USD",
+                                              font=("Segoe UI", 13, "bold"),
+                                              text_color=C_TEXT)
+        self._bs_sig_pair_lbl.pack(side="left")
+        self._bs_sig_src_lbl = ctk.CTkLabel(sig_top, text="MA2/MA5",
+                                             font=("Segoe UI", 10),
+                                             text_color=C_MUTED)
+        self._bs_sig_src_lbl.pack(side="right")
+
+        sig_bot = ctk.CTkFrame(sig_inner, fg_color="transparent")
+        sig_bot.pack(fill="x", padx=14, pady=(0, 10))
+        self._bs_sig_price_lbl = ctk.CTkLabel(sig_bot, text="",
+                                               font=("Segoe UI", 12, "bold"),
+                                               text_color=C_ACCENT3)
+        self._bs_sig_price_lbl.pack(side="left")
+        self._bs_sig_spent_lbl = ctk.CTkLabel(sig_bot, text="",
+                                               font=("Segoe UI", 11),
+                                               text_color=C_TEXT2)
+        self._bs_sig_spent_lbl.pack(side="left", padx=(10, 0))
+        self._bs_sig_time_lbl  = ctk.CTkLabel(sig_bot, text="",
+                                               font=("Segoe UI", 10),
+                                               text_color=C_MUTED)
+        self._bs_sig_time_lbl.pack(side="right")
 
         # Quick actions card
         acts = ctk.CTkFrame(r3, fg_color=C_CARD, corner_radius=14,
@@ -873,9 +943,27 @@ class Dashboard(ctk.CTkFrame):
         ctk.CTkLabel(
             risk,
             text="  Signals fire on completed candles of this timeframe.\n"
-                 "  1m = fastest, most noise  ·  5m = default balanced  ·  1h/1d = slower, higher conviction",
+                 "  1m = fastest, most noise  ·  5m = balanced  ·  1h/1d = slower, higher conviction",
             font=("Segoe UI", 10), text_color=C_MUTED, justify="left",
-        ).pack(anchor="w", padx=20, pady=(0, 6))
+        ).pack(anchor="w", padx=20, pady=(0, 10))
+
+        # ── Signal direction ──────────────────────────────────────────────────
+        dir_row = ctk.CTkFrame(risk, fg_color="transparent")
+        dir_row.pack(fill="x", padx=20, pady=(0, 4))
+        ctk.CTkLabel(dir_row, text="Signal Direction", width=240, anchor="w",
+                     font=("Segoe UI", 12), text_color=C_TEXT).pack(side="left")
+        self.signal_dir_var = ctk.StringVar(value=self.signal_direction)
+        ctk.CTkSegmentedButton(
+            dir_row, values=["Both", "Buy Only", "Sell Only"],
+            variable=self.signal_dir_var,
+            width=260, height=34,
+        ).pack(side="left")
+
+        ctk.CTkLabel(
+            risk,
+            text="  Both = act on every signal  ·  Buy Only / Sell Only = ignore the other side",
+            font=("Segoe UI", 10), text_color=C_MUTED, justify="left",
+        ).pack(anchor="w", padx=20, pady=(0, 10))
 
         ctk.CTkButton(risk, text="Save Settings", width=140, height=36, corner_radius=9,
                       fg_color=C_ACCENT2, hover_color="#5d47bb",
@@ -1088,10 +1176,15 @@ class Dashboard(ctk.CTkFrame):
             pair_alloc = sum(self.bot_pair_alloc[p] for p in TRADING_PAIRS)
             bot_total  = self.bot_balance + pair_alloc
             bot_exp    = sum(self.bot_exposure[p] for p in TRADING_PAIRS)
-            portfolio  = liquid_usd + coin_value + bot_total + bot_exp
+            # Portfolio = real liquid USD + real coin market value.
+            # bot_total (earmarked USD) is already INSIDE liquid_usd — Coinbase still
+            # holds that cash, we just label it for the bot.
+            # bot_exp (deployed USD) is already INSIDE coin_value — those are real coins.
+            # Adding them again would double-count and produce a false P&L swing on allocation.
+            portfolio  = liquid_usd + coin_value
             pnl        = portfolio - self.initial_balance if self.initial_balance else 0
             pnl_pct    = (pnl / self.initial_balance * 100) if self.initial_balance else 0
-            pcolor     = C_GREEN if pnl >= 0 else C_RED
+            pcolor     = C_MUTED if abs(pnl) < 0.005 else (C_GREEN if pnl > 0 else C_RED)
             active     = sum(1 for t in self.trade_history.values()
                              if t.get('event') == 'trade')
 
@@ -1100,13 +1193,27 @@ class Dashboard(ctk.CTkFrame):
             self.metric_cards['usd_bal']._sub.configure(
                 text=f"Liquid ${liquid_usd:,.2f}  ·  Coins ${coin_value:,.2f}")
 
-            # Bot balance card
-            alloc_parts = "  ".join(
-                f"{p.split('-')[0]} ${self.bot_pair_alloc[p]:,.2f}"
-                for p in TRADING_PAIRS if self.bot_pair_alloc[p] > 0)
-            self.metric_cards['bot_bal']._val.configure(text=f"${bot_total:,.2f}")
+            # Bot balance card — include coin holdings managed by the bot
+            coin_holdings_val_mc = sum(
+                self.bot_coin_qty.get(p, 0) * self.live_prices.get(p, 0)
+                for p in TRADING_PAIRS
+            )
+            bot_display_total = bot_total + coin_holdings_val_mc
+            alloc_lines = []
+            for p in TRADING_PAIRS:
+                usd_p  = self.bot_pair_alloc.get(p, 0)
+                cqty_p = self.bot_coin_qty.get(p, 0)
+                cval_p = cqty_p * self.live_prices.get(p, 0) if cqty_p > 0 else 0
+                if usd_p > 0 and cval_p > 0:
+                    alloc_lines.append(f"{p.split('-')[0]} ${usd_p+cval_p:,.2f}")
+                elif usd_p > 0:
+                    alloc_lines.append(f"{p.split('-')[0]} ${usd_p:,.2f}")
+                elif cval_p > 0:
+                    alloc_lines.append(f"{p.split('-')[0]} {cqty_p:.4f} ≈ ${cval_p:,.2f}")
+            alloc_parts = "  ·  ".join(alloc_lines)
+            self.metric_cards['bot_bal']._val.configure(text=f"${bot_display_total:,.2f}")
             self.metric_cards['bot_bal']._sub.configure(
-                text=alloc_parts if alloc_parts else f"General pool · {active} active trade{'s' if active != 1 else ''}")
+                text=alloc_parts if alloc_parts else f"Unallocated  ·  {active} active trade{'s' if active != 1 else ''}")
 
             # Coin holdings card
             self.metric_cards['exposure']._val.configure(text=f"${coin_value:,.2f}")
@@ -1117,9 +1224,9 @@ class Dashboard(ctk.CTkFrame):
                 ) or "No open positions")
 
             # P&L card
-            sign = "+" if pnl >= 0 else ""
+            sign = "+" if pnl > 0.005 else ("" if abs(pnl) < 0.005 else "-")
             self.metric_cards['pnl']._val.configure(
-                text=f"{sign}${pnl:,.2f}", text_color=pcolor)
+                text=f"{sign}${abs(pnl):,.2f}", text_color=pcolor)
             self.metric_cards['pnl']._sub.configure(
                 text=f"{pnl_pct:+.2f}%  ·  initial ${self.initial_balance:,.2f}"
                 if self.initial_balance else "Accumulating baseline…",
@@ -1128,7 +1235,25 @@ class Dashboard(ctk.CTkFrame):
             # Topbar
             self.bal_label.configure(text=f"Portfolio  ${portfolio:,.2f}")
             self.pnl_label.configure(
-                text=f"P&L  {sign}${pnl:,.2f}", text_color=pcolor)
+                text=f"P&L  {sign}${abs(pnl):,.2f}", text_color=pcolor)
+            # Allocated line — only show when bot has funds under management
+            _ch_val = sum(
+                self.bot_coin_qty.get(p, 0) * self.live_prices.get(p, 0)
+                for p in TRADING_PAIRS)
+            _alloc_total = bot_total + _ch_val
+            if _alloc_total >= 0.01:
+                _parts = []
+                for p in TRADING_PAIRS:
+                    _uv = self.bot_pair_alloc.get(p, 0)
+                    _cv = self.bot_coin_qty.get(p, 0) * self.live_prices.get(p, 0)
+                    if _uv + _cv >= 0.01:
+                        coin = p.split('-')[0]
+                        _parts.append(f"{coin} ${_uv+_cv:,.2f}")
+                _detail = "  ·  ".join(_parts) if _parts else f"${_alloc_total:,.2f}"
+                self.alloc_label.configure(
+                    text=f"Bot  {_detail}", text_color=C_ACCENT2)
+            else:
+                self.alloc_label.configure(text="")
 
             # Bot status card
             state_txt = ("PAUSED" if self.paused else
@@ -1136,9 +1261,117 @@ class Dashboard(ctk.CTkFrame):
             state_col = (C_ORANGE if self.paused else
                          C_GREEN  if self.running else C_RED)
             self.bs_state_lbl.configure(text=state_txt, text_color=state_col)
+
+            # Mode: user's direction setting + capital availability
+            _dir = self.signal_direction  # 'Both' | 'Buy Only' | 'Sell Only'
+            _has_usd  = bot_total >= MINIMUM_RESERVE
+            _has_coin = any(self.bot_coin_qty.get(p, 0) > 0 or
+                            self.bot_exposure.get(p, 0) > 0 for p in TRADING_PAIRS)
+            if not (_has_usd or _has_coin):
+                _mode_txt, _mode_col = "No funds", C_RED
+            elif _dir == 'Buy Only':
+                _mode_txt = "Buy Only"
+                _mode_col = C_GREEN if _has_usd else C_RED
+            elif _dir == 'Sell Only':
+                _mode_txt = "Sell Only"
+                _mode_col = C_ORANGE if _has_coin else C_RED
+            else:
+                # Both — show what's actually possible given capital
+                _can_buy  = _has_usd
+                _can_sell = _has_coin
+                if _can_buy and _can_sell:
+                    _mode_txt, _mode_col = "Both", C_GREEN
+                elif _can_buy:
+                    _mode_txt, _mode_col = "Both (buy cap only)", C_ACCENT
+                else:
+                    _mode_txt, _mode_col = "Both (sell cap only)", C_ORANGE
+            self.bs_mode_lbl.configure(text=_mode_txt, text_color=_mode_col)
+
             self.bs_signal_lbl.configure(text=self.signal_tf)
+
+            # Next signal window: time until next candle close on signal TF
+            _tf_secs = {'1m': 60, '5m': 300, '1h': 3600, '1d': 86400}
+            _period  = _tf_secs.get(self.signal_tf, 3600)
+            _now_ts  = time.time()
+            _elapsed = _now_ts % _period
+            _remain  = _period - _elapsed
+            if _remain < 60:
+                _next_txt = f"{int(_remain)}s"
+            elif _remain < 3600:
+                _next_txt = f"{int(_remain//60)}m {int(_remain%60)}s"
+            else:
+                _next_txt = f"{int(_remain//3600)}h {int((_remain%3600)//60)}m"
+            self.bs_next_lbl.configure(text=_next_txt,
+                                        text_color=C_ACCENT if _remain > 60 else C_ORANGE)
+
+            # Price feed freshness
+            _stale_pairs = [
+                p.split('-')[0] for p in TRADING_PAIRS
+                if time.time() - self._price_ts.get(p, 0) > 15
+            ]
+            if _stale_pairs:
+                self.bs_feed_lbl.configure(
+                    text=f"STALE ({', '.join(_stale_pairs)})", text_color=C_RED)
+            else:
+                _oldest = max(
+                    time.time() - self._price_ts.get(p, time.time())
+                    for p in TRADING_PAIRS) if self._price_ts else 0
+                self.bs_feed_lbl.configure(
+                    text=f"LIVE  {_oldest:.1f}s ago", text_color=C_GREEN)
+
             self.bs_trades_lbl.configure(text=str(active))
-            self.bs_alloc_lbl.configure(text=f"${bot_total:,.2f}")
+            # Per-pair allocation sub-rows (includes coin holdings value)
+            for pair, (row, lbl) in self._bs_pair_alloc_rows.items():
+                usd_alloc  = self.bot_pair_alloc.get(pair, 0)
+                exp        = self.bot_exposure.get(pair, 0)
+                coin_qty   = self.bot_coin_qty.get(pair, 0)
+                coin_val_p = coin_qty * self.live_prices.get(pair, 0) if coin_qty > 0 else 0
+                total_p    = usd_alloc + exp + coin_val_p
+                if total_p > 0:
+                    parts = []
+                    if usd_alloc > 0:
+                        parts.append(f"${usd_alloc:,.2f} USD")
+                    if coin_val_p > 0:
+                        coin = pair.split('-')[0]
+                        parts.append(f"{coin_qty:.4f} {coin} ≈ ${coin_val_p:,.2f}")
+                    if exp > 0:
+                        parts.append(f"${exp:,.2f} deployed")
+                    lbl.configure(text="  ·  ".join(parts),
+                                  text_color=C_ACCENT2)
+                    row.pack(fill="x", pady=1)
+                else:
+                    row.pack_forget()
+
+            # Total allocated = USD + coin holdings market value + deployed
+            coin_holdings_val = sum(
+                self.bot_coin_qty.get(p, 0) * self.live_prices.get(p, 0)
+                for p in TRADING_PAIRS
+            )
+            alloc_display = bot_total + coin_holdings_val
+            suffix = "  (general pool)" if (
+                self.bot_balance > 0 and not any(
+                    self.bot_pair_alloc.get(p, 0) > 0 for p in TRADING_PAIRS)
+                and coin_holdings_val == 0) else ""
+            self.bs_alloc_lbl.configure(text=f"${alloc_display:,.2f}{suffix}")
+
+            # Last executed signal panel — only show after a real fill
+            sig = self.last_executed_signal
+            if sig:
+                side      = sig['side']
+                side_col  = C_GREEN if side == 'buy' else C_RED
+                ts_str    = datetime.fromtimestamp(sig['ts']).strftime("%b %d  %H:%M:%S")
+                self._bs_sig_side_lbl.configure(
+                    text=side.upper(), text_color=side_col)
+                self._bs_sig_pair_lbl.configure(text=sig['pair'])
+                self._bs_sig_src_lbl.configure(text=sig.get('source', ''))
+                self._bs_sig_price_lbl.configure(
+                    text=format_price(sig['price']))
+                self._bs_sig_spent_lbl.configure(
+                    text=f"  ${sig['spent']:,.2f}  ·  {sig['qty']:.6f} {sig['pair'].split('-')[0]}")
+                self._bs_sig_time_lbl.configure(text=ts_str)
+                self._last_sig_frame.pack(fill="x", pady=(0, 4))
+            else:
+                self._last_sig_frame.pack_forget()
 
             # Charts header allocation
             cur_pair = self.chart_pair_var.get()
@@ -1356,14 +1589,9 @@ class Dashboard(ctk.CTkFrame):
                 ax.plot(ts[-len(warmed):], warmed, color=col, linewidth=1.3, alpha=0.9)
             ma_lines[period] = warmed
 
-        # ── 6. Signals — exact replay of live bot logic ──────────────────────
-        # Bot fires on every MA crossover where the fast MA crosses the slow MA.
-        # No SMC filter — OBs/FVGs reject breakouts by design (price breaks OUT
-        # of consolidation zones, not into them).
-        #
-        # On signal TF:  ▲▼ solid = bot would fire here
-        # On other TFs:  ▲▼ dim   = informational only (bot runs on signal TF)
-        # ⚡ = breakout/breakdown — always on signal TF only
+        # ── 6. Signals — MA crossover replay across all timeframes ──────────
+        # All crossovers shown solid regardless of timeframe — bot acts on
+        # signal TF, other TFs show the same markers for context.
 
         sorted_periods = sorted(MA_PERIODS)
         p_fast = sorted_periods[0]
@@ -1398,19 +1626,17 @@ class Dashboard(ctk.CTkFrame):
 
                 if action == 'buy':
                     y_pos  = _lo[i] - signal_offset
-                    color  = C_GREEN if is_signal_tf else "#1e5c2e"
-                    alpha  = 1.0     if is_signal_tf else 0.4
+                    color  = C_GREEN
                     marker = "▲"
                     va     = 'top'
                 else:
                     y_pos  = _hi[i] + signal_offset
-                    color  = C_RED   if is_signal_tf else "#5c1e1e"
-                    alpha  = 1.0     if is_signal_tf else 0.4
+                    color  = C_RED
                     marker = "▼"
                     va     = 'bottom'
 
                 ax.annotate(marker, (_ts[i], y_pos),
-                            color=color, fontsize=10, alpha=alpha,
+                            color=color, fontsize=10, alpha=1.0,
                             ha='center', va=va, fontweight='bold')
 
                 self._signal_data.append({
@@ -1428,12 +1654,11 @@ class Dashboard(ctk.CTkFrame):
                     'p_slow':       p_slow,
                     'atr':          atr,
                 })
-                if is_signal_tf:
-                    if action == 'buy':  buy_signal_drawn  = True
-                    else:                sell_signal_drawn = True
+                if action == 'buy':  buy_signal_drawn  = True
+                else:                sell_signal_drawn = True
 
         # ── 6b. Breakout signals (same logic as calculate_breakout) ──────────
-        if is_signal_tf and len(data) >= 25:
+        if len(data) >= 25:
             _lb    = 20
             _cl_a  = closes
             _hi_a  = highs
@@ -1556,26 +1781,15 @@ class Dashboard(ctk.CTkFrame):
                 items.append(('sym', c, f"──  MA {p}"))
         items.append(('sp',   None,        None))
 
-        # Signal legend — only show if this is the bot's signal TF
-        if is_signal_tf:
-            if buy_signal_drawn:
-                items.append(('sym', C_GREEN,    "▲  BUY  (MA+SMC ✓)"))
-            if sell_signal_drawn:
-                items.append(('sym', C_RED,      "▼  SELL (MA+SMC ✓)"))
-            if breakout_drawn:
-                items.append(('sym', C_ACCENT3,  "⚡  Breakout signal"))
-            # Dim markers key
-            any_dim = any(not s.get('confirmed') for s in self._signal_data)
-            if any_dim:
-                items.append(('sym', "#3a5c3a",  "▲▼ Cross (no SMC — skip)"))
-        else:
-            items.append(('inf', C_ACCENT3,
-                          f"Bot trades on {self.signal_tf}"))
-            items.append(('inf', C_MUTED,  "These are informational"))
-            items.append(('inf', C_MUTED,  f"crossovers for {tf.upper()} only"))
-            if buy_signal_drawn or sell_signal_drawn:
-                items.append(('sp', None, None))
-                items.append(('sym', "#3a5c3a", "▲▼ cross (this TF)"))
+        # Signal legend — all TFs show solid markers
+        if buy_signal_drawn:
+            items.append(('sym', C_GREEN,   "▲  BUY signal"))
+        if sell_signal_drawn:
+            items.append(('sym', C_RED,     "▼  SELL signal"))
+        if breakout_drawn:
+            items.append(('sym', C_ACCENT3, "⚡  Breakout signal"))
+        if not is_signal_tf and (buy_signal_drawn or sell_signal_drawn or breakout_drawn):
+            items.append(('inf', C_MUTED,   f"Bot executes on {self.signal_tf}"))
         items.append(('sp', None, None))
 
         if ob_bull_drawn:
@@ -2038,9 +2252,10 @@ class Dashboard(ctk.CTkFrame):
                     if val > avail_qty + 1e-9:
                         err.configure(text=f"Max: {avail_qty:.6f} {coin}")
                         return
-                    self.bot_coin_qty[p]     += val
-                    self.real_exposure[p]     = max(0, self.real_exposure.get(p, 0)
-                                                    - val * price)
+                    # Track how many coins the bot manages — do NOT touch real_exposure;
+                    # those coins still exist in the Coinbase account and _fetch_balance
+                    # is authoritative for their current market value.
+                    self.bot_coin_qty[p] += val
                     self.log_message(
                         f"Allocated {val:.6f} {coin} holdings → bot", "trade")
                 self._update_metrics()
@@ -2222,7 +2437,8 @@ class Dashboard(ctk.CTkFrame):
             COOLDOWN_SECONDS = float(self.cd_var.get())
             import engine as _eng
             _eng.COOLDOWN_SECONDS = COOLDOWN_SECONDS
-            self.signal_tf = self.signal_tf_var.get()
+            self.signal_tf        = self.signal_tf_var.get()
+            self.signal_direction = self.signal_dir_var.get()
             # Persist swap targets ('USD' maps to '' meaning no swap order placed)
             for pair in TRADING_PAIRS:
                 chosen = self.swap_vars[pair].get()
@@ -2234,13 +2450,14 @@ class Dashboard(ctk.CTkFrame):
             ) or 'none'
             # ── Persist to config.json ────────────────────────────────────────
             save_user_settings({
-                'signal_tf':       self.signal_tf,
-                'ma_periods':      list(self.custom_ma_periods),
-                'swap_targets':    dict(self.swap_targets),
-                'stop_loss_pct':   STOP_LOSS_PCT,
-                'take_profit_pct': TAKE_PROFIT_PCT,
+                'signal_tf':        self.signal_tf,
+                'signal_direction': self.signal_direction,
+                'ma_periods':       list(self.custom_ma_periods),
+                'swap_targets':     dict(self.swap_targets),
+                'stop_loss_pct':    STOP_LOSS_PCT,
+                'take_profit_pct':  TAKE_PROFIT_PCT,
                 'order_amount_usd': ORDER_AMOUNT_USD,
-                'minimum_reserve': MINIMUM_RESERVE,
+                'minimum_reserve':  MINIMUM_RESERVE,
                 'cooldown_seconds': COOLDOWN_SECONDS,
             })
             self.log_message(
@@ -2273,6 +2490,7 @@ class Dashboard(ctk.CTkFrame):
         # Persist MA change alongside current settings
         save_user_settings({
             'signal_tf':        self.signal_tf,
+            'signal_direction': self.signal_direction,
             'ma_periods':       list(periods),
             'swap_targets':     dict(self.swap_targets),
             'stop_loss_pct':    STOP_LOSS_PCT,
@@ -2283,6 +2501,38 @@ class Dashboard(ctk.CTkFrame):
         })
         self.log_message(f"Moving averages updated: {periods}", "trade")
         self._refresh_chart()
+
+    # ── 1-second status ticker (next window countdown + feed freshness) ──────
+    def _tick_status(self):
+        if not self.root_alive:
+            return
+        try:
+            _tf_secs = {'1m': 60, '5m': 300, '1h': 3600, '1d': 86400}
+            _period  = _tf_secs.get(self.signal_tf, 3600)
+            _remain  = _period - (time.time() % _period)
+            if _remain < 60:
+                _next_txt = f"{int(_remain)}s"
+            elif _remain < 3600:
+                _next_txt = f"{int(_remain//60)}m {int(_remain%60)}s"
+            else:
+                _next_txt = f"{int(_remain//3600)}h {int((_remain%3600)//60)}m"
+            self.bs_next_lbl.configure(
+                text=_next_txt,
+                text_color=C_ACCENT if _remain > 60 else C_ORANGE)
+
+            _stale = [p.split('-')[0] for p in TRADING_PAIRS
+                      if time.time() - self._price_ts.get(p, 0) > 15]
+            if _stale:
+                self.bs_feed_lbl.configure(
+                    text=f"STALE ({', '.join(_stale)})", text_color=C_RED)
+            else:
+                _oldest = max((time.time() - self._price_ts.get(p, time.time()))
+                              for p in TRADING_PAIRS) if self._price_ts else 0
+                self.bs_feed_lbl.configure(
+                    text=f"LIVE  {_oldest:.1f}s ago", text_color=C_GREEN)
+        except Exception:
+            pass
+        self.root.after(1000, self._tick_status)
 
     # ── Backend startup ───────────────────────────────────────────────────────
     def _start_backend(self):
@@ -2354,6 +2604,7 @@ class Dashboard(ctk.CTkFrame):
                 price = float(resp.to_dict().get('price', 0) or 0)
                 if price:
                     self.live_prices[pair] = price
+                    self._price_ts[pair]   = time.time()
                     self.log_message(f"{pair}: {format_price(price)}", "info")
             except Exception as e:
                 self.log_message(f"Price fetch {pair}: {e}", "warn")
@@ -2373,6 +2624,10 @@ class Dashboard(ctk.CTkFrame):
             usd   = 0.0
             pair_coins = {p.split('-')[0]: p for p in TRADING_PAIRS}
 
+            # C3 fix: zero all pairs first so externally-sold coins clear properly
+            for p in TRADING_PAIRS:
+                self.real_exposure[p] = 0.0
+
             for a in raw.get('accounts', []):
                 cur = a.get('currency', '')
                 val = float(a.get('available_balance', {}).get('value', 0) or 0)
@@ -2381,7 +2636,8 @@ class Dashboard(ctk.CTkFrame):
                 elif cur in pair_coins:
                     pair  = pair_coins[cur]
                     price = self.live_prices.get(pair, 0)
-                    self.real_exposure[pair] = val * price
+                    if price > 0:   # C4-adjacent: skip if price feed not yet ready
+                        self.real_exposure[pair] = val * price
 
             self.usd_balance = usd
             if self.root_alive:
@@ -2475,16 +2731,27 @@ class Dashboard(ctk.CTkFrame):
             # Confirmation frame: one step shorter than the signal TF
             _conf_map = {'1m': '1m', '5m': '1m', '1h': '5m', '1d': '1h'}
             conf_tf   = _conf_map.get(self.signal_tf, '1m')
-            # Gate: this specific pair must have funds allocated or an open position
-            pair_funds = (self.bot_pair_alloc.get(pair, 0) >= MINIMUM_RESERVE
-                          or self.bot_balance >= MINIMUM_RESERVE)
-            cap = pair_funds or self.bot_exposure[pair] > 0
+            # C5 fix: separate new-entry capital check from position-management check.
+            # New BUY requires USD funds. SELL / position mgmt also allowed when
+            # the bot already has coins to sell (exposure or user-handed holdings).
+            pair_funds  = (self.bot_pair_alloc.get(pair, 0) >= MINIMUM_RESERVE
+                           or self.bot_balance >= MINIMUM_RESERVE)
+            has_coins   = (self.bot_exposure[pair] > 0
+                           or self.bot_coin_qty.get(pair, 0) > 0)
+            # Allow signal evaluation when we have capital OR sellable holdings
+            cap = pair_funds or has_coins
             if cap and not self.order_locks[pair]:
                 conf_candles = list(self.candle_history[conf_tf][pair])
                 sig = (self.strategy.calculate_signals(pair, ha, conf_candles) or
                        self.strategy.calculate_breakout(pair, ha))
+                # Filter by user's signal direction setting
+                if sig and self.signal_direction == 'Buy Only'  and sig['action'] != 'buy':
+                    sig = None
+                if sig and self.signal_direction == 'Sell Only' and sig['action'] != 'sell':
+                    sig = None
                 if sig:
                     self.order_locks[pair] = True
+                    self._last_signal_source = sig['source']
                     self.log_message(
                         f"Signal [{sig['source']}] {sig['action'].upper()} {pair} "
                         f"@ {format_price(sig['price'])}", "trade")
@@ -2492,10 +2759,11 @@ class Dashboard(ctk.CTkFrame):
                         self._place_order(pair, sig['action']), self.loop)
 
         # Auto-refresh chart if this pair/tf is selected
-        if (self.chart_pair_var.get() == pair and
-                self.chart_tf_var.get() == timeframe):
-            self.root.after(0, self._refresh_chart)
-        self.root.after(0, self._update_pair_cards)
+        if self.root_alive:
+            if (self.chart_pair_var.get() == pair and
+                    self.chart_tf_var.get() == timeframe):
+                self.root.after(0, self._refresh_chart)
+            self.root.after(0, self._update_pair_cards)
 
     # ── WebSocket ticker ──────────────────────────────────────────────────────
     async def _websocket_loop(self):
@@ -2545,6 +2813,7 @@ class Dashboard(ctk.CTkFrame):
                                     if pid in TRADING_PAIRS and price:
                                         p = float(price)
                                         self.live_prices[pid] = p
+                                        self._price_ts[pid]   = time.time()
                                         self.price_history[pid].append(p)
                                         if self.root_alive:
                                             self.root.after(0, self._update_pair_cards)
@@ -2592,28 +2861,45 @@ class Dashboard(ctk.CTkFrame):
         now = time.time()
         if now - self.surge_last_time[pair] < SURGE_COOLDOWN:
             return
-        # Need capital or an open position
+        # Need capital, an open position, or coin holdings handed to the bot
         pair_cap = (self.bot_pair_alloc.get(pair, 0) >= MINIMUM_RESERVE
                     or self.bot_balance >= MINIMUM_RESERVE)
         has_exposure = self.bot_exposure[pair] > 0
-        if not (pair_cap or has_exposure):
+        has_coins    = self.bot_coin_qty.get(pair, 0) > 0
+        if not (pair_cap or has_exposure or has_coins):
             return
         if self.order_locks[pair]:
             return
 
         action = 'buy' if move > 0 else 'sell'
-        # Don't buy into a surge that's already peaked, don't sell into a crash
-        # that's already recovering — basic sanity: require move still in progress
-        # (last tick moving same direction as the window)
-        if len(ticks) >= 2:
-            last_tick_dir = ticks[-1] - ticks[-2]
-            if action == 'buy'  and last_tick_dir < 0:
-                return   # surge reversed — skip
-            if action == 'sell' and last_tick_dir > 0:
-                return   # crash reversed — skip
 
-        self.surge_last_time[pair] = now
+        # H3 fix: per-direction cooldown so a buy surge doesn't block a crash signal
+        last_ts = self.surge_last_buy[pair] if action == 'buy' else self.surge_last_sell[pair]
+        if now - last_ts < SURGE_COOLDOWN:
+            return
+
+        # Reversal guard: require majority of last 5 ticks to match direction
+        # (M2 fix: don't cancel on a single contrary tick)
+        if len(ticks) >= 5:
+            recent = ticks[-5:]
+            dirs   = [recent[i] - recent[i-1] for i in range(1, len(recent))]
+            bull   = sum(1 for d in dirs if d > 0)
+            bear   = sum(1 for d in dirs if d < 0)
+            if action == 'buy'  and bear > bull:
+                return   # momentum has reversed
+            if action == 'sell' and bull > bear:
+                return   # momentum has reversed
+
+        if action == 'buy':
+            self.surge_last_buy[pair]  = now
+        else:
+            self.surge_last_sell[pair] = now
         self.order_locks[pair] = True
+        # Filter by signal direction setting
+        if self.signal_direction == 'Buy Only'  and action != 'buy':  return
+        if self.signal_direction == 'Sell Only' and action != 'sell': return
+
+        self._last_signal_source = f"Surge⚡ {move*100:+.1f}%"
         self.log_message(
             f"⚡ SURGE {'+' if move > 0 else ''}{move*100:.1f}%  "
             f"{action.upper()} {pair}  @ {format_price(newest)}", "trade")
@@ -2689,6 +2975,14 @@ class Dashboard(ctk.CTkFrame):
             amount = ORDER_AMOUNT_USD
         try:
             if not self.running or self.paused:
+                return
+
+            # C4 fix: reject if live price is stale (>15s since last WebSocket tick)
+            price_age = time.time() - self._price_ts.get(pair, 0)
+            if price_age > 15:
+                self.log_message(
+                    f"Skipping {side} {pair} — price feed stale ({price_age:.0f}s old)",
+                    "warn")
                 return
 
             atr    = self.indicator_engine.data[pair]['atr']
@@ -2792,17 +3086,26 @@ class Dashboard(ctk.CTkFrame):
                 self.bot_exposure[pair] += spent
                 self.bot_coin_qty[pair] += qty_filled
             else:
-                # Drain coin qty first, then USD exposure
-                if self.bot_coin_qty.get(pair, 0) > 0:
-                    drained = min(qty_filled, self.bot_coin_qty[pair])
-                    self.bot_coin_qty[pair] = max(0, self.bot_coin_qty[pair] - drained)
-                    self.bot_pair_alloc[pair] += spent
-                elif self.bot_exposure.get(pair, 0) > 0:
-                    self.bot_pair_alloc[pair] += spent
+                # H1 fix: route proceeds to the correct bucket based on coin source.
+                # bot_coin_qty coins came from user (not from bot-traded USD), so
+                # proceeds return to bot_balance (liquid bot pool), not bot_pair_alloc.
+                # bot_exposure coins came from bot buying with bot_pair_alloc USD, so
+                # proceeds return to bot_pair_alloc to replenish that trading budget.
+                coin_qty   = self.bot_coin_qty.get(pair, 0)
+                bot_exp    = self.bot_exposure.get(pair, 0)
+                total_qty  = coin_qty + (bot_exp / filled_price if filled_price else 0)
+                if total_qty > 0:
+                    # Proportional split of proceeds back to each bucket
+                    user_frac = coin_qty / total_qty if total_qty > 0 else 0
+                    bot_frac  = 1.0 - user_frac
+                    self.bot_balance          += spent * user_frac
+                    self.bot_pair_alloc[pair] += spent * bot_frac
                 else:
                     self.bot_balance += spent
-                self.bot_exposure[pair]  = max(0, self.bot_exposure[pair] - spent)
-                self.bot_coin_qty[pair]  = max(0, self.bot_coin_qty[pair])
+                # Drain tracked quantities
+                drained_qty = min(qty_filled, coin_qty)
+                self.bot_coin_qty[pair]  = max(0, coin_qty - drained_qty)
+                self.bot_exposure[pair]  = max(0, bot_exp - spent * bot_frac)
 
                 # ── Swap-on-sell ──────────────────────────────────────────────
                 await self._execute_swap(pair, spent)
@@ -2817,6 +3120,16 @@ class Dashboard(ctk.CTkFrame):
             }
             save_trade_history(self.trade_history)
             self.strategy.last_trade_time[pair] = time.time()
+            # Record last executed signal for the dashboard display
+            self.last_executed_signal = {
+                'pair':    pair,
+                'side':    side,
+                'price':   filled_price,
+                'qty':     qty_filled,
+                'spent':   spent,
+                'ts':      time.time(),
+                'source':  getattr(self, '_last_signal_source', side.upper()),
+            }
             self.log_message(
                 f"{side.upper()} {pair}  qty={qty_filled:.6f}  "
                 f"@ {format_price(filled_price)}  "
