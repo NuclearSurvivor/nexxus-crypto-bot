@@ -249,8 +249,9 @@ class Dashboard(ctk.CTkFrame):
         self.initial_balance = 0.0
         self.bot_exposure    = defaultdict(float)
         self.real_exposure   = defaultdict(float)
-        self.live_prices     = defaultdict(float)
-        self._price_ts       = defaultdict(float)   # C4: timestamp of last price update
+        self.live_prices      = defaultdict(float)
+        self._price_ts        = defaultdict(float)   # C4: timestamp of last price update
+        self._base_precision  = {}                   # pair → int decimal places for base_size
         self.price_history   = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
         self.candle_history  = {tf: defaultdict(lambda: deque(maxlen=MAX_HISTORY))
                                  for tf in TIMEFRAMES}
@@ -2643,12 +2644,29 @@ class Dashboard(ctk.CTkFrame):
     async def _fetch_initial_prices(self):
         async def _fetch_one(pair):
             try:
-                resp  = await asyncio.to_thread(self.client.get_product, pair)
-                price = float(resp.to_dict().get('price', 0) or 0)
+                resp = await asyncio.to_thread(self.client.get_product, pair)
+                info = resp.to_dict()
+                price = float(info.get('price', 0) or 0)
                 if price:
                     self.live_prices[pair] = price
                     self._price_ts[pair]   = time.time()
-                    self.log_message(f"{pair}: {format_price(price)}", "info")
+                # Cache base_increment decimal precision so sell orders are rounded
+                # to exactly what Coinbase requires (e.g. XCN may be 0.01 = 2dp)
+                base_inc = info.get('base_increment', '0.00000001')
+                try:
+                    inc_f = float(base_inc)
+                    if inc_f >= 1:
+                        dp = 0
+                    elif '.' in str(base_inc):
+                        dp = len(str(base_inc).rstrip('0').split('.')[-1])
+                    else:
+                        dp = 0
+                    self._base_precision[pair] = dp
+                except Exception:
+                    self._base_precision[pair] = 2
+                self.log_message(
+                    f"{pair}: {format_price(price) if price else '—'}  "
+                    f"(base increment {base_inc})", "info")
             except Exception as e:
                 self.log_message(f"Price fetch {pair}: {e}", "warn")
 
@@ -2774,15 +2792,14 @@ class Dashboard(ctk.CTkFrame):
             # Confirmation frame: one step shorter than the signal TF
             _conf_map = {'1m': '1m', '5m': '1m', '1h': '5m', '1d': '1h'}
             conf_tf   = _conf_map.get(self.signal_tf, '1m')
-            # C5 fix: separate new-entry capital check from position-management check.
-            # New BUY requires USD funds. SELL / position mgmt also allowed when
-            # the bot already has coins to sell (exposure or user-handed holdings).
-            pair_funds  = (self.bot_pair_alloc.get(pair, 0) >= MINIMUM_RESERVE
-                           or self.bot_balance >= MINIMUM_RESERVE)
-            has_coins   = (self.bot_exposure[pair] > 0
-                           or self.bot_coin_qty.get(pair, 0) > 0)
-            # Allow signal evaluation when we have capital OR sellable holdings
-            cap = pair_funds or has_coins
+            # Capital gates — matched to what _place_order will actually accept.
+            # BUY needs USD (bot_balance or bot_pair_alloc >= reserve).
+            # SELL needs coins (bot_exposure or bot_coin_qty > 0).
+            _can_buy  = (self.bot_pair_alloc.get(pair, 0) >= MINIMUM_RESERVE
+                         or self.bot_balance >= MINIMUM_RESERVE)
+            _can_sell = (self.bot_exposure[pair] > 0
+                         or self.bot_coin_qty.get(pair, 0) > 0)
+            cap = _can_buy or _can_sell
             if cap and not self.order_locks[pair]:
                 conf_candles = list(self.candle_history[conf_tf][pair])
                 sig = (self.strategy.calculate_signals(pair, ha, conf_candles) or
@@ -2791,6 +2808,12 @@ class Dashboard(ctk.CTkFrame):
                 if sig and self.signal_direction == 'Buy Only'  and sig['action'] != 'buy':
                     sig = None
                 if sig and self.signal_direction == 'Sell Only' and sig['action'] != 'sell':
+                    sig = None
+                # Drop signals for which we have no matching capital — avoids
+                # "No funds" log spam and unnecessary order lock cycles.
+                if sig and sig['action'] == 'buy'  and not _can_buy:
+                    sig = None
+                if sig and sig['action'] == 'sell' and not _can_sell:
                     sig = None
                 if sig:
                     self.order_locks[pair] = True
@@ -3110,26 +3133,42 @@ class Dashboard(ctk.CTkFrame):
             # Coinbase Advanced Trade market order
             # For buys use quote_size (USD); for sells use base_size (coin qty)
             if side == 'buy':
+                quote_str = str(round(amount_usd, 2))
+                self.log_message(
+                    f"Placing BUY {pair}  quote_size={quote_str}  "
+                    f"price≈{format_price(price)}", "info")
                 order_resp = await asyncio.to_thread(
                     self.client.market_order_buy,
                     client_order_id=order_id,
                     product_id=pair,
-                    quote_size=str(round(amount_usd, 2))
+                    quote_size=quote_str
                 )
             else:
+                dp  = self._base_precision.get(pair, 2)
                 qty = amount_usd / price
+                # Floor (not round) to never over-sell; respect Coinbase base_increment
+                import math as _math
+                qty = _math.floor(qty * (10 ** dp)) / (10 ** dp)
+                base_str = f"{qty:.{dp}f}"
+                self.log_message(
+                    f"Placing SELL {pair}  base_size={base_str} ({dp}dp)  "
+                    f"≈${amount_usd:.2f}  price≈{format_price(price)}", "info")
                 order_resp = await asyncio.to_thread(
                     self.client.market_order_sell,
                     client_order_id=order_id,
                     product_id=pair,
-                    base_size=str(round(qty, 8))
+                    base_size=base_str
                 )
 
             raw = order_resp.to_dict()
             success = raw.get('success', False)
             if not success:
-                reason = raw.get('error_response', {}).get('message', str(raw))
-                self.log_message(f"Order rejected {pair}: {reason}", "error")
+                err_obj = raw.get('error_response', {}) or {}
+                reason  = err_obj.get('message') or err_obj.get('error') or str(raw)
+                preview = err_obj.get('preview_failure_reason', '')
+                detail  = f"  [{preview}]" if preview else ''
+                self.log_message(
+                    f"Order REJECTED {pair} {side.upper()}: {reason}{detail}", "error")
                 return
 
             # Parse fill price: prefer success_response.average_filled_price,
@@ -3210,10 +3249,14 @@ class Dashboard(ctk.CTkFrame):
                 'ts':      time.time(),
                 'source':  getattr(self, '_last_signal_source', side.upper()),
             }
+            coin = pair.split('-')[0]
             self.log_message(
-                f"{side.upper()} {pair}  qty={qty_filled:.6f}  "
-                f"@ {format_price(filled_price)}  "
-                f"SL={format_price(sl)}  TP={format_price(tp)}", "trade")
+                f"FILLED {side.upper()} {pair}  "
+                f"{qty_filled:.4f} {coin} @ {format_price(filled_price)}  "
+                f"(≈${spent:.2f})  "
+                f"SL {format_price(sl)}  TP {format_price(tp)}  "
+                f"bot_balance=${self.bot_balance:.2f}  "
+                f"coin_qty={self.bot_coin_qty[pair]:.2f}", "trade")
             if self.root_alive:
                 self.root.after(0, self._refresh_trade_rows)
                 self.root.after(0, self._update_metrics)
