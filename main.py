@@ -1531,9 +1531,14 @@ class Dashboard(ctk.CTkFrame):
             if is_bull: ob_bull_drawn = True
             else:       ob_bear_drawn = True
 
-        # ── 2. Fair Value Gaps (cap to 3 most recent visible) ────────────────
+        # ── 2. Fair Value Gaps (cap to 3 most recent; age-limited per TF) ──────
         fvg_bull_drawn = fvg_bear_drawn = False
-        fvgs_visible = [fvg for fvg in ind['fair_value_gaps'] if fvg[0] >= chart_start_ms][-3:]
+        # Limit how far back FVGs are shown on short TFs (they become irrelevant quickly)
+        _fvg_lookback_ms = {'1m': 45*60*1000, '5m': 3*3600*1000,
+                            '1h': 24*3600*1000, '1d': 60*86400*1000}
+        _fvg_min_ts = data[-1][0] - _fvg_lookback_ms.get(tf, 24*3600*1000)
+        fvgs_visible = [fvg for fvg in ind['fair_value_gaps']
+                        if fvg[0] >= chart_start_ms and fvg[0] >= _fvg_min_ts][-3:]
         for fvg_ts, fvg_high, fvg_low, is_bull in fvgs_visible:
             x_start = datetime.fromtimestamp(fvg_ts / 1000, pytz.UTC)
             x_end   = ts[-1]
@@ -1752,6 +1757,14 @@ class Dashboard(ctk.CTkFrame):
         ax.yaxis.set_label_position("right")
         for lbl in ax.get_yticklabels():
             lbl.set_color(C_MUTED)
+
+        # Robust Y-axis: use 1st–99th percentile of visible candle prices so
+        # a single spike candle doesn't compress the rest of the chart.
+        if not self._zoom_locked and len(lows) > 4:
+            _p_lo = float(np.percentile(lows,  1))
+            _p_hi = float(np.percentile(highs, 99))
+            _pad  = (_p_hi - _p_lo) * 0.06
+            ax.set_ylim(_p_lo - _pad, _p_hi + _pad)
 
         if self._zoom_locked:
             ax.set_xlim(_saved_xl)
@@ -2590,10 +2603,11 @@ class Dashboard(ctk.CTkFrame):
             f"Portfolio: ${self.initial_balance:.2f}", "info")
 
         tasks = [
-            self._safe_loop(self._candles_loop,   "candles"),
-            self._safe_loop(self._websocket_loop, "websocket"),
-            self._safe_loop(self._balance_loop,   "balance"),
-            self._safe_loop(self._monitor_loop,   "monitor"),
+            self._safe_loop(self._candles_loop,    "candles"),
+            self._safe_loop(self._websocket_loop,  "websocket"),
+            self._safe_loop(self._balance_loop,    "balance"),
+            self._safe_loop(self._monitor_loop,    "monitor"),
+            self._safe_loop(self._price_poll_loop, "price_poll"),
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -2790,6 +2804,9 @@ class Dashboard(ctk.CTkFrame):
         Coinbase Advanced Trade WebSocket.
         Docs: https://docs.cdp.coinbase.com/advanced-trade/docs/ws-overview
         Auth: https://docs.cdp.coinbase.com/advanced-trade/docs/ws-auth
+
+        Subscribes to both 'ticker' (per-trade) and 'ticker_batch' (~1s heartbeat)
+        so low-volume pairs like XCN still receive periodic price updates.
         """
         while self.running:
             try:
@@ -2802,13 +2819,14 @@ class Dashboard(ctk.CTkFrame):
                     jwt = make_ws_jwt(self.api_key, self.api_secret)
                     self._ws_jwt_ts = time.time()
 
-                    sub = {
-                        "type":        "subscribe",
-                        "product_ids": TRADING_PAIRS,
-                        "channel":     "ticker",
-                        "jwt":         jwt,
-                    }
-                    await ws.send(json.dumps(sub))
+                    # Subscribe to both channels in one shot
+                    for channel in ("ticker", "ticker_batch"):
+                        await ws.send(json.dumps({
+                            "type":        "subscribe",
+                            "product_ids": TRADING_PAIRS,
+                            "channel":     channel,
+                            "jwt":         jwt,
+                        }))
                     self.log_message("WebSocket connected — live prices active", "trade")
 
                     while self.running:
@@ -2822,7 +2840,7 @@ class Dashboard(ctk.CTkFrame):
                                 self._ws_jwt_ts = time.time()
 
                             chan = data.get("channel", "")
-                            if chan != "ticker":
+                            if chan not in ("ticker", "ticker_batch"):
                                 continue
 
                             for evt in data.get("events", []):
@@ -2836,8 +2854,10 @@ class Dashboard(ctk.CTkFrame):
                                         self.price_history[pid].append(p)
                                         if self.root_alive:
                                             self.root.after(0, self._update_pair_cards)
-                                        # ── Surge / flash detection ───────────
-                                        await self._check_surge(pid)
+                                        # Surge detection only on fresh trades (ticker),
+                                        # not on ticker_batch heartbeats (no new trade info)
+                                        if chan == "ticker":
+                                            await self._check_surge(pid)
 
                         except asyncio.TimeoutError:
                             await ws.ping()
@@ -2848,6 +2868,37 @@ class Dashboard(ctk.CTkFrame):
             except Exception as e:
                 self.log_message(f"WS disconnected: {e} — reconnect in 5s", "warn")
                 await asyncio.sleep(5)
+
+    # ── REST price poll fallback (catches pairs WS misses) ────────────────────
+    async def _price_poll_loop(self):
+        """
+        Polls get_best_bid_ask every 8 seconds as a safety net for pairs
+        that haven't received a WebSocket tick recently (e.g. low-volume XCN).
+        Uses the bid/ask midpoint. Only updates pairs stale for >5s to avoid
+        overwriting a fresher WS price.
+        """
+        await asyncio.sleep(15)   # let WS establish first
+        while self.running:
+            try:
+                now  = time.time()
+                stale = [p for p in TRADING_PAIRS
+                         if now - self._price_ts.get(p, 0) > 5]
+                if stale:
+                    resp = await asyncio.to_thread(
+                        self.client.get_best_bid_ask, product_ids=stale)
+                    for entry in resp.to_dict().get("pricebooks", []):
+                        pid = entry.get("product_id", "")
+                        bid = float(entry.get("bids", [{}])[0].get("price", 0) or 0)
+                        ask = float(entry.get("asks", [{}])[0].get("price", 0) or 0)
+                        if pid in TRADING_PAIRS and bid > 0 and ask > 0:
+                            mid = (bid + ask) / 2
+                            self.live_prices[pid] = mid
+                            self._price_ts[pid]   = time.time()
+                            if self.root_alive:
+                                self.root.after(0, self._update_pair_cards)
+            except Exception as e:
+                logger.warning(f"Price poll error: {e}")
+            await asyncio.sleep(8)
 
     # ── Surge / flash-move detector ───────────────────────────────────────────
     async def _check_surge(self, pair: str):

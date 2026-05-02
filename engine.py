@@ -247,9 +247,16 @@ class IndicatorEngine:
         fvgs = []
         for i in range(1, len(candles)-1):
             if lows[i-1] > highs[i+1]:      # bearish FVG
-                fvgs.append((timestamps[i], lows[i-1], highs[i+1], False))
+                fvg_hi, fvg_lo = lows[i-1], highs[i+1]
             elif highs[i-1] < lows[i+1]:    # bullish FVG
-                fvgs.append((timestamps[i], lows[i+1], highs[i-1], True))
+                fvg_hi, fvg_lo = lows[i+1], highs[i-1]
+            else:
+                continue
+            # Skip anomalous gaps from spike candles (> 1% of price)
+            if fvg_lo > 0 and (fvg_hi - fvg_lo) / fvg_lo > 0.01:
+                continue
+            is_bull = highs[i-1] < lows[i+1]
+            fvgs.append((timestamps[i], fvg_hi, fvg_lo, is_bull))
         self.data[pair]['fair_value_gaps'] = fvgs[-10:]
 
     def calculate_atr(self, pair, candles):
