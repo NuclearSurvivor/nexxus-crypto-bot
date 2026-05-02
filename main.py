@@ -282,6 +282,7 @@ class Dashboard(ctk.CTkFrame):
         if 'cooldown_seconds' in _s:
             globals()['COOLDOWN_SECONDS'] = float(_s['cooldown_seconds'])
             import engine as _eng2; _eng2.COOLDOWN_SECONDS = float(_s['cooldown_seconds'])
+        self.alloc_round_tokens = int(_s.get('alloc_round_tokens', 250))
 
         self.running         = True
         self.paused          = False
@@ -919,6 +920,7 @@ class Dashboard(ctk.CTkFrame):
         self.ord_var = ctk.StringVar(value=str(ORDER_AMOUNT_USD))
         self.res_var = ctk.StringVar(value=str(MINIMUM_RESERVE))
         self.cd_var  = ctk.StringVar(value=str(COOLDOWN_SECONDS))
+        self.round_var = ctk.StringVar(value=str(self.alloc_round_tokens))
 
         risk = section("Risk Management",
                        "docs.cdp.coinbase.com/advanced-trade/reference/create_order")
@@ -927,6 +929,7 @@ class Dashboard(ctk.CTkFrame):
         entry_row(risk, "Order Size",          self.ord_var, "USD")
         entry_row(risk, "Minimum Bot Reserve", self.res_var, "USD")
         entry_row(risk, "Cooldown Between Trades", self.cd_var, "seconds")
+        entry_row(risk, "Coin Alloc Rounding", self.round_var, "tokens")
 
         # ── Signal timeframe selector ─────────────────────────────────────────
         tf_row = ctk.CTkFrame(risk, fg_color="transparent")
@@ -2215,6 +2218,12 @@ class Dashboard(ctk.CTkFrame):
                 total = self.real_exposure.get(p, 0) / price if price else 0
             for pct, b in qbtns:
                 v = total * pct / 100
+                if mode == "Coin Holdings":
+                    # round down to nearest alloc_round_tokens boundary
+                    n = self.alloc_round_tokens
+                    if n > 1:
+                        import math as _math
+                        v = _math.floor(v / n) * n
                 fmt = f"{v:.2f}" if mode == "USD Budget" else f"{v:.6f}"
                 b.configure(command=lambda x=fmt: (amt.delete(0, "end"),
                                                     amt.insert(0, x)))
@@ -2247,7 +2256,14 @@ class Dashboard(ctk.CTkFrame):
                     self.log_message(
                         f"Allocated ${val:,.2f} USD → {coin} bot wallet", "trade")
                 else:
-                    # val = coin quantity
+                    # val = coin quantity; apply rounding before validation
+                    n = self.alloc_round_tokens
+                    if n > 1:
+                        import math as _math
+                        val = _math.floor(val / n) * n
+                    if val <= 0:
+                        err.configure(text=f"Amount rounds to 0 (step: {n} tokens)")
+                        return
                     avail_qty = self.real_exposure.get(p, 0) / price if price else 0
                     if val > avail_qty + 1e-9:
                         err.configure(text=f"Max: {avail_qty:.6f} {coin}")
@@ -2435,6 +2451,7 @@ class Dashboard(ctk.CTkFrame):
             ORDER_AMOUNT_USD = float(self.ord_var.get())
             MINIMUM_RESERVE  = float(self.res_var.get())
             COOLDOWN_SECONDS = float(self.cd_var.get())
+            self.alloc_round_tokens = max(1, int(float(self.round_var.get())))
             import engine as _eng
             _eng.COOLDOWN_SECONDS = COOLDOWN_SECONDS
             self.signal_tf        = self.signal_tf_var.get()
@@ -2450,15 +2467,16 @@ class Dashboard(ctk.CTkFrame):
             ) or 'none'
             # ── Persist to config.json ────────────────────────────────────────
             save_user_settings({
-                'signal_tf':        self.signal_tf,
-                'signal_direction': self.signal_direction,
-                'ma_periods':       list(self.custom_ma_periods),
-                'swap_targets':     dict(self.swap_targets),
-                'stop_loss_pct':    STOP_LOSS_PCT,
-                'take_profit_pct':  TAKE_PROFIT_PCT,
-                'order_amount_usd': ORDER_AMOUNT_USD,
-                'minimum_reserve':  MINIMUM_RESERVE,
-                'cooldown_seconds': COOLDOWN_SECONDS,
+                'signal_tf':           self.signal_tf,
+                'signal_direction':    self.signal_direction,
+                'ma_periods':          list(self.custom_ma_periods),
+                'swap_targets':        dict(self.swap_targets),
+                'stop_loss_pct':       STOP_LOSS_PCT,
+                'take_profit_pct':     TAKE_PROFIT_PCT,
+                'order_amount_usd':    ORDER_AMOUNT_USD,
+                'minimum_reserve':     MINIMUM_RESERVE,
+                'cooldown_seconds':    COOLDOWN_SECONDS,
+                'alloc_round_tokens':  self.alloc_round_tokens,
             })
             self.log_message(
                 f"Settings saved  ·  Signal TF: {self.signal_tf}  ·  Swaps: {swap_summary}",
@@ -2489,15 +2507,16 @@ class Dashboard(ctk.CTkFrame):
         self.ma_periods_var.set(", ".join(str(p) for p in periods))
         # Persist MA change alongside current settings
         save_user_settings({
-            'signal_tf':        self.signal_tf,
-            'signal_direction': self.signal_direction,
-            'ma_periods':       list(periods),
-            'swap_targets':     dict(self.swap_targets),
-            'stop_loss_pct':    STOP_LOSS_PCT,
-            'take_profit_pct':  TAKE_PROFIT_PCT,
-            'order_amount_usd': ORDER_AMOUNT_USD,
-            'minimum_reserve':  MINIMUM_RESERVE,
-            'cooldown_seconds': COOLDOWN_SECONDS,
+            'signal_tf':           self.signal_tf,
+            'signal_direction':    self.signal_direction,
+            'ma_periods':          list(periods),
+            'swap_targets':        dict(self.swap_targets),
+            'stop_loss_pct':       STOP_LOSS_PCT,
+            'take_profit_pct':     TAKE_PROFIT_PCT,
+            'order_amount_usd':    ORDER_AMOUNT_USD,
+            'minimum_reserve':     MINIMUM_RESERVE,
+            'cooldown_seconds':    COOLDOWN_SECONDS,
+            'alloc_round_tokens':  self.alloc_round_tokens,
         })
         self.log_message(f"Moving averages updated: {periods}", "trade")
         self._refresh_chart()
