@@ -2654,19 +2654,18 @@ class Dashboard(ctk.CTkFrame):
                 # to exactly what Coinbase requires (e.g. XCN may be 0.01 = 2dp)
                 base_inc = info.get('base_increment', '0.00000001')
                 try:
-                    inc_f = float(base_inc)
+                    inc_f = float(base_inc)  # handles scientific notation (1e-8)
                     if inc_f >= 1:
                         dp = 0
-                    elif '.' in str(base_inc):
-                        dp = len(str(base_inc).rstrip('0').split('.')[-1])
                     else:
-                        dp = 0
+                        import math as _m
+                        dp = max(0, -int(_m.floor(_m.log10(inc_f))))
                     self._base_precision[pair] = dp
                 except Exception:
-                    self._base_precision[pair] = 2
+                    self._base_precision[pair] = 8  # safe default (BTC-level precision)
                 self.log_message(
                     f"{pair}: {format_price(price) if price else '—'}  "
-                    f"(base increment {base_inc})", "info")
+                    f"(base_increment={base_inc} → {self._base_precision[pair]}dp)", "info")
             except Exception as e:
                 self.log_message(f"Price fetch {pair}: {e}", "warn")
 
@@ -3045,8 +3044,10 @@ class Dashboard(ctk.CTkFrame):
                             trade['stop_loss'] = min(orig_sl, trail_sl)
                             hit_trail = cur >= trail_sl
 
-                    hit_sl = (trade['side'] == 'buy'  and cur <= orig_sl) or \
-                             (trade['side'] == 'sell' and cur >= orig_sl)
+                    # Use trade['stop_loss'] (may have been updated by trail above)
+                    cur_sl = trade['stop_loss']
+                    hit_sl = (trade['side'] == 'buy'  and cur <= cur_sl) or \
+                             (trade['side'] == 'sell' and cur >= cur_sl)
                     hit_tp = (trade['side'] == 'buy'  and cur >= orig_tp) or \
                              (trade['side'] == 'sell' and cur <= orig_tp)
 
@@ -3080,9 +3081,10 @@ class Dashboard(ctk.CTkFrame):
             if not self.running or self.paused:
                 return
 
-            # C4 fix: reject if live price is stale (>15s since last WebSocket tick)
+            # Reject if live price is stale — 30s threshold to avoid false-blocking
+            # on startup before WS connects (initial REST price is set at startup time)
             price_age = time.time() - self._price_ts.get(pair, 0)
-            if price_age > 15:
+            if price_age > 30:
                 self.log_message(
                     f"Skipping {side} {pair} — price feed stale ({price_age:.0f}s old)",
                     "warn")
@@ -3144,11 +3146,17 @@ class Dashboard(ctk.CTkFrame):
                     quote_size=quote_str
                 )
             else:
-                dp  = self._base_precision.get(pair, 2)
+                dp  = self._base_precision.get(pair, 8)
                 qty = amount_usd / price
                 # Floor (not round) to never over-sell; respect Coinbase base_increment
                 import math as _math
                 qty = _math.floor(qty * (10 ** dp)) / (10 ** dp)
+                min_qty = 10 ** (-dp)
+                if qty < min_qty:
+                    self.log_message(
+                        f"Sell qty {qty} below min increment {min_qty} for {pair} — skipping",
+                        "warn")
+                    return
                 base_str = f"{qty:.{dp}f}"
                 self.log_message(
                     f"Placing SELL {pair}  base_size={base_str} ({dp}dp)  "
@@ -3221,10 +3229,11 @@ class Dashboard(ctk.CTkFrame):
                     self.bot_pair_alloc[pair] += spent * bot_frac
                 else:
                     self.bot_balance += spent
-                # Drain tracked quantities
+                # Drain tracked quantities — clamp to prevent negatives if price moved
                 drained_qty = min(qty_filled, coin_qty)
-                self.bot_coin_qty[pair]  = max(0, coin_qty - drained_qty)
-                self.bot_exposure[pair]  = max(0, bot_exp - spent * bot_frac)
+                bot_frac_drain = bot_frac if total_qty > 0 else 0
+                self.bot_coin_qty[pair] = max(0, coin_qty - drained_qty)
+                self.bot_exposure[pair] = max(0, bot_exp - min(spent * bot_frac_drain, bot_exp))
 
                 # ── Swap-on-sell ──────────────────────────────────────────────
                 await self._execute_swap(pair, spent)
@@ -3306,6 +3315,10 @@ class Dashboard(ctk.CTkFrame):
         trade = self.trade_history.get(tid)
         if not trade:
             return
+        # Guard: don't attempt to close the same position twice concurrently
+        if trade.get('_closing'):
+            return
+        trade['_closing'] = True
         pair       = trade['symbol']
         close_side = 'sell' if trade['side'] == 'buy' else 'buy'
         qty        = trade['quantity']
@@ -3313,11 +3326,20 @@ class Dashboard(ctk.CTkFrame):
         try:
             order_id = str(uuid.uuid4())
             if close_side == 'sell':
+                dp  = self._base_precision.get(pair, 8)
+                import math as _m2
+                qty_adj  = _m2.floor(qty * (10 ** dp)) / (10 ** dp)
+                min_qty  = 10 ** (-dp)
+                if qty_adj < min_qty:
+                    self.log_message(
+                        f"Close qty {qty_adj} below min increment — skipping {reason}", "warn")
+                    trade.pop('_closing', None)
+                    return
                 resp = await asyncio.to_thread(
                     self.client.market_order_sell,
                     client_order_id=order_id,
                     product_id=pair,
-                    base_size=str(round(qty, 8))
+                    base_size=f"{qty_adj:.{dp}f}"
                 )
             else:
                 resp = await asyncio.to_thread(
@@ -3335,6 +3357,7 @@ class Dashboard(ctk.CTkFrame):
                 self.log_message(
                     f"Close order REJECTED {pair} ({reason}): {err_msg}", "error")
                 logger.error(f"_close_trade rejected: {raw}")
+                trade.pop('_closing', None)
                 return
 
             pl = ((cur_price - trade['entry_price']) * qty
@@ -3342,13 +3365,24 @@ class Dashboard(ctk.CTkFrame):
                   else (trade['entry_price'] - cur_price) * qty)
             proceeds = qty * cur_price
             if close_side == 'sell':
-                # Return proceeds to the pair's allocation wallet, not bot_balance
-                self.bot_pair_alloc[pair] += proceeds
-                self.bot_exposure[pair]    = max(0, self.bot_exposure[pair] - proceeds)
+                # Drain coin sources proportionally (same logic as regular sell)
+                coin_qty = self.bot_coin_qty.get(pair, 0)
+                bot_exp  = self.bot_exposure.get(pair, 0)
+                total_q  = coin_qty + (bot_exp / cur_price if cur_price else 0)
+                if total_q > 0:
+                    user_frac = coin_qty / total_q
+                    bot_frac  = 1.0 - user_frac
+                    self.bot_balance          += proceeds * user_frac
+                    self.bot_pair_alloc[pair] += proceeds * bot_frac
+                else:
+                    self.bot_pair_alloc[pair] += proceeds
+                drained = min(qty, coin_qty)
+                self.bot_coin_qty[pair] = max(0, coin_qty - drained)
+                self.bot_exposure[pair] = max(0, bot_exp - proceeds * (1.0 - (coin_qty / total_q if total_q else 0)))
                 # Apply swap-on-sell for SL/TP closes too
                 await self._execute_swap(pair, proceeds)
             else:
-                self.bot_pair_alloc[pair] -= proceeds
+                self.bot_pair_alloc[pair] = max(0, self.bot_pair_alloc[pair] - proceeds)
                 self.bot_exposure[pair]   += proceeds
             self.log_message(
                 f"CLOSED {trade['side'].upper()} {pair}  "
