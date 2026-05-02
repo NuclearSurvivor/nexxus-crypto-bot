@@ -1507,7 +1507,17 @@ class Dashboard(ctk.CTkFrame):
 
         chart_start_ms = data[0][0]
 
-        delta         = (mdates.date2num(ts[1]) - mdates.date2num(ts[0])) * 0.6 if len(ts) > 1 else 0.003
+        # Use median inter-candle gap (not first-two only) so sparse pairs like
+        # XCN-USD — where the first gap may be minutes wide — get the right width.
+        if len(ts) > 2:
+            _num_ts = mdates.date2num(ts)
+            _gaps   = np.diff(_num_ts)
+            _med    = float(np.median(_gaps))
+            delta   = _med * 0.7
+        elif len(ts) == 2:
+            delta = (mdates.date2num(ts[1]) - mdates.date2num(ts[0])) * 0.7
+        else:
+            delta = 0.003
         # Tight signal offset: ATR-based so arrows sit right at the candle wick
         signal_offset = max(atr * 0.08, closes[-1] * 0.001) if atr > 0 else closes[-1] * 0.001
 
