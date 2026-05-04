@@ -50,7 +50,7 @@ from engine import (
     load_candle_cache, save_candle_cache,
     load_user_settings, save_user_settings,
     make_client, make_ws_jwt,
-    TRADING_PAIRS, COINBASE_WS_URL, MAX_HISTORY, DISPLAY_CANDLES, FETCH_CANDLES,
+    TRADING_PAIRS, WATCHLIST_PAIRS, COINBASE_WS_URL, MAX_HISTORY, DISPLAY_CANDLES, FETCH_CANDLES,
     MA_PERIODS, TIMEFRAMES, ORDER_AMOUNT_USD, MINIMUM_RESERVE, WEBHOOK_PORT,
     STOP_LOSS_PCT, TAKE_PROFIT_PCT, TRAIL_STOP_PCT, ATR_PERIOD, COOLDOWN_SECONDS,
     SURGE_WINDOW, SURGE_PCT, SURGE_COOLDOWN,
@@ -787,11 +787,25 @@ class Dashboard(ctk.CTkFrame):
         row = ctk.CTkFrame(tb, fg_color="transparent")
         row.pack(fill="both", expand=True, padx=10)
 
-        # Pair selector
+        # Pair selector — trading pairs + watchlist in a dropdown + segmented buttons
+        _all_chart_pairs = TRADING_PAIRS + WATCHLIST_PAIRS
         ctk.CTkSegmentedButton(
             row, values=TRADING_PAIRS, variable=self.chart_pair_var,
             command=self._on_chart_pair_change, height=32
-        ).pack(side="left", padx=(0, 0), pady=10)
+        ).pack(side="left", padx=(0, 4), pady=10)
+        # Watchlist dropdown — more coins without crowding the toolbar
+        _wl_var = ctk.StringVar(value="More ▾")
+        _wl_menu = ctk.CTkOptionMenu(
+            row, variable=_wl_var,
+            values=WATCHLIST_PAIRS,
+            width=100, height=32,
+            fg_color=C_CARD, button_color=C_CARD2,
+            text_color=C_TEXT2, font=("Segoe UI", 11),
+            command=lambda p: (self.chart_pair_var.set(p),
+                               _wl_var.set("More ▾"),
+                               self._on_chart_pair_change(p))
+        )
+        _wl_menu.pack(side="left", padx=(0, 0), pady=10)
 
         ctk.CTkFrame(row, width=1, fg_color=C_BORDER2).pack(
             side="left", fill="y", padx=10, pady=10)
@@ -1711,9 +1725,17 @@ class Dashboard(ctk.CTkFrame):
                     border_color="#1a3324" if pct >= 0 else "#331a1a")
 
     def _on_chart_pair_change(self, _=None):
-        """Update chart header pair label then refresh chart."""
+        """Update chart header, trigger on-demand fetch for watchlist pairs, refresh."""
         pair = self.chart_pair_var.get()
         self.chart_hdr_pair_lbl.configure(text=pair.replace("-", "/"))
+        # If this pair has no cached data yet (watchlist pair never fetched), kick off
+        # a background fetch for all timeframes so the chart populates immediately.
+        if pair not in TRADING_PAIRS:
+            has_data = any(len(self.candle_history[tf][pair]) > 0 for tf in TIMEFRAMES)
+            if not has_data:
+                self.log_message(f"On-demand fetch: {pair} (watchlist)", "info")
+                asyncio.run_coroutine_threadsafe(
+                    self._fetch_watchlist_pair(pair), self.loop)
         self._refresh_chart()
 
     # ── Chart drawing ─────────────────────────────────────────────────────────
@@ -3225,9 +3247,20 @@ class Dashboard(ctk.CTkFrame):
     async def _candles_loop(self):
         """
         Fetch candles sequentially with spacing to avoid Coinbase 429 rate limits.
-        Coinbase Advanced Trade: ~10 req/s private, ~3 req/s public per IP.
-        We stay conservative: one candle-batch call every 0.5 s.
+        Trading pairs are refreshed every 5 min.  Watchlist pairs are pre-fetched
+        once at startup (best-effort; skipped on rate-limit) and cached to disk.
         """
+        # ── Startup: pre-cache watchlist pairs in the background ─────────────
+        # Delay 60s after bot starts so trading-pair initial fetch takes priority.
+        await asyncio.sleep(60)
+        for pair in WATCHLIST_PAIRS:
+            if not self.running:
+                return
+            # Only fetch if not already in cache (avoids redundant API calls)
+            has_data = any(len(self.candle_history[tf][pair]) > 0 for tf in TIMEFRAMES)
+            if not has_data:
+                await self._fetch_watchlist_pair(pair)
+
         while self.running:
             for pair in TRADING_PAIRS:
                 for tf in TIMEFRAMES:
@@ -3236,6 +3269,24 @@ class Dashboard(ctk.CTkFrame):
                     await self._fetch_pair_tf(pair, tf)
                     await asyncio.sleep(0.5)   # 0.5 s between each call
             await asyncio.sleep(300)           # full refresh every 5 min
+
+    async def _fetch_watchlist_pair(self, pair: str):
+        """Fetch all 4 TFs for a watchlist/on-demand pair and cache to disk.
+        Uses larger FETCH_CANDLES depth for best MA accuracy — same as trading pairs.
+        No signals or indicator calculations run for watchlist pairs.
+        """
+        self.log_message(f"Caching watchlist: {pair} (all TFs)…", "monitor")
+        for tf in TIMEFRAMES:
+            if not self.running:
+                return
+            try:
+                await self._fetch_pair_tf(pair, tf)
+                await asyncio.sleep(0.6)   # conservative spacing for public endpoint
+            except Exception as e:
+                self.log_message(f"Watchlist fetch {pair}/{tf}: {e}", "warn")
+        # Persist expanded cache to disk immediately
+        save_candle_cache(self.candle_history)
+        self.log_message(f"Watchlist cached: {pair}", "monitor")
 
     async def _fetch_pair_tf(self, pair: str, timeframe: str):
         """Batch-fetch up to FETCH_CANDLES[tf] candles (2× display) so MAs are
@@ -3305,15 +3356,18 @@ class Dashboard(ctk.CTkFrame):
                 prev_c, last_c = ha[-2][4], ha[-1][4]
                 self.pct_24h[pair] = ((last_c - prev_c) / prev_c * 100) if prev_c else 0
 
+        # Watchlist-only pairs: skip indicator calculations and signal checks —
+        # they are view/cache only; bot does not trade them.
+        is_trading_pair = pair in TRADING_PAIRS
         # Always recalculate indicators on the signal TF so SMC zones stay current.
         # Also keep 1h as a fallback so the chart has data even when signal_tf differs.
-        if timeframe == self.signal_tf or timeframe == '1h':
+        if is_trading_pair and (timeframe == self.signal_tf or timeframe == '1h'):
             self.indicator_engine.calculate_support_resistance(pair, ha)
             self.indicator_engine.calculate_order_blocks(pair, ha)
             self.indicator_engine.calculate_fair_value_gaps(pair, ha)
             self.indicator_engine.calculate_atr(pair, ha)
 
-        if timeframe == self.signal_tf and self.running and not self.paused:
+        if is_trading_pair and timeframe == self.signal_tf and self.running and not self.paused:
             # Confirmation frame: one step shorter than the signal TF
             _conf_map = {'1m': '1m', '5m': '1m', '1h': '5m', '1d': '1h'}
             conf_tf   = _conf_map.get(self.signal_tf, '1m')

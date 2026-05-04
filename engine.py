@@ -24,6 +24,12 @@ logger = logging.getLogger("engine")
 
 # ── Constants ────────────────────────────────────────────────────────────────
 TRADING_PAIRS        = ["BTC-USD", "ETH-USD", "XCN-USD"]
+# Watchlist extends the chart viewer beyond active trading pairs.
+# No trades are placed for watchlist-only pairs — they are view + cache only.
+WATCHLIST_PAIRS      = [
+    "SOL-USD", "DOGE-USD", "ADA-USD", "AVAX-USD",
+    "LINK-USD", "DOT-USD", "MATIC-USD", "LTC-USD",
+]
 COINBASE_WS_URL      = "wss://advanced-trade-ws.coinbase.com"
 MAX_HISTORY          = 2000
 DISPLAY_CANDLES      = {'1m': 200, '5m': 500, '1h': 300, '1d': 365}
