@@ -4795,10 +4795,12 @@ class Dashboard(ctk.CTkFrame):
             # Attempt 2: price at raw bid/ask — maker on normal-spread markets.
             # Fallback:  market order — guaranteed fill, taker fee applies.
             #
-            # fast_exec (signal-triggered): 2 attempts × 25s → market (~1 min max)
-            # normal:                       3 attempts × 90s → market (~5 min max)
-            MAX_LIMIT_ATTEMPTS = 2 if fast_exec else 3
-            _fill_timeout      = 25 if fast_exec else 90
+            # fast_exec (signal-triggered): 2 attempts × 30s → market (~1 min max)
+            # normal:                       5 attempts × 120s → market (~10 min max)
+            # Longer patience on normal orders = more time to fill as maker (0% taker fee).
+            # XCN and other illiquid pairs need several minutes to attract buyers/sellers.
+            MAX_LIMIT_ATTEMPTS = 2 if fast_exec else 5
+            _fill_timeout      = 30 if fast_exec else 120
             tick         = 10 ** (-qdp)
             filled_price = None
             qty_filled   = None
@@ -5110,7 +5112,8 @@ class Dashboard(ctk.CTkFrame):
             # Attempt 1: 1 tick from crossing → guaranteed maker on any market
             # Attempt 2: at raw bid/ask → maker if spread exists
             # Fallback:  market
-            MAX_CLOSE_ATTEMPTS = 3
+            MAX_CLOSE_ATTEMPTS = 5   # same patience as _place_order normal path
+            _close_timeout     = 120
             tick_c             = 10 ** (-qdp)
             close_filled_price = None
             close_filled_qty   = None
@@ -5163,7 +5166,7 @@ class Dashboard(ctk.CTkFrame):
                     continue
 
                 placed_id = (raw.get('success_response', {}) or {}).get('order_id') or order_id
-                filled_order = await self._wait_for_fill(placed_id, timeout_s=90)
+                filled_order = await self._wait_for_fill(placed_id, timeout_s=_close_timeout)
                 if filled_order:
                     avg = float(filled_order.get('average_filled_price', 0) or 0)
                     fees = float(filled_order.get('total_fees', 0) or 0)
