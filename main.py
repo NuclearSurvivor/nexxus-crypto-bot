@@ -59,7 +59,7 @@ from engine import (
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s.%(msecs)03d  %(levelname)-5s  %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
@@ -68,13 +68,32 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("nexxus")
+# Suppress websocket frame-level debug noise (ticker spam)
+logging.getLogger('websockets').setLevel(logging.WARNING)
+logging.getLogger('websockets.client').setLevel(logging.WARNING)
 
 # ── Theme ─────────────────────────────────────────────────────────────────────
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-# Render budget — all interactive throttles use this single constant
-_FRAME_DT = 1.0 / 144   # ~6.94 ms per frame @ 144 fps
+# Render budget — throttles hover/drag redraws to the monitor's native refresh rate
+def _detect_monitor_hz() -> float:
+    """Query xrandr for the active display refresh rate; fall back to 60."""
+    try:
+        import subprocess, re
+        out = subprocess.check_output(['xrandr'], text=True, timeout=2)
+        for line in out.splitlines():
+            m = re.search(r'([\d.]+)\*', line)
+            if m:
+                hz = float(m.group(1))
+                if 24 <= hz <= 500:   # sanity range
+                    return hz
+    except Exception:
+        pass
+    return 60.0
+
+_MONITOR_HZ = _detect_monitor_hz()
+_FRAME_DT   = 1.0 / _MONITOR_HZ   # e.g. 6.94 ms @ 144 Hz, 16.67 ms @ 60 Hz
 
 # v2 color system — layered depth, trading terminal palette
 C_BG       = "#070a0f"   # base background
@@ -244,6 +263,8 @@ class Dashboard(ctk.CTkFrame):
 
         # State
         self.usd_balance     = 0.0
+        self.usdc_balance    = 0.0        # USDC held (also counted in usd_balance)
+        self.usdt_balance    = 0.0        # USDT held (also counted in usd_balance)
         self.bot_balance     = 0.0        # general (unassigned) bot pool
         self.bot_pair_alloc  = defaultdict(float)   # per-coin USD budget
         self.bot_coin_qty    = defaultdict(float)   # coins handed to bot from holdings
@@ -253,6 +274,7 @@ class Dashboard(ctk.CTkFrame):
         self.live_prices      = defaultdict(float)
         self._price_ts        = defaultdict(float)   # C4: timestamp of last price update
         self._base_precision  = {}                   # pair → int decimal places for base_size
+        self._quote_precision = {}                   # pair → int decimal places for limit_price
         self.price_history   = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
         self.candle_history  = {tf: defaultdict(lambda: deque(maxlen=MAX_HISTORY))
                                  for tf in TIMEFRAMES}
@@ -284,7 +306,26 @@ class Dashboard(ctk.CTkFrame):
         if 'cooldown_seconds' in _s:
             globals()['COOLDOWN_SECONDS'] = float(_s['cooldown_seconds'])
             import engine as _eng2; _eng2.COOLDOWN_SECONDS = float(_s['cooldown_seconds'])
-        self.alloc_round_tokens = int(_s.get('alloc_round_tokens', 250))
+        self.alloc_round_tokens     = int(_s.get('alloc_round_tokens', 250))
+        self.auto_compound_enabled  = bool(_s.get('auto_compound_enabled', False))
+        self.auto_compound_pct      = float(_s.get('auto_compound_pct',  10.0))  # % of avail per trade
+        self.auto_compound_cap      = float(_s.get('auto_compound_cap', 500.0))  # max order USD
+
+        # ── Restore persisted bot pool balances ───────────────────────────────
+        # bot_balance and bot_pair_alloc are saved to config.json after every
+        # trade and allocation so cash accumulated from sell cycles survives
+        # restarts and isn't silently lost.
+        self.bot_balance = float(_s.get('bot_balance', 0.0))
+        for _p, _v in _s.get('bot_pair_alloc', {}).items():
+            if _p in TRADING_PAIRS:
+                self.bot_pair_alloc[_p] = float(_v)
+        # Reconstruct bot_exposure from any open BUY trades persisted in trades.json
+        # so the monitor loop has correct state if the bot is restarted mid-position.
+        for _t in self.trade_history.values():
+            if _t.get('event') == 'trade' and _t.get('side') == 'buy':
+                _tp = _t.get('symbol', '')
+                if _tp in TRADING_PAIRS:
+                    self.bot_exposure[_tp] += float(_t.get('entry_price', 0)) * float(_t.get('quantity', 0))
 
         self.running         = True
         self.paused          = False
@@ -539,6 +580,12 @@ class Dashboard(ctk.CTkFrame):
         bs_hdr.pack(fill="x", padx=16, pady=(14, 6))
         ctk.CTkLabel(bs_hdr, text="⚙  BOT STATUS", font=("Segoe UI", 9, "bold"),
                      text_color=C_MUTED).pack(side="left")
+        ctk.CTkButton(
+            bs_hdr, text="Copy", width=52, height=22, corner_radius=6,
+            fg_color=C_CARD2, hover_color=C_BORDER2, text_color=C_TEXT2,
+            font=("Segoe UI", 9),
+            command=self._copy_bot_status
+        ).pack(side="right")
 
         bs_grid = ctk.CTkFrame(bsc, fg_color="transparent")
         bs_grid.pack(fill="x", padx=16, pady=(0, 14))
@@ -853,6 +900,12 @@ class Dashboard(ctk.CTkFrame):
         th.pack(fill="x", padx=20, pady=(20, 10))
         ctk.CTkLabel(th, text="ACTIVE POSITIONS", font=("Segoe UI", 10, "bold"),
                      text_color=C_MUTED).pack(side="left")
+        ctk.CTkButton(
+            th, text="Copy All", width=70, height=26, corner_radius=7,
+            fg_color=C_CARD2, hover_color=C_BORDER2, text_color=C_TEXT2,
+            font=("Segoe UI", 9),
+            command=self._copy_trades
+        ).pack(side="right")
 
         table = ctk.CTkFrame(page, fg_color=C_CARD, corner_radius=14,
                              border_width=1, border_color=C_BORDER)
@@ -890,6 +943,21 @@ class Dashboard(ctk.CTkFrame):
         page = ctk.CTkFrame(self.content, fg_color=C_BG, corner_radius=0)
         scroll = ctk.CTkScrollableFrame(page, fg_color=C_BG)
         scroll.pack(fill="both", expand=True, padx=20, pady=20)
+
+        # Bind mouse wheel to scroll — works on all child widgets too
+        def _on_mousewheel(event):
+            try:
+                scroll._parent_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            except Exception:
+                pass
+        def _bind_mousewheel(widget):
+            widget.bind("<MouseWheel>",      _on_mousewheel, add="+")
+            widget.bind("<Button-4>",        lambda e: scroll._parent_canvas.yview_scroll(-1, "units"), add="+")
+            widget.bind("<Button-5>",        lambda e: scroll._parent_canvas.yview_scroll( 1, "units"), add="+")
+            for child in widget.winfo_children():
+                _bind_mousewheel(child)
+        # Defer binding until after all children are created
+        page.after(200, lambda: _bind_mousewheel(scroll))
 
         def section(title, link=None):
             f = ctk.CTkFrame(scroll, fg_color=C_PANEL, corner_radius=12,
@@ -967,6 +1035,27 @@ class Dashboard(ctk.CTkFrame):
         ctk.CTkLabel(
             risk,
             text="  Both = act on every signal  ·  Buy Only / Sell Only = ignore the other side",
+            font=("Segoe UI", 10), text_color=C_MUTED, justify="left",
+        ).pack(anchor="w", padx=20, pady=(0, 10))
+
+        # ── Auto-Compound ─────────────────────────────────────────────────────
+        ac_row = ctk.CTkFrame(risk, fg_color="transparent")
+        ac_row.pack(fill="x", padx=20, pady=(0, 6))
+        ctk.CTkLabel(ac_row, text="Auto-Compound Profits", width=240, anchor="w",
+                     font=("Segoe UI", 12), text_color=C_TEXT).pack(side="left")
+        self.ac_enabled_var = ctk.BooleanVar(value=self.auto_compound_enabled)
+        ctk.CTkSwitch(ac_row, text="", variable=self.ac_enabled_var,
+                      width=48, height=24,
+                      fg_color=C_CARD2, progress_color=C_GREEN).pack(side="left")
+
+        self.ac_pct_var = ctk.StringVar(value=str(self.auto_compound_pct))
+        self.ac_cap_var = ctk.StringVar(value=str(self.auto_compound_cap))
+        entry_row(risk, "  Order Size (% of available funds)", self.ac_pct_var, "%")
+        entry_row(risk, "  Max Order Cap",                     self.ac_cap_var, "USD")
+        ctk.CTkLabel(
+            risk,
+            text="  When ON, order size = avail_funds × pct% (capped at max).\n"
+                 "  Profits automatically scale trade sizes up to the cap.",
             font=("Segoe UI", 10), text_color=C_MUTED, justify="left",
         ).pack(anchor="w", padx=20, pady=(0, 10))
 
@@ -1076,30 +1165,73 @@ class Dashboard(ctk.CTkFrame):
     # ── Logs page ─────────────────────────────────────────────────────────────
     def _make_logs_page(self):
         page = ctk.CTkFrame(self.content, fg_color=C_BG, corner_radius=0)
-        hdr = ctk.CTkFrame(page, fg_color="transparent")
-        hdr.pack(fill="x", padx=20, pady=(20, 10))
-        ctk.CTkLabel(hdr, text="SYSTEM LOGS", font=("Segoe UI", 10, "bold"),
+
+        # Tab view: Logs (signals/fills/errors) | Monitor (balance/heartbeat)
+        tabs = ctk.CTkTabview(page, fg_color=C_CARD, corner_radius=14,
+                              border_width=1, border_color=C_BORDER,
+                              segmented_button_fg_color=C_CARD2,
+                              segmented_button_selected_color=C_ACCENT2,
+                              segmented_button_selected_hover_color="#5d47bb",
+                              segmented_button_unselected_color=C_CARD2,
+                              segmented_button_unselected_hover_color=C_BORDER2,
+                              text_color=C_TEXT)
+        tabs.pack(fill="both", expand=True, padx=20, pady=20)
+        tabs.add("Logs")
+        tabs.add("Monitor")
+
+        # ── Logs tab ──────────────────────────────────────────────────────────
+        logs_tab = tabs.tab("Logs")
+        lhdr = ctk.CTkFrame(logs_tab, fg_color="transparent")
+        lhdr.pack(fill="x", pady=(4, 8))
+        ctk.CTkLabel(lhdr, text="SIGNALS  ·  FILLS  ·  ERRORS", font=("Segoe UI", 9, "bold"),
                      text_color=C_MUTED).pack(side="left")
-        ctk.CTkButton(hdr, text="Clear", width=76, height=30, corner_radius=7,
-                      fg_color=C_CARD, hover_color=C_CARD2,
+        ctk.CTkButton(lhdr, text="Clear", width=68, height=26, corner_radius=6,
+                      fg_color=C_CARD2, hover_color=C_BORDER2,
                       border_width=1, border_color=C_BORDER,
-                      font=("Segoe UI", 11), text_color=C_TEXT2,
-                      command=self._clear_logs).pack(side="right", padx=(6, 0))
-        ctk.CTkButton(hdr, text="⎘  Copy", width=84, height=30, corner_radius=7,
-                      fg_color=C_CARD, hover_color=C_CARD2,
+                      font=("Segoe UI", 10), text_color=C_TEXT2,
+                      command=self._clear_logs).pack(side="right", padx=(4, 0))
+        ctk.CTkButton(lhdr, text="⎘ Copy", width=72, height=26, corner_radius=6,
+                      fg_color=C_CARD2, hover_color=C_BORDER2,
                       border_width=1, border_color=C_BORDER,
-                      font=("Segoe UI", 11), text_color=C_TEXT2,
-                      command=self._copy_logs).pack(side="right", padx=(6, 0))
+                      font=("Segoe UI", 10), text_color=C_TEXT2,
+                      command=self._copy_logs).pack(side="right", padx=(4, 0))
+        ctk.CTkButton(lhdr, text="💾 Save", width=72, height=26, corner_radius=6,
+                      fg_color=C_CARD2, hover_color=C_BORDER2,
+                      border_width=1, border_color=C_BORDER,
+                      font=("Segoe UI", 10), text_color=C_TEXT2,
+                      command=self._save_logs).pack(side="right", padx=(4, 0))
         self.log_filter = ctk.StringVar(value="All")
-        ctk.CTkSegmentedButton(hdr, values=["All", "Trades", "Errors"],
-                                variable=self.log_filter, height=30,
-                                command=self._filter_logs).pack(side="right", padx=12)
+        ctk.CTkSegmentedButton(lhdr, values=["All", "Trades", "Errors"],
+                                variable=self.log_filter, height=26,
+                                command=self._filter_logs).pack(side="right", padx=10)
         self.log_box = ctk.CTkTextbox(
-            page, fg_color=C_CARD, corner_radius=14,
-            border_width=1, border_color=C_BORDER,
+            logs_tab, fg_color="transparent",
             text_color=C_TEXT, font=("Courier New", 12), state="disabled")
-        self.log_box.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-        self._all_logs = []
+        self.log_box.pack(fill="both", expand=True)
+
+        # ── Monitor tab ───────────────────────────────────────────────────────
+        mon_tab = tabs.tab("Monitor")
+        mhdr = ctk.CTkFrame(mon_tab, fg_color="transparent")
+        mhdr.pack(fill="x", pady=(4, 8))
+        ctk.CTkLabel(mhdr, text="BALANCE SYNC  ·  WS HEARTBEAT  ·  POSITION TICKS",
+                     font=("Segoe UI", 9, "bold"), text_color=C_MUTED).pack(side="left")
+        ctk.CTkButton(mhdr, text="Clear", width=68, height=26, corner_radius=6,
+                      fg_color=C_CARD2, hover_color=C_BORDER2,
+                      border_width=1, border_color=C_BORDER,
+                      font=("Segoe UI", 10), text_color=C_TEXT2,
+                      command=self._clear_monitor).pack(side="right", padx=(4, 0))
+        ctk.CTkButton(mhdr, text="⎘ Copy", width=72, height=26, corner_radius=6,
+                      fg_color=C_CARD2, hover_color=C_BORDER2,
+                      border_width=1, border_color=C_BORDER,
+                      font=("Segoe UI", 10), text_color=C_TEXT2,
+                      command=self._copy_monitor).pack(side="right", padx=(4, 0))
+        self.monitor_box = ctk.CTkTextbox(
+            mon_tab, fg_color="transparent",
+            text_color=C_TEXT2, font=("Courier New", 11), state="disabled")
+        self.monitor_box.pack(fill="both", expand=True)
+
+        self._all_logs     = []   # (entry, color, level) — non-monitor messages
+        self._all_monitor  = []   # (entry) — monitor messages
         return page
 
     # ── Page navigation ───────────────────────────────────────────────────────
@@ -1118,19 +1250,33 @@ class Dashboard(ctk.CTkFrame):
 
     # ── Logging (thread-safe) ─────────────────────────────────────────────────
     def log_message(self, message: str, level="info"):
+        # Suppress consecutive duplicate messages — identical content adds no info
+        if message == getattr(self, '_last_log_msg', None):
+            return
+        self._last_log_msg = message
         now   = datetime.now(pytz.UTC)
         ts_ui = now.strftime("%H:%M:%S")
         entry = f"[{ts_ui}] {message}\n"
         # Write to bot.log with full date + ms and level tag
         log_fn = {"error": logger.error, "warn": logger.warning,
-                  "trade": logger.info,  "info":  logger.info}.get(level, logger.info)
-        log_fn(f"[{level.upper():<5}] {message}")
-        cmap  = {"error": C_RED, "warn": C_ORANGE, "trade": C_GREEN, "info": C_TEXT}
-        color = cmap.get(level, C_TEXT)
-        self._all_logs.append((entry, color, level))
-        if self.root_alive:
-            self.root.after(0, self._gui_append_log,      entry)
-            self.root.after(0, self._gui_append_activity, entry)
+                  "trade": logger.info,  "info": logger.info,
+                  "monitor": logger.debug}.get(level, logger.info)
+        log_fn(f"[{level.upper():<7}] {message}")
+
+        if level == "monitor":
+            # Route to Monitor tab — keeps main Logs clean
+            if hasattr(self, '_all_monitor'):
+                self._all_monitor.append(entry)
+            if self.root_alive:
+                self.root.after(0, self._gui_append_monitor, entry)
+        else:
+            cmap  = {"error": C_RED, "warn": C_ORANGE, "trade": C_GREEN, "info": C_TEXT}
+            color = cmap.get(level, C_TEXT)
+            if hasattr(self, '_all_logs'):
+                self._all_logs.append((entry, color, level))
+            if self.root_alive:
+                self.root.after(0, self._gui_append_log,      entry)
+                self.root.after(0, self._gui_append_activity, entry)
 
     def _gui_append_log(self, entry):
         try:
@@ -1138,6 +1284,17 @@ class Dashboard(ctk.CTkFrame):
             self.log_box.insert("end", entry)
             self.log_box.configure(state="disabled")
             self.log_box.see("end")
+        except Exception:
+            pass
+
+    def _gui_append_monitor(self, entry):
+        try:
+            if not hasattr(self, 'monitor_box'):
+                return
+            self.monitor_box.configure(state="normal")
+            self.monitor_box.insert("end", entry)
+            self.monitor_box.configure(state="disabled")
+            self.monitor_box.see("end")
         except Exception:
             pass
 
@@ -1151,9 +1308,24 @@ class Dashboard(ctk.CTkFrame):
             pass
 
     def _clear_logs(self):
+        self._all_logs.clear()
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
+
+    def _clear_monitor(self):
+        self._all_monitor.clear()
+        self.monitor_box.configure(state="normal")
+        self.monitor_box.delete("1.0", "end")
+        self.monitor_box.configure(state="disabled")
+
+    def _copy_monitor(self):
+        try:
+            text = self.monitor_box.get("1.0", "end").strip()
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception:
+            pass
 
     def _copy_logs(self):
         try:
@@ -1163,6 +1335,34 @@ class Dashboard(ctk.CTkFrame):
             self.log_message("Logs copied to clipboard", "info")
         except Exception:
             pass
+
+    def _save_logs(self):
+        """Save bot.log to a user-chosen file via file dialog."""
+        try:
+            from tkinter import filedialog
+            ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
+            path = filedialog.asksaveasfilename(
+                parent=self.root,
+                initialfile=f"nexxus_logs_{ts}.txt",
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("Log files", "*.log"), ("All files", "*.*")],
+                title="Save Logs"
+            )
+            if not path:
+                return
+            bot_log = os.path.join(os.path.dirname(__file__), 'bot.log')
+            if os.path.exists(bot_log):
+                import shutil
+                shutil.copy2(bot_log, path)
+                self.log_message(f"Logs saved → {path}", "info")
+            else:
+                # Fall back to saving the in-memory log box content
+                text = self.log_box.get("1.0", "end")
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(text)
+                self.log_message(f"Logs saved → {path}", "info")
+        except Exception as e:
+            self.log_message(f"Save logs error: {e}", "warn")
 
     def _filter_logs(self, _=None):
         filt = self.log_filter.get()
@@ -1393,6 +1593,87 @@ class Dashboard(ctk.CTkFrame):
         except Exception:
             pass
 
+    def _copy_bot_status(self):
+        """Copy current bot status snapshot to clipboard."""
+        try:
+            state_txt = ("PAUSED" if self.paused else
+                         "RUNNING" if self.running else "STOPPED")
+            bot_total = self.bot_balance + sum(self.bot_pair_alloc[p] for p in TRADING_PAIRS)
+            bot_exp   = sum(self.bot_exposure[p] for p in TRADING_PAIRS)
+            active    = sum(1 for t in self.trade_history.values() if t.get('event') == 'trade')
+            lines = [
+                f"── BOT STATUS ─────────────────── {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"State        : {state_txt}",
+                f"Mode         : {self.signal_direction}",
+                f"Signal TF    : {self.signal_tf}",
+                f"Active Trades: {active}",
+                f"Allocated    : ${bot_total + sum(self.bot_coin_qty.get(p,0)*self.live_prices.get(p,0) for p in TRADING_PAIRS):,.2f}",
+                f"Deployed     : ${bot_exp:,.2f}",
+                f"Liquid USD   : ${self.usd_balance:,.2f}",
+            ]
+            for pair in TRADING_PAIRS:
+                usd_a = self.bot_pair_alloc.get(pair, 0)
+                exp_a = self.bot_exposure.get(pair, 0)
+                cqty  = self.bot_coin_qty.get(pair, 0)
+                cval  = cqty * self.live_prices.get(pair, 0) if cqty > 0 else 0
+                if usd_a + exp_a + cval > 0:
+                    lines.append(
+                        f"  {pair.split('-')[0]:<6}: ${usd_a:,.2f} USD  "
+                        f"${exp_a:,.2f} deployed  "
+                        f"{cqty:.4f} coins ≈ ${cval:,.2f}")
+            sig = self.last_executed_signal
+            if sig:
+                lines.append(
+                    f"Last Signal  : {sig['side'].upper()} {sig['pair']} "
+                    f"@ {format_price(sig['price'])}  "
+                    f"${sig['spent']:,.2f}  "
+                    f"{datetime.fromtimestamp(sig['ts']).strftime('%H:%M:%S')}")
+            text = "\n".join(lines)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception as e:
+            self.log_message(f"Copy bot status error: {e}", "warn")
+
+    def _copy_trades(self):
+        """Copy active positions + closed trade history to clipboard."""
+        try:
+            lines = [
+                f"── TRADES ──────────────────────── {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                "",
+                "ACTIVE POSITIONS",
+                f"{'Pair':<12}{'Side':<6}{'Qty':>12}{'Entry':>12}{'Current':>12}{'P&L':>10}{'SL':>12}{'TP':>12}",
+                "-" * 82,
+            ]
+            active_trades = [t for t in self.trade_history.values() if t.get('event') == 'trade']
+            if active_trades:
+                for t in active_trades:
+                    pair = t.get('symbol', '')
+                    cur  = self.live_prices.get(pair, t.get('entry_price', 0))
+                    qty  = t.get('quantity', 0)
+                    entr = t.get('entry_price', 0)
+                    pl   = (cur - entr) * qty if t.get('side') == 'buy' else (entr - cur) * qty
+                    lines.append(
+                        f"{pair:<12}{t.get('side','').upper():<6}"
+                        f"{qty:>12.4f}{format_price(entr):>12}{format_price(cur):>12}"
+                        f"{pl:>+10.2f}{format_price(t.get('stop_loss',0)):>12}"
+                        f"{format_price(t.get('take_profit',0)):>12}")
+            else:
+                lines.append("  (no active positions)")
+
+            lines.append("")
+            lines.append("CLOSED TRADE HISTORY")
+            try:
+                hist_text = self.history_box.get("1.0", "end").strip()
+                lines.append(hist_text if hist_text else "  (no history)")
+            except Exception:
+                lines.append("  (unavailable)")
+
+            text = "\n".join(lines)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception as e:
+            self.log_message(f"Copy trades error: {e}", "warn")
+
     def _update_pair_cards(self):
         for pair in TRADING_PAIRS:
             pc    = self.pair_cards.get(pair)
@@ -1613,9 +1894,13 @@ class Dashboard(ctk.CTkFrame):
                 ax.plot(ts[-len(warmed):], warmed, color=col, linewidth=1.3, alpha=0.9)
             ma_lines[period] = warmed
 
-        # ── 6. Signals — MA crossover replay across all timeframes ──────────
-        # All crossovers shown solid regardless of timeframe — bot acts on
-        # signal TF, other TFs show the same markers for context.
+        # ── 6. Signals ────────────────────────────────────────────────────────
+        # INVARIANT: every marker drawn here uses the SAME logic as
+        # _ingest_candles + engine.calculate_signals / calculate_breakout.
+        # Signals are ONLY shown when viewing the signal TF so that "a marker
+        # on the chart" == "something that could trigger a trade".
+        # On non-signal TF views, MA lines are still visible for context but
+        # no signal markers are drawn — those crossovers do not drive orders.
 
         sorted_periods = sorted(MA_PERIODS)
         p_fast = sorted_periods[0]
@@ -1626,118 +1911,164 @@ class Dashboard(ctk.CTkFrame):
         breakout_drawn   = False
         is_signal_tf     = (tf == self.signal_tf)
 
-        ma_fast = ma_lines.get(p_fast, np.array([]))
-        ma_slow = ma_lines.get(p_slow, np.array([]))
-        _n = min(len(ma_fast), len(ma_slow), len(ts))
+        if not is_signal_tf:
+            # Non-signal TF: no markers — inform user which TF has signals.
+            ax.annotate(
+                f"Signal markers shown on {self.signal_tf} chart",
+                xy=(0.01, 0.01), xycoords='axes fraction',
+                fontsize=7, color=C_MUTED, alpha=0.65, va='bottom', ha='left')
+        else:
+            # ── Precompute confirmation TF MA diff indexed by candle timestamp ─
+            # Matches engine.calculate_signals: BUY only if MA_fast > MA_slow on
+            # conf TF at the time of the crossover.  SELL requires the opposite.
+            _conf_map = {'1m': '1m', '5m': '1m', '1h': '5m', '1d': '1h'}
+            _conf_tf  = _conf_map.get(self.signal_tf, '1m')
+            _conf_raw = list(self.candle_history[_conf_tf][pair])
+            _conf_diff_by_ts: dict = {}   # candle_ts_ms → float (fast_ma − slow_ma)
+            if len(_conf_raw) >= p_slow:
+                _conf_c    = np.array([c[4] for c in _conf_raw])
+                _cf_fast   = np.convolve(_conf_c, np.ones(p_fast) / p_fast, 'valid')
+                _cf_slow   = np.convolve(_conf_c, np.ones(p_slow) / p_slow, 'valid')
+                _conf_vts  = [c[0] for c in _conf_raw[(p_slow - 1):]]
+                for _t, _fd, _sd in zip(_conf_vts, _cf_fast, _cf_slow):
+                    _conf_diff_by_ts[_t] = float(_fd) - float(_sd)
+            _conf_ts_sorted = sorted(_conf_diff_by_ts.keys())
 
-        if _n >= 2:
-            _mf  = ma_fast[-_n:]
-            _ms  = ma_slow[-_n:]
-            _ts  = ts[-_n:]
-            _hi  = highs[-_n:]
-            _lo  = lows[-_n:]
-            _cl  = closes[-_n:]
+            import bisect as _bisect
+            def _conf_diff_at(ts_ms: int) -> 'float | None':
+                """Conf TF MA diff at the most recent candle ≤ ts_ms. None if unavailable."""
+                if not _conf_ts_sorted:
+                    return None
+                idx = _bisect.bisect_right(_conf_ts_sorted, ts_ms) - 1
+                if idx < 0:
+                    return None
+                return _conf_diff_by_ts[_conf_ts_sorted[idx]]
 
-            for i in range(1, _n):
-                prev = _mf[i - 1] - _ms[i - 1]
-                curr = _mf[i]     - _ms[i]
-                is_golden = (prev < 0 < curr)
-                is_death  = (prev > 0 > curr)
-                if not (is_golden or is_death):
-                    continue
+            # ── 6a. MA crossover signals with conf TF validation ──────────────
+            ma_fast = ma_lines.get(p_fast, np.array([]))
+            ma_slow = ma_lines.get(p_slow, np.array([]))
+            _n = min(len(ma_fast), len(ma_slow), len(ts))
 
-                action = 'buy' if is_golden else 'sell'
+            if _n >= 2:
+                _mf        = ma_fast[-_n:]
+                _ms        = ma_slow[-_n:]
+                _ts        = ts[-_n:]
+                _hi        = highs[-_n:]
+                _lo        = lows[-_n:]
+                _cl        = closes[-_n:]
+                _data_win  = data[-_n:]   # raw candle rows with timestamps
 
-                if action == 'buy':
-                    y_pos  = _lo[i] - signal_offset
-                    color  = C_GREEN
-                    marker = "▲"
-                    va     = 'top'
-                else:
-                    y_pos  = _hi[i] + signal_offset
-                    color  = C_RED
-                    marker = "▼"
-                    va     = 'bottom'
+                for i in range(1, _n):
+                    prev = _mf[i - 1] - _ms[i - 1]
+                    curr = _mf[i]     - _ms[i]
+                    is_golden = (prev < 0 < curr)
+                    is_death  = (prev > 0 > curr)
+                    if not (is_golden or is_death):
+                        continue
 
-                ax.annotate(marker, (_ts[i], y_pos),
-                            color=color, fontsize=10, alpha=1.0,
-                            ha='center', va=va, fontweight='bold')
+                    action = 'buy' if is_golden else 'sell'
 
-                self._signal_data.append({
-                    'ts':           _ts[i],
-                    'price':        y_pos,
-                    'candle_price': float(_cl[i]),
-                    'action':       action,
-                    'confirmed':    is_signal_tf,
-                    'source':       f'MA{p_fast}/MA{p_slow} Cross',
-                    'price_str':    format_price(_cl[i]),
-                    'time_str':     _ts[i].strftime('%Y-%m-%d %H:%M UTC'),
-                    'ma9':          float(_mf[i]),
-                    'ma20':         float(_ms[i]),
-                    'p_fast':       p_fast,
-                    'p_slow':       p_slow,
-                    'atr':          atr,
-                })
-                if action == 'buy':  buy_signal_drawn  = True
-                else:                sell_signal_drawn = True
+                    # Confirmation TF check — same gate as engine.calculate_signals
+                    candle_ts_ms = _data_win[i][0]
+                    conf_diff = _conf_diff_at(candle_ts_ms)
+                    if conf_diff is not None:
+                        if action == 'buy'  and conf_diff <= 0:
+                            continue   # conf TF disagrees — engine would reject
+                        if action == 'sell' and conf_diff >= 0:
+                            continue   # conf TF disagrees — engine would reject
 
-        # ── 6b. Breakout signals (same logic as calculate_breakout) ──────────
-        if len(data) >= 25:
-            _lb    = 20
-            _cl_a  = closes
-            _hi_a  = highs
-            _lo_a  = lows
-            _vol_a = np.array([c[5] for c in data])
-            for i in range(_lb + 4, len(data)):
-                _cur   = _cl_a[i]
-                _prev  = _cl_a[i - 1]
-                _p_hi  = _hi_a[i - _lb:i].max()
-                _p_lo  = _lo_a[i - _lb:i].min()
-                _avg_v = _vol_a[i - _lb:i].mean() or 1e-12
-                _vsurge = _vol_a[i] > _avg_v * 2.0
-                _mom    = (_cur - _prev) / _prev if _prev > 0 else 0
-                if _cur > _p_hi and (_vsurge or _mom > 0.02):
-                    y_pos = _lo_a[i] - signal_offset * 2.2
-                    ax.annotate("⚡", (ts[i], y_pos),
-                                color=C_ACCENT3, fontsize=9,
-                                ha='center', va='top', fontweight='bold')
+                    if action == 'buy':
+                        y_pos  = _lo[i] - signal_offset
+                        color  = C_GREEN
+                        marker = "▲"
+                        va     = 'top'
+                    else:
+                        y_pos  = _hi[i] + signal_offset
+                        color  = C_RED
+                        marker = "▼"
+                        va     = 'bottom'
+
+                    ax.annotate(marker, (_ts[i], y_pos),
+                                color=color, fontsize=10, alpha=1.0,
+                                ha='center', va=va, fontweight='bold')
+
                     self._signal_data.append({
-                        'ts':           ts[i],
+                        'ts':           _ts[i],
                         'price':        y_pos,
-                        'candle_price': float(_cur),
-                        'action':       'buy',
-                        'confirmed':    True,
-                        'source':       'Breakout↑',
-                        'price_str':    format_price(_cur),
-                        'time_str':     ts[i].strftime('%Y-%m-%d %H:%M UTC'),
-                        'ma9':          float(ma_lines.get(p_fast, [0])[-1]) if ma_lines.get(p_fast, []) is not None and len(ma_lines.get(p_fast, [])) > 0 else 0,
-                        'ma20':         float(ma_lines.get(p_slow, [0])[-1]) if ma_lines.get(p_slow, []) is not None and len(ma_lines.get(p_slow, [])) > 0 else 0,
+                        'candle_price': float(_cl[i]),
+                        'action':       action,
+                        'confirmed':    True,   # conf TF was checked above
+                        'source':       f'MA{p_fast}/MA{p_slow} Cross',
+                        'price_str':    format_price(_cl[i]),
+                        'time_str':     _ts[i].strftime('%Y-%m-%d %H:%M:%S UTC'),
+                        'ma9':          float(_mf[i]),
+                        'ma20':         float(_ms[i]),
                         'p_fast':       p_fast,
                         'p_slow':       p_slow,
                         'atr':          atr,
                     })
-                    breakout_drawn = True
-                elif _cur < _p_lo and (_vsurge or _mom < -0.02):
-                    y_pos = _hi_a[i] + signal_offset * 2.2
-                    ax.annotate("⚡", (ts[i], y_pos),
-                                color=C_ACCENT3, fontsize=9,
-                                ha='center', va='bottom', fontweight='bold')
-                    self._signal_data.append({
-                        'ts':           ts[i],
-                        'price':        y_pos,
-                        'candle_price': float(_cur),
-                        'action':       'sell',
-                        'confirmed':    True,
-                        'source':       'Breakdown↓',
-                        'price_str':    format_price(_cur),
-                        'time_str':     ts[i].strftime('%Y-%m-%d %H:%M UTC'),
-                        'ma9':          float(ma_lines.get(p_fast, [0])[-1]) if ma_lines.get(p_fast, []) is not None and len(ma_lines.get(p_fast, [])) > 0 else 0,
-                        'ma20':         float(ma_lines.get(p_slow, [0])[-1]) if ma_lines.get(p_slow, []) is not None and len(ma_lines.get(p_slow, [])) > 0 else 0,
-                        'p_fast':       p_fast,
-                        'p_slow':       p_slow,
-                        'atr':          atr,
-                    })
-                    breakout_drawn = True
+                    if action == 'buy':  buy_signal_drawn  = True
+                    else:                sell_signal_drawn = True
+
+            # ── 6b. Breakout signals (signal TF only — matches calculate_breakout) ─
+            if len(data) >= 25:
+                _lb    = 20
+                _cl_a  = closes
+                _hi_a  = highs
+                _lo_a  = lows
+                _vol_a = np.array([c[5] for c in data])
+                _ma9_last  = float(ma_lines.get(p_fast, [0])[-1]) if len(ma_lines.get(p_fast, [])) > 0 else 0
+                _ma20_last = float(ma_lines.get(p_slow, [0])[-1]) if len(ma_lines.get(p_slow, [])) > 0 else 0
+                for i in range(_lb + 4, len(data)):
+                    _cur    = _cl_a[i]
+                    _prev   = _cl_a[i - 1]
+                    _p_hi   = _hi_a[i - _lb:i].max()
+                    _p_lo   = _lo_a[i - _lb:i].min()
+                    _avg_v  = _vol_a[i - _lb:i].mean() or 1e-12
+                    _vsurge = _vol_a[i] > _avg_v * 2.0
+                    _mom    = (_cur - _prev) / _prev if _prev > 0 else 0
+                    if _cur > _p_hi and (_vsurge or _mom > 0.02):
+                        y_pos = _lo_a[i] - signal_offset * 2.2
+                        ax.annotate("⚡", (ts[i], y_pos),
+                                    color=C_ACCENT3, fontsize=9,
+                                    ha='center', va='top', fontweight='bold')
+                        self._signal_data.append({
+                            'ts':           ts[i],
+                            'price':        y_pos,
+                            'candle_price': float(_cur),
+                            'action':       'buy',
+                            'confirmed':    True,
+                            'source':       'Breakout↑',
+                            'price_str':    format_price(_cur),
+                            'time_str':     ts[i].strftime('%Y-%m-%d %H:%M:%S UTC'),
+                            'ma9':          _ma9_last,
+                            'ma20':         _ma20_last,
+                            'p_fast':       p_fast,
+                            'p_slow':       p_slow,
+                            'atr':          atr,
+                        })
+                        breakout_drawn = True
+                    elif _cur < _p_lo and (_vsurge or _mom < -0.02):
+                        y_pos = _hi_a[i] + signal_offset * 2.2
+                        ax.annotate("⚡", (ts[i], y_pos),
+                                    color=C_ACCENT3, fontsize=9,
+                                    ha='center', va='bottom', fontweight='bold')
+                        self._signal_data.append({
+                            'ts':           ts[i],
+                            'price':        y_pos,
+                            'candle_price': float(_cur),
+                            'action':       'sell',
+                            'confirmed':    True,
+                            'source':       'Breakdown↓',
+                            'price_str':    format_price(_cur),
+                            'time_str':     ts[i].strftime('%Y-%m-%d %H:%M:%S UTC'),
+                            'ma9':          _ma9_last,
+                            'ma20':         _ma20_last,
+                            'p_fast':       p_fast,
+                            'p_slow':       p_slow,
+                            'atr':          atr,
+                        })
+                        breakout_drawn = True
 
         # ── 7. Live price line ───────────────────────────────────────────────
         if price:
@@ -1813,15 +2144,17 @@ class Dashboard(ctk.CTkFrame):
                 items.append(('sym', c, f"──  MA {p}"))
         items.append(('sp',   None,        None))
 
-        # Signal legend — all TFs show solid markers
+        # Signal legend — markers only appear on signal TF view
         if buy_signal_drawn:
             items.append(('sym', C_GREEN,   "▲  BUY signal"))
         if sell_signal_drawn:
             items.append(('sym', C_RED,     "▼  SELL signal"))
         if breakout_drawn:
             items.append(('sym', C_ACCENT3, "⚡  Breakout signal"))
-        if not is_signal_tf and (buy_signal_drawn or sell_signal_drawn or breakout_drawn):
-            items.append(('inf', C_MUTED,   f"Bot executes on {self.signal_tf}"))
+        if is_signal_tf and (buy_signal_drawn or sell_signal_drawn or breakout_drawn):
+            items.append(('inf', C_MUTED,   "Conf TF validated"))
+        if not is_signal_tf:
+            items.append(('inf', C_MUTED,   f"Signals: {self.signal_tf} only"))
         items.append(('sp', None, None))
 
         if ob_bull_drawn:
@@ -2159,15 +2492,19 @@ class Dashboard(ctk.CTkFrame):
                 coin  = p.split("-")[0]
                 price = self.live_prices.get(p, 0)
                 if mode == "USD Budget":
-                    sub = f"{format_price(price)}" if price else "—"
+                    # USD Budget: show only coin name — price is irrelevant here
+                    btn_text = coin
+                    btn_h    = 40
                 else:
                     holdings_usd = self.real_exposure.get(p, 0)
                     holdings_qty = holdings_usd / price if price else 0
-                    sub = f"{holdings_qty:.4f} {coin}" if holdings_qty else "0"
+                    sub      = f"{holdings_qty:.4f} {coin}" if holdings_qty else "0"
+                    btn_text = f"{coin}\n{sub}"
+                    btn_h    = 54
                 is_sel = (p == pair_var.get())
                 btn = ctk.CTkButton(
-                    pair_row, text=f"{coin}\n{sub}",
-                    width=118, height=54, corner_radius=10,
+                    pair_row, text=btn_text,
+                    width=118, height=btn_h, corner_radius=10,
                     fg_color=C_ACCENT2 if is_sel else C_CARD,
                     hover_color="#6a4de0" if is_sel else C_BORDER,
                     border_width=2 if is_sel else 1,
@@ -2217,14 +2554,41 @@ class Dashboard(ctk.CTkFrame):
             b.pack(side="left", padx=(0, 6))
             qbtns.append((pct, b))
 
+        def _allocate_all():
+            mode = mode_var.get()
+            if mode == "USD Budget":
+                v = f"{self.usd_balance:.2f}"
+            else:
+                p     = pair_var.get()
+                price = self.live_prices.get(p, 0)
+                total = self.real_exposure.get(p, 0) / price if price else 0
+                n = self.alloc_round_tokens
+                import math as _m2
+                total = _m2.floor(total / n) * n if n > 1 else total
+                v = f"{total:.6f}"
+            amt.delete(0, "end")
+            amt.insert(0, v)
+
+        ctk.CTkButton(form, text="Allocate All Available", height=32, corner_radius=8,
+                      fg_color=C_CARD2, hover_color=C_BORDER2,
+                      border_width=1, border_color=C_BORDER2,
+                      font=("Segoe UI", 11, "bold"), text_color=C_ACCENT3,
+                      command=_allocate_all).pack(fill="x", pady=(6, 0))
+
         def _refresh_labels():
             p    = pair_var.get()
             mode = mode_var.get()
             coin = p.split("-")[0]
             if mode == "USD Budget":
-                info_lbl.configure(
-                    text=f"Liquid USD: ${self.usd_balance:,.4f}  ·  "
-                         f"Bot wallet ({coin}): ${self.bot_pair_alloc.get(p,0):,.2f}")
+                raw_usd = max(0.0, self.usd_balance - self.usdc_balance - self.usdt_balance)
+                parts   = [f"USD: ${raw_usd:,.2f}"]
+                if self.usdc_balance > 0.01:
+                    parts.append(f"USDC: ${self.usdc_balance:,.2f}")
+                if self.usdt_balance > 0.01:
+                    parts.append(f"USDT: ${self.usdt_balance:,.2f}")
+                parts.append(f"Total liquid: ${self.usd_balance:,.2f}")
+                parts.append(f"Bot ({coin}): ${self.bot_pair_alloc.get(p,0):,.2f}")
+                info_lbl.configure(text="  ·  ".join(parts))
                 input_lbl.configure(text="Amount in USD")
                 amt.configure(placeholder_text="0.00 USD")
             else:
@@ -2303,6 +2667,7 @@ class Dashboard(ctk.CTkFrame):
                     self.bot_coin_qty[p] += val
                     self.log_message(
                         f"Allocated {val:.6f} {coin} holdings → bot", "trade")
+                self._save_bot_state()
                 self._update_metrics()
                 win.destroy()
             except ValueError:
@@ -2421,6 +2786,7 @@ class Dashboard(ctk.CTkFrame):
                     return
                 self.bot_pair_alloc[p] -= a
                 self.usd_balance       += a
+                self._save_bot_state()
                 self._update_metrics()
                 self.log_message(
                     f"Unallocated ${a:,.2f} from {p.split('-')[0]} → Liquid", "trade")
@@ -2480,7 +2846,10 @@ class Dashboard(ctk.CTkFrame):
             ORDER_AMOUNT_USD = float(self.ord_var.get())
             MINIMUM_RESERVE  = float(self.res_var.get())
             COOLDOWN_SECONDS = float(self.cd_var.get())
-            self.alloc_round_tokens = max(1, int(float(self.round_var.get())))
+            self.alloc_round_tokens    = max(1, int(float(self.round_var.get())))
+            self.auto_compound_enabled = bool(self.ac_enabled_var.get())
+            self.auto_compound_pct     = max(0.1, min(100.0, float(self.ac_pct_var.get())))
+            self.auto_compound_cap     = max(1.0, float(self.ac_cap_var.get()))
             import engine as _eng
             _eng.COOLDOWN_SECONDS = COOLDOWN_SECONDS
             self.signal_tf        = self.signal_tf_var.get()
@@ -2496,16 +2865,19 @@ class Dashboard(ctk.CTkFrame):
             ) or 'none'
             # ── Persist to config.json ────────────────────────────────────────
             save_user_settings({
-                'signal_tf':           self.signal_tf,
-                'signal_direction':    self.signal_direction,
-                'ma_periods':          list(self.custom_ma_periods),
-                'swap_targets':        dict(self.swap_targets),
-                'stop_loss_pct':       STOP_LOSS_PCT,
-                'take_profit_pct':     TAKE_PROFIT_PCT,
-                'order_amount_usd':    ORDER_AMOUNT_USD,
-                'minimum_reserve':     MINIMUM_RESERVE,
-                'cooldown_seconds':    COOLDOWN_SECONDS,
-                'alloc_round_tokens':  self.alloc_round_tokens,
+                'signal_tf':               self.signal_tf,
+                'signal_direction':        self.signal_direction,
+                'ma_periods':              list(self.custom_ma_periods),
+                'swap_targets':            dict(self.swap_targets),
+                'stop_loss_pct':           STOP_LOSS_PCT,
+                'take_profit_pct':         TAKE_PROFIT_PCT,
+                'order_amount_usd':        ORDER_AMOUNT_USD,
+                'minimum_reserve':         MINIMUM_RESERVE,
+                'cooldown_seconds':        COOLDOWN_SECONDS,
+                'alloc_round_tokens':      self.alloc_round_tokens,
+                'auto_compound_enabled':   self.auto_compound_enabled,
+                'auto_compound_pct':       self.auto_compound_pct,
+                'auto_compound_cap':       self.auto_compound_cap,
             })
             self.log_message(
                 f"Settings saved  ·  Signal TF: {self.signal_tf}  ·  Swaps: {swap_summary}",
@@ -2536,16 +2908,19 @@ class Dashboard(ctk.CTkFrame):
         self.ma_periods_var.set(", ".join(str(p) for p in periods))
         # Persist MA change alongside current settings
         save_user_settings({
-            'signal_tf':           self.signal_tf,
-            'signal_direction':    self.signal_direction,
-            'ma_periods':          list(periods),
-            'swap_targets':        dict(self.swap_targets),
-            'stop_loss_pct':       STOP_LOSS_PCT,
-            'take_profit_pct':     TAKE_PROFIT_PCT,
-            'order_amount_usd':    ORDER_AMOUNT_USD,
-            'minimum_reserve':     MINIMUM_RESERVE,
-            'cooldown_seconds':    COOLDOWN_SECONDS,
-            'alloc_round_tokens':  self.alloc_round_tokens,
+            'signal_tf':               self.signal_tf,
+            'signal_direction':        self.signal_direction,
+            'ma_periods':              list(periods),
+            'swap_targets':            dict(self.swap_targets),
+            'stop_loss_pct':           STOP_LOSS_PCT,
+            'take_profit_pct':         TAKE_PROFIT_PCT,
+            'order_amount_usd':        ORDER_AMOUNT_USD,
+            'minimum_reserve':         MINIMUM_RESERVE,
+            'cooldown_seconds':        COOLDOWN_SECONDS,
+            'alloc_round_tokens':      self.alloc_round_tokens,
+            'auto_compound_enabled':   self.auto_compound_enabled,
+            'auto_compound_pct':       self.auto_compound_pct,
+            'auto_compound_cap':       self.auto_compound_cap,
         })
         self.log_message(f"Moving averages updated: {periods}", "trade")
         self._refresh_chart()
@@ -2668,9 +3043,22 @@ class Dashboard(ctk.CTkFrame):
                     self._base_precision[pair] = dp
                 except Exception:
                     self._base_precision[pair] = 8  # safe default (BTC-level precision)
+                # Cache quote_increment precision for limit order price formatting
+                quote_inc = info.get('quote_increment', '0.01')
+                try:
+                    q_f = float(quote_inc)
+                    if q_f >= 1:
+                        qdp = 0
+                    else:
+                        import math as _mq
+                        qdp = max(0, -int(_mq.floor(_mq.log10(q_f))))
+                    self._quote_precision[pair] = qdp
+                except Exception:
+                    self._quote_precision[pair] = 2
                 self.log_message(
                     f"{pair}: {format_price(price) if price else '—'}  "
-                    f"(base_increment={base_inc} → {self._base_precision[pair]}dp)", "info")
+                    f"(base_increment={base_inc} → {self._base_precision[pair]}dp  "
+                    f"quote_increment={quote_inc} → {self._quote_precision[pair]}dp)", "info")
             except Exception as e:
                 self.log_message(f"Price fetch {pair}: {e}", "warn")
 
@@ -2681,6 +3069,70 @@ class Dashboard(ctk.CTkFrame):
         while self.running:
             await self._fetch_balance()
             await asyncio.sleep(60)
+
+    def _save_bot_state(self):
+        """Persist bot_balance and bot_pair_alloc to config.json.
+
+        Called after every trade fill and every manual allocation so that
+        cash accumulated from sell cycles (partial buybacks, profit) survives
+        restarts. bot_exposure is NOT persisted here — it's reconstructed from
+        trades.json entries on startup.
+        """
+        try:
+            s = load_user_settings()
+            s['bot_balance']    = round(self.bot_balance, 6)
+            s['bot_pair_alloc'] = {p: round(v, 6)
+                                   for p, v in self.bot_pair_alloc.items()
+                                   if v > 0.001}
+            save_user_settings(s)
+        except Exception as e:
+            logger.warning(f"Could not save bot state: {e}")
+
+    async def _get_bid_ask(self, pair: str):
+        """Fetch current best bid and ask. Returns raw (bid, ask) floats.
+
+        Callers are responsible for applying any offset — see _place_order which
+        uses attempt-based progressive offsets for maker-guaranteed pricing.
+        Falls back to live_price ± 1 tick on API error.
+        """
+        qdp  = self._quote_precision.get(pair, 2)
+        tick = 10 ** (-qdp)
+        try:
+            resp = await asyncio.to_thread(
+                self.client.get_best_bid_ask, product_ids=[pair])
+            raw   = resp.to_dict()
+            books = raw.get('pricebooks', [])
+            if books:
+                book = books[0]
+                bids = book.get('bids', [])
+                asks = book.get('asks', [])
+                bid  = float(bids[0]['price']) if bids else 0
+                ask  = float(asks[0]['price']) if asks else 0
+                if bid > 0 and ask > 0:
+                    return bid, ask
+        except Exception as e:
+            self.log_message(f"bid/ask fetch {pair}: {e}", "warn")
+        p = self.live_prices.get(pair, 0)
+        return round(p - tick, qdp), round(p + tick, qdp)
+
+    async def _wait_for_fill(self, order_id: str, timeout_s: int = 90) -> dict | None:
+        """Poll get_order every 5s until FILLED or timeout.
+        Returns order dict on fill, None on timeout/cancel/error."""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            await asyncio.sleep(5)
+            try:
+                resp = await asyncio.to_thread(self.client.get_order, order_id=order_id)
+                raw  = resp.to_dict()
+                order = raw.get('order', raw)
+                status = (order.get('status') or '').upper()
+                if status == 'FILLED':
+                    return order
+                if status in ('CANCELLED', 'EXPIRED', 'FAILED'):
+                    return None
+            except Exception as e:
+                self.log_message(f"Order poll {order_id}: {e}", "warn")
+        return None
 
     async def _fetch_balance(self):
         try:
@@ -2699,11 +3151,19 @@ class Dashboard(ctk.CTkFrame):
                 self.log_message("Balance fetch returned empty accounts list — skipping update", "warn")
                 return
 
+            usdc = 0.0
+            usdt = 0.0
             for a in accounts:
                 cur = a.get('currency', '')
                 val = float(a.get('available_balance', {}).get('value', 0) or 0)
-                if cur in ('USD', 'USDC', 'USDT'):
+                if cur == 'USD':
                     usd += val
+                elif cur == 'USDC':
+                    usdc += val
+                    usd  += val   # treated as liquid USD for trading
+                elif cur == 'USDT':
+                    usdt += val
+                    usd  += val
                 elif cur in pair_coins:
                     pair  = pair_coins[cur]
                     price = self.live_prices.get(pair, 0)
@@ -2713,7 +3173,9 @@ class Dashboard(ctk.CTkFrame):
                     else:
                         coin_log.append(f"{cur}={val:.4f} (price unknown)")
 
-            self.usd_balance = usd
+            self.usd_balance  = usd
+            self.usdc_balance = usdc
+            self.usdt_balance = usdt
             coin_str = "  |  ".join(coin_log) if coin_log else "none"
             self.log_message(
                 f"Balance sync:  USD=${usd:,.2f}  |  Coins: {coin_str}  |  "
@@ -2721,7 +3183,7 @@ class Dashboard(ctk.CTkFrame):
                 f"bot_alloc=${sum(self.bot_pair_alloc.values()):.2f}  "
                 f"bot_exposure=${sum(self.bot_exposure.values()):.2f}  "
                 f"bot_coin_qty={ {p.split('-')[0]: round(v,2) for p,v in self.bot_coin_qty.items() if v>0} }",
-                "info")
+                "monitor")
             if self.root_alive:
                 self.root.after(0, self._update_metrics)
                 self.root.after(0, self._update_pair_cards)
@@ -2786,7 +3248,7 @@ class Dashboard(ctk.CTkFrame):
             span_to   = datetime.fromtimestamp(all_candles[-1][0]/1000 if isinstance(all_candles[-1], list) else all_candles[-1]['start'] if isinstance(all_candles[-1], dict) else 0, pytz.UTC).strftime('%Y-%m-%d %H:%M')
             self.log_message(
                 f"Candles fetched  {pair}/{timeframe}  "
-                f"count={len(all_candles)}  span={span_from} → {span_to}", "info")
+                f"count={len(all_candles)}  span={span_from} → {span_to}", "monitor")
             if self.root_alive:
                 self.root.after(0, self._ingest_candles, pair, all_candles, timeframe)
 
@@ -2803,7 +3265,7 @@ class Dashboard(ctk.CTkFrame):
         self.log_message(
             f"Candle ingest  {pair}/{timeframe}  "
             f"raw={len(candles)}  ha={len(ha)}  new={len(new_ones)}  "
-            f"total_stored={len(existing)}", "info")
+            f"total_stored={len(existing)}", "monitor")
 
         if len(ha) >= 2:
             op, np_ = ha[0][4], ha[-1][4]
@@ -2843,7 +3305,7 @@ class Dashboard(ctk.CTkFrame):
                 f"coin_qty={self.bot_coin_qty.get(pair,0):.2f}  "
                 f"live_price={format_price(self.live_prices.get(pair,0))}  "
                 f"direction={self.signal_direction}",
-                "info")
+                "monitor")
             if cap and not self.order_locks[pair]:
                 conf_candles = list(self.candle_history[conf_tf][pair])
                 sig = (self.strategy.calculate_signals(pair, ha, conf_candles) or
@@ -2881,7 +3343,7 @@ class Dashboard(ctk.CTkFrame):
                         f"conf_candles={len(conf_candles)}  tf={timeframe}→{conf_tf}",
                         "trade")
                     asyncio.run_coroutine_threadsafe(
-                        self._place_order(pair, sig['action']), self.loop)
+                        self._place_order(pair, sig['action'], fast_exec=True), self.loop)
             elif self.order_locks[pair]:
                 self.log_message(
                     f"Signal check skipped — {pair} order lock active", "info")
@@ -2971,7 +3433,7 @@ class Dashboard(ctk.CTkFrame):
                                     for p in TRADING_PAIRS)
                                 self.log_message(
                                     f"WS heartbeat  ticks_last_60s={_ws_ticks}  {prices_str}",
-                                    "info")
+                                    "monitor")
                                 _ws_ticks = 0
                                 _ws_last_log = _now
 
@@ -3055,23 +3517,11 @@ class Dashboard(ctk.CTkFrame):
         last_ts      = self.surge_last_buy[pair] if action == 'buy' else self.surge_last_sell[pair]
         cd_remaining = max(0, SURGE_COOLDOWN - (now - last_ts))
 
-        # Log every surge candidate so we know why it was blocked or passed
-        self.log_message(
-            f"Surge candidate  {pair}  move={move*100:+.2f}%  ({SURGE_PCT*100:.1f}% threshold)  "
-            f"action={action}  oldest={format_price(oldest)}  newest={format_price(newest)}  "
-            f"pair_cap={pair_cap}  has_exposure={has_exposure}  has_coins={has_coins}  "
-            f"locked={self.order_locks[pair]}  cd_remaining={cd_remaining:.0f}s  "
-            f"direction={self.signal_direction}", "info")
-
         if not (pair_cap or has_exposure or has_coins):
-            self.log_message(f"Surge {pair} blocked — no capital/coins", "info")
             return
         if self.order_locks[pair]:
-            self.log_message(f"Surge {pair} blocked — order lock active", "info")
             return
         if cd_remaining > 0:
-            self.log_message(
-                f"Surge {pair} blocked — {action} cooldown {cd_remaining:.0f}s remaining", "info")
             return
 
         # Reversal guard: require majority of last 5 ticks to match direction
@@ -3080,22 +3530,14 @@ class Dashboard(ctk.CTkFrame):
             dirs   = [recent[i] - recent[i-1] for i in range(1, len(recent))]
             bull   = sum(1 for d in dirs if d > 0)
             bear   = sum(1 for d in dirs if d < 0)
-            if action == 'buy' and bear > bull:
-                self.log_message(
-                    f"Surge {pair} BUY blocked — reversal guard  bull={bull} bear={bear}  "
-                    f"ticks={[round(t,8) for t in recent]}", "info")
+            if action == 'buy'  and bear > bull:
                 return
             if action == 'sell' and bull > bear:
-                self.log_message(
-                    f"Surge {pair} SELL blocked — reversal guard  bull={bull} bear={bear}  "
-                    f"ticks={[round(t,8) for t in recent]}", "info")
                 return
 
         if self.signal_direction == 'Buy Only'  and action != 'buy':
-            self.log_message(f"Surge {pair} {action.upper()} blocked — direction=Buy Only", "info")
             return
         if self.signal_direction == 'Sell Only' and action != 'sell':
-            self.log_message(f"Surge {pair} {action.upper()} blocked — direction=Sell Only", "info")
             return
 
         if action == 'buy':
@@ -3110,24 +3552,18 @@ class Dashboard(ctk.CTkFrame):
             f"move={move*100:+.2f}%  oldest={format_price(oldest)}→newest={format_price(newest)}  "
             f"window={SURGE_WINDOW} ticks  bot_balance=${self.bot_balance:.2f}  "
             f"coin_qty={self.bot_coin_qty.get(pair,0):.2f}", "trade")
-        asyncio.create_task(self._place_order(pair, action))
+        asyncio.create_task(self._place_order(pair, action, fast_exec=True))
 
     # ── Trade monitor ─────────────────────────────────────────────────────────
     async def _monitor_loop(self):
-        _monitor_tick = 0
+        _monitor_tick  = 0
+        _last_log: dict = {}   # tid → {'price': float, 'sl': float, 'pl': float}
         while self.running:
             try:
                 _monitor_tick += 1
                 active = [(tid, t) for tid, t in self.trade_history.items()
                           if t.get('event') == 'trade']
-                # Log position summary every 12 ticks (~60s) or when positions exist
-                if active and _monitor_tick % 12 == 0:
-                    self.log_message(
-                        f"Monitor heartbeat — {len(active)} open position(s)  "
-                        f"bot_balance=${self.bot_balance:.2f}  "
-                        f"bot_exposure=${ sum(self.bot_exposure.values()):.2f }  "
-                        f"coin_qty={ {p.split('-')[0]:round(v,2) for p,v in self.bot_coin_qty.items() if v>0} }",
-                        "info")
+
                 for tid, trade in active:
                     pair  = trade['symbol']
                     cur   = self.live_prices.get(pair) or trade['current_price']
@@ -3150,7 +3586,7 @@ class Dashboard(ctk.CTkFrame):
                         trail_sl = peak * (1 - TRAIL_STOP_PCT)
                         if peak > entry * 1.01:
                             trade['stop_loss'] = max(orig_sl, trail_sl)
-                            hit_trail   = cur <= trail_sl
+                            hit_trail    = cur <= trail_sl
                             trail_active = True
                     else:
                         trough = min(trade.get('peak_price', entry), cur)
@@ -3158,7 +3594,7 @@ class Dashboard(ctk.CTkFrame):
                         trail_sl = trough * (1 + TRAIL_STOP_PCT)
                         if trough < entry * 0.99:
                             trade['stop_loss'] = min(orig_sl, trail_sl)
-                            hit_trail   = cur >= trail_sl
+                            hit_trail    = cur >= trail_sl
                             trail_active = True
 
                     cur_sl = trade['stop_loss']
@@ -3167,19 +3603,37 @@ class Dashboard(ctk.CTkFrame):
                     hit_tp = (trade['side'] == 'buy'  and cur >= orig_tp) or \
                              (trade['side'] == 'sell' and cur <= orig_tp)
 
-                    # Log every position on every tick for full traceability
-                    trail_str = (f"  trail_sl={format_price(trail_sl)}"
-                                 f"  peak={format_price(trade.get('peak_price',entry))}"
-                                 if trail_active else "  trail=inactive")
-                    self.log_message(
-                        f"Monitor  {trade['side'].upper()} {pair}  "
-                        f"qty={trade['quantity']:.4f}  "
-                        f"entry={format_price(entry)}  cur={format_price(cur)}  "
-                        f"P&L=${pl:+.4f}  "
-                        f"SL={format_price(cur_sl)}  TP={format_price(orig_tp)}"
-                        f"{trail_str}  "
-                        f"hit_sl={hit_sl}  hit_tp={hit_tp}  hit_trail={hit_trail}",
-                        "info")
+                    # ── Selective logging — only on meaningful change ────────
+                    prev      = _last_log.get(tid, {})
+                    prev_price = prev.get('price', 0)
+                    prev_sl    = prev.get('sl', 0)
+                    prev_pl    = prev.get('pl', None)
+                    # Log if: price moved >0.2%, SL ratcheted, P&L crossed $0.10
+                    # boundary, within 3% of SL/TP, or every 60 ticks (~5 min)
+                    price_moved  = prev_price == 0 or (abs(cur - prev_price) / prev_price > 0.002)
+                    sl_moved     = cur_sl != prev_sl
+                    pl_boundary  = prev_pl is None or int(pl / 0.10) != int(prev_pl / 0.10)
+                    sl_dist      = abs(cur - cur_sl) / cur if cur else 1
+                    tp_dist      = abs(cur - orig_tp) / cur if cur else 1
+                    near_trigger = sl_dist < 0.03 or tp_dist < 0.03
+                    periodic     = _monitor_tick % 60 == 0
+
+                    if price_moved or sl_moved or pl_boundary or near_trigger or periodic:
+                        trail_str = (f"  trail_sl={format_price(trail_sl)}"
+                                     f"  peak={format_price(trade.get('peak_price', entry))}"
+                                     if trail_active else "")
+                        near_str  = (f"  ⚠ {(sl_dist*100):.1f}% from SL" if sl_dist < 0.03
+                                     else f"  ⚠ {(tp_dist*100):.1f}% from TP" if tp_dist < 0.03
+                                     else "")
+                        msg = (
+                            f"Position  {trade['side'].upper()} {pair}  "
+                            f"cur={format_price(cur)}  P&L=${pl:+.4f}  "
+                            f"SL={format_price(cur_sl)}  TP={format_price(orig_tp)}"
+                            f"{trail_str}{near_str}"
+                        )
+                        if msg != prev.get('msg'):
+                            self.log_message(msg, "monitor")
+                        _last_log[tid] = {'price': cur, 'sl': cur_sl, 'pl': pl, 'msg': msg}
 
                     if hit_trail:
                         peak_str = format_price(trade.get('peak_price', cur))
@@ -3197,6 +3651,10 @@ class Dashboard(ctk.CTkFrame):
                             f"entry={format_price(entry)}  P&L=${pl:+.4f}", "trade")
                         await self._close_trade(tid, cur, reason)
 
+                # Clean up state for closed trades
+                for gone in set(_last_log) - {tid for tid, _ in active}:
+                    _last_log.pop(gone, None)
+
                 if self.root_alive:
                     self.root.after(0, self._refresh_trade_rows)
                     self.root.after(0, self._update_metrics)
@@ -3209,9 +3667,12 @@ class Dashboard(ctk.CTkFrame):
                 await asyncio.sleep(5)
 
     # ── Order placement ───────────────────────────────────────────────────────
-    async def _place_order(self, pair: str, side: str, amount: float = None):
+    async def _place_order(self, pair: str, side: str, amount: float = None,
+                           fast_exec: bool = False):
         """
-        Place a live market order via Coinbase Advanced Trade REST API.
+        Place a limit order (post_only maker, 0% fee) via Coinbase Advanced Trade REST API.
+        fast_exec=True: signal-triggered trades — 2 attempts × 25s then market fallback
+                        so total max delay is ~1 minute instead of 4.5 minutes.
         Reference: https://docs.cdp.coinbase.com/advanced-trade/reference/create_order
         """
         if amount is None:
@@ -3249,6 +3710,11 @@ class Dashboard(ctk.CTkFrame):
                         f"No funds allocated for {pair} — allocate via Dashboard or Charts",
                         "warn")
                     return
+                # Auto-compound: scale order size as % of available funds (up to cap)
+                if self.auto_compound_enabled:
+                    compound_size = avail_funds * (self.auto_compound_pct / 100.0)
+                    compound_size = min(compound_size, self.auto_compound_cap)
+                    amount = max(compound_size, 1.0)   # floor at $1 to avoid zero orders
                 amount_usd = min(amount, avail_funds)
                 total_cap  = avail_funds + sum(self.bot_exposure.values())
                 if self.bot_exposure[pair] + amount_usd > MAX_EXPOSURE_PER_PAIR * total_cap:
@@ -3269,76 +3735,161 @@ class Dashboard(ctk.CTkFrame):
                 self.log_message(f"No live price for {pair}", "error")
                 return
 
-            order_id = str(uuid.uuid4())
+            import math as _math
+            bdp  = self._base_precision.get(pair, 8)
+            qdp  = self._quote_precision.get(pair, 2)
 
-            # Coinbase Advanced Trade market order
-            # For buys use quote_size (USD); for sells use base_size (coin qty)
-            if side == 'buy':
-                quote_str = str(round(amount_usd, 2))
-                self.log_message(
-                    f"Placing BUY {pair}  quote_size={quote_str}  "
-                    f"price≈{format_price(price)}", "info")
-                order_resp = await asyncio.to_thread(
-                    self.client.market_order_buy,
-                    client_order_id=order_id,
-                    product_id=pair,
-                    quote_size=quote_str
-                )
-            else:
-                dp  = self._base_precision.get(pair, 8)
-                qty = amount_usd / price
-                # Floor (not round) to never over-sell; respect Coinbase base_increment
-                import math as _math
-                qty = _math.floor(qty * (10 ** dp)) / (10 ** dp)
-                min_qty = 10 ** (-dp)
-                if qty < min_qty:
+            # ── Progressive limit order (maker → 0% fee) ─────────────────────
+            # Attempt 1: price offset 1 tick from bid/ask — guaranteed maker on ANY
+            #            market, even zero-spread (XCN-USD). Cost ≤ 0.2% vs 0.6% taker.
+            # Attempt 2: price at raw bid/ask — maker on normal-spread markets.
+            # Fallback:  market order — guaranteed fill, taker fee applies.
+            #
+            # fast_exec (signal-triggered): 2 attempts × 25s → market (~1 min max)
+            # normal:                       3 attempts × 90s → market (~5 min max)
+            MAX_LIMIT_ATTEMPTS = 2 if fast_exec else 3
+            _fill_timeout      = 25 if fast_exec else 90
+            tick         = 10 ** (-qdp)
+            filled_price = None
+            qty_filled   = None
+            order_id     = None
+            used_market  = False
+
+            for attempt in range(MAX_LIMIT_ATTEMPTS):
+                bid, ask = await self._get_bid_ask(pair)
+                # Progressive offset: attempt 0 → 1 tick from crossing (safe maker)
+                #                     attempt 1+ → at the spread (maker if spread > 0)
+                offset = tick if attempt == 0 else 0
+
+                if side == 'buy':
+                    # Buy below bid by offset → guaranteed maker; more aggressive each retry
+                    limit_px = round(bid - offset, qdp)
+                    raw_qty  = amount_usd / limit_px if limit_px else 0
+                    qty_str  = f"{_math.floor(raw_qty * 10**bdp) / 10**bdp:.{bdp}f}"
+                    lp_str   = f"{limit_px:.{qdp}f}"
+                    offset_note = f"  (bid-{offset:.{qdp}f}, maker-safe)" if offset else "  (at bid)"
                     self.log_message(
-                        f"Sell qty {qty} below min increment {min_qty} for {pair} — skipping",
-                        "warn")
-                    return
-                base_str = f"{qty:.{dp}f}"
-                self.log_message(
-                    f"Placing SELL {pair}  base_size={base_str} ({dp}dp)  "
-                    f"≈${amount_usd:.2f}  price≈{format_price(price)}", "info")
-                order_resp = await asyncio.to_thread(
-                    self.client.market_order_sell,
-                    client_order_id=order_id,
-                    product_id=pair,
-                    base_size=base_str
-                )
+                        f"BUY LIMIT {pair}  qty={qty_str}  price={lp_str}{offset_note}"
+                        f"  attempt {attempt+1}/{MAX_LIMIT_ATTEMPTS}", "info")
+                    order_id   = str(uuid.uuid4())
+                    order_resp = await asyncio.to_thread(
+                        self.client.limit_order_gtc_buy,
+                        client_order_id=order_id,
+                        product_id=pair,
+                        base_size=qty_str,
+                        limit_price=lp_str,
+                        post_only=True
+                    )
+                else:
+                    # Sell above ask by offset → guaranteed maker; more aggressive each retry
+                    limit_px = round(ask + offset, qdp)
+                    raw_qty  = amount_usd / price
+                    raw_qty  = _math.floor(raw_qty * 10**bdp) / 10**bdp
+                    min_qty  = 10 ** (-bdp)
+                    if raw_qty < min_qty:
+                        self.log_message(
+                            f"Sell qty below min increment for {pair} — skipping", "warn")
+                        return
+                    qty_str    = f"{raw_qty:.{bdp}f}"
+                    lp_str     = f"{limit_px:.{qdp}f}"
+                    offset_note = f"  (ask+{offset:.{qdp}f}, maker-safe)" if offset else "  (at ask)"
+                    self.log_message(
+                        f"SELL LIMIT {pair}  qty={qty_str}  price={lp_str}{offset_note}"
+                        f"  attempt {attempt+1}/{MAX_LIMIT_ATTEMPTS}", "info")
+                    order_id   = str(uuid.uuid4())
+                    order_resp = await asyncio.to_thread(
+                        self.client.limit_order_gtc_sell,
+                        client_order_id=order_id,
+                        product_id=pair,
+                        base_size=qty_str,
+                        limit_price=lp_str,
+                        post_only=True
+                    )
 
-            raw = order_resp.to_dict()
-            success = raw.get('success', False)
-            if not success:
-                err_obj = raw.get('error_response', {}) or {}
-                reason  = err_obj.get('message') or err_obj.get('error') or str(raw)
-                preview = err_obj.get('preview_failure_reason', '')
-                detail  = f"  [{preview}]" if preview else ''
-                self.log_message(
-                    f"Order REJECTED {pair} {side.upper()}: {reason}{detail}", "error")
-                return
+                raw     = order_resp.to_dict()
+                success = raw.get('success', False)
+                if not success:
+                    err_obj = raw.get('error_response', {}) or {}
+                    reason  = err_obj.get('message') or err_obj.get('error') or str(raw)
+                    preview = err_obj.get('preview_failure_reason', '')
+                    detail  = f"  [{preview}]" if preview else ''
+                    self.log_message(
+                        f"Limit order REJECTED {pair} {side.upper()} attempt {attempt+1}: "
+                        f"{reason}{detail}", "warn")
+                    # post_only rejection (would cross spread) — retry immediately
+                    await asyncio.sleep(1)
+                    continue
 
-            # Parse fill price: prefer success_response.average_filled_price,
-            # fall back to live price.  Old base_size=1 default was catastrophically wrong.
-            filled_price = price   # safe default
-            if side == 'buy':
-                try:
-                    sr   = raw.get('success_response', {}) or {}
-                    avg  = float(sr.get('average_filled_price', 0) or 0)
-                    if avg > 0 and (price == 0 or abs(avg - price) / price < 0.20):
+                # Wait for fill
+                placed_id = (raw.get('success_response', {}) or {}).get('order_id') or order_id
+                filled_order = await self._wait_for_fill(placed_id, timeout_s=_fill_timeout)
+                if filled_order:
+                    avg = float(filled_order.get('average_filled_price', 0) or 0)
+                    fees = float(filled_order.get('total_fees', 0) or 0)
+                    if avg > 0:
                         filled_price = avg
+                    qty_f = float(filled_order.get('filled_size', 0) or 0)
+                    if qty_f > 0:
+                        qty_filled = qty_f
+                    if fees > 0:
+                        self.log_message(f"Order fee: ${fees:.6f} {pair}", "warn")
                     else:
-                        conf = (raw.get('order_configuration', {})
-                                   .get('market_market_ioc', {}))
-                        q = float(conf.get('quote_size', 0) or 0)
-                        b = float(conf.get('base_size',  0) or 0)
-                        if q > 0 and b > 0:
-                            parsed = q / b
-                            if price == 0 or abs(parsed - price) / price < 0.20:
-                                filled_price = parsed
-                except Exception:
-                    pass
-            qty_filled   = amount_usd / filled_price
+                        self.log_message(f"Order fee: $0.00 (maker limit) {pair}", "info")
+                    break
+                else:
+                    # Not filled in 90s — cancel and retry
+                    self.log_message(
+                        f"Limit order not filled in 90s ({pair} {side}) — "
+                        f"cancelling, attempt {attempt+1}", "warn")
+                    try:
+                        await asyncio.to_thread(
+                            self.client.cancel_orders, order_ids=[placed_id])
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1)
+
+            if filled_price is None or qty_filled is None:
+                # All limit attempts failed — fall back to market order
+                self.log_message(
+                    f"All limit attempts failed for {pair} {side} — "
+                    f"falling back to market order (taker fee applies)", "warn")
+                used_market = True
+                order_id    = str(uuid.uuid4())
+                if side == 'buy':
+                    quote_str  = str(round(amount_usd, 2))
+                    order_resp = await asyncio.to_thread(
+                        self.client.market_order_buy,
+                        client_order_id=order_id,
+                        product_id=pair,
+                        quote_size=quote_str
+                    )
+                else:
+                    raw_qty2 = amount_usd / price
+                    raw_qty2 = _math.floor(raw_qty2 * 10**bdp) / 10**bdp
+                    order_resp = await asyncio.to_thread(
+                        self.client.market_order_sell,
+                        client_order_id=order_id,
+                        product_id=pair,
+                        base_size=f"{raw_qty2:.{bdp}f}"
+                    )
+                raw     = order_resp.to_dict()
+                success = raw.get('success', False)
+                if not success:
+                    err_obj = raw.get('error_response', {}) or {}
+                    reason  = err_obj.get('message') or err_obj.get('error') or str(raw)
+                    preview = err_obj.get('preview_failure_reason', '')
+                    detail  = f"  [{preview}]" if preview else ''
+                    self.log_message(
+                        f"Market order REJECTED {pair} {side.upper()}: {reason}{detail}", "error")
+                    return
+                filled_price = price   # best we can do for market fills
+                sr   = (raw.get('success_response', {}) or {})
+                avg2 = float(sr.get('average_filled_price', 0) or 0)
+                if avg2 > 0 and (price == 0 or abs(avg2 - price) / price < 0.20):
+                    filled_price = avg2
+
+            if qty_filled is None:
+                qty_filled = amount_usd / filled_price
 
             sl = filled_price * (1 - sl_pct) if side == 'buy' else filled_price * (1 + sl_pct)
             tp = filled_price * (1 + tp_pct) if side == 'buy' else filled_price * (1 - tp_pct)
@@ -3350,7 +3901,10 @@ class Dashboard(ctk.CTkFrame):
                 else:
                     self.bot_balance = max(0, self.bot_balance - spent)
                 self.bot_exposure[pair] += spent
-                self.bot_coin_qty[pair] += qty_filled
+                # NOTE: bot_coin_qty is USER-allocation only. Bot-bought coins are
+                # tracked solely via bot_exposure (USD cost basis). Do NOT increment
+                # bot_coin_qty here — that would double-count coins in sell capacity
+                # and corrupt the proceeds routing user_frac/bot_frac split.
             else:
                 # H1 fix: route proceeds to the correct bucket based on coin source.
                 # bot_coin_qty coins came from user (not from bot-traded USD), so
@@ -3412,6 +3966,7 @@ class Dashboard(ctk.CTkFrame):
                 f"bot_exposure=${self.bot_exposure[pair]:.4f}  "
                 f"coin_qty={self.bot_coin_qty[pair]:.4f}  "
                 f"order_id={order_id}", "trade")
+            self._save_bot_state()
             if self.root_alive:
                 self.root.after(0, self._refresh_trade_rows)
                 self.root.after(0, self._update_metrics)
@@ -3470,46 +4025,149 @@ class Dashboard(ctk.CTkFrame):
         qty        = trade['quantity']
         cur_price  = self.live_prices.get(pair, price)
         try:
-            order_id = str(uuid.uuid4())
+            import math as _m2
+            bdp = self._base_precision.get(pair, 8)
+            qdp = self._quote_precision.get(pair, 2)
+
             if close_side == 'sell':
-                dp  = self._base_precision.get(pair, 8)
-                import math as _m2
-                qty_adj  = _m2.floor(qty * (10 ** dp)) / (10 ** dp)
-                min_qty  = 10 ** (-dp)
-                if qty_adj < min_qty:
+                qty_adj = _m2.floor(qty * 10**bdp) / 10**bdp
+                if qty_adj < 10**(-bdp):
                     self.log_message(
                         f"Close qty {qty_adj} below min increment — skipping {reason}", "warn")
                     trade.pop('_closing', None)
                     return
-                resp = await asyncio.to_thread(
-                    self.client.market_order_sell,
-                    client_order_id=order_id,
-                    product_id=pair,
-                    base_size=f"{qty_adj:.{dp}f}"
-                )
-            else:
-                resp = await asyncio.to_thread(
-                    self.client.market_order_buy,
-                    client_order_id=order_id,
-                    product_id=pair,
-                    quote_size=str(round(qty * cur_price, 2))
-                )
 
-            # Verify the close order succeeded before touching balances
-            raw     = resp.to_dict()
-            success = raw.get('success', False)
-            if not success:
-                err_msg = raw.get('error_response', {}).get('message', str(raw))
+            # Progressive limit order — same offset strategy as _place_order
+            # Attempt 1: 1 tick from crossing → guaranteed maker on any market
+            # Attempt 2: at raw bid/ask → maker if spread exists
+            # Fallback:  market
+            MAX_CLOSE_ATTEMPTS = 3
+            tick_c             = 10 ** (-qdp)
+            close_filled_price = None
+            close_filled_qty   = None
+            for attempt in range(MAX_CLOSE_ATTEMPTS):
+                bid, ask   = await self._get_bid_ask(pair)
+                offset     = tick_c if attempt == 0 else 0
+                order_id   = str(uuid.uuid4())
+                if close_side == 'sell':
+                    limit_px   = round(ask + offset, qdp)
+                    lp_str     = f"{limit_px:.{qdp}f}"
+                    bs_str     = f"{qty_adj:.{bdp}f}"
+                    note       = f"  (ask+{offset:.{qdp}f})" if offset else "  (at ask)"
+                    self.log_message(
+                        f"CLOSE SELL LIMIT {pair}  qty={bs_str}  price={lp_str}{note}"
+                        f"  {reason}  attempt {attempt+1}", "info")
+                    order_resp = await asyncio.to_thread(
+                        self.client.limit_order_gtc_sell,
+                        client_order_id=order_id,
+                        product_id=pair,
+                        base_size=bs_str,
+                        limit_price=lp_str,
+                        post_only=True
+                    )
+                else:
+                    limit_px    = round(bid - offset, qdp)
+                    lp_str      = f"{limit_px:.{qdp}f}"
+                    raw_qty_buy = qty * cur_price / limit_px if limit_px else 0
+                    bs_str      = f"{_m2.floor(raw_qty_buy * 10**bdp) / 10**bdp:.{bdp}f}"
+                    note        = f"  (bid-{offset:.{qdp}f})" if offset else "  (at bid)"
+                    self.log_message(
+                        f"CLOSE BUY LIMIT {pair}  qty={bs_str}  price={lp_str}{note}"
+                        f"  {reason}  attempt {attempt+1}", "info")
+                    order_resp = await asyncio.to_thread(
+                        self.client.limit_order_gtc_buy,
+                        client_order_id=order_id,
+                        product_id=pair,
+                        base_size=bs_str,
+                        limit_price=lp_str,
+                        post_only=True
+                    )
+
+                raw     = order_resp.to_dict()
+                success = raw.get('success', False)
+                if not success:
+                    err_obj = raw.get('error_response', {}) or {}
+                    err_msg = err_obj.get('message') or err_obj.get('error') or str(raw)
+                    self.log_message(
+                        f"Close limit REJECTED {pair} attempt {attempt+1}: {err_msg}", "warn")
+                    await asyncio.sleep(1)
+                    continue
+
+                placed_id = (raw.get('success_response', {}) or {}).get('order_id') or order_id
+                filled_order = await self._wait_for_fill(placed_id, timeout_s=90)
+                if filled_order:
+                    avg = float(filled_order.get('average_filled_price', 0) or 0)
+                    fees = float(filled_order.get('total_fees', 0) or 0)
+                    if avg > 0:
+                        close_filled_price = avg
+                    qty_f = float(filled_order.get('filled_size', 0) or 0)
+                    if qty_f > 0:
+                        close_filled_qty = qty_f
+                    if fees > 0:
+                        self.log_message(f"Close fee: ${fees:.6f} {pair}", "warn")
+                    else:
+                        self.log_message(f"Close fee: $0.00 (maker limit) {pair}", "info")
+                    break
+                else:
+                    self.log_message(
+                        f"Close limit not filled in 90s ({pair} {close_side}) — "
+                        f"cancelling, attempt {attempt+1}", "warn")
+                    try:
+                        await asyncio.to_thread(
+                            self.client.cancel_orders, order_ids=[placed_id])
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1)
+
+            if close_filled_price is None:
+                # Fall back to market order
                 self.log_message(
-                    f"Close order REJECTED {pair} ({reason}): {err_msg}", "error")
-                logger.error(f"_close_trade rejected: {raw}")
-                trade.pop('_closing', None)
-                return
+                    f"Close limit attempts exhausted — falling back to market ({pair})", "warn")
+                order_id = str(uuid.uuid4())
+                if close_side == 'sell':
+                    resp = await asyncio.to_thread(
+                        self.client.market_order_sell,
+                        client_order_id=order_id,
+                        product_id=pair,
+                        base_size=f"{qty_adj:.{bdp}f}"
+                    )
+                else:
+                    resp = await asyncio.to_thread(
+                        self.client.market_order_buy,
+                        client_order_id=order_id,
+                        product_id=pair,
+                        quote_size=str(round(qty * cur_price, 2))
+                    )
+                raw     = resp.to_dict()
+                success = raw.get('success', False)
+                if not success:
+                    err_msg = raw.get('error_response', {}).get('message', str(raw))
+                    self.log_message(
+                        f"ABANDONED {pair} trade — all close attempts failed ({reason}): {err_msg}  "
+                        f"Removing from active positions. Verify on Coinbase.", "error")
+                    logger.error(f"_close_trade all attempts failed: {raw}")
+                    # Remove the zombie trade from history so the monitor stops retrying.
+                    # _closing stays True to block any concurrent calls that haven't returned yet.
+                    self.trade_history.pop(tid, None)
+                    save_trade_history(self.trade_history)
+                    if self.root_alive:
+                        self.root.after(0, self._refresh_trade_rows)
+                    return
+                close_filled_price = cur_price
+                sr2 = (raw.get('success_response', {}) or {})
+                avg2 = float(sr2.get('average_filled_price', 0) or 0)
+                if avg2 > 0 and (cur_price == 0 or abs(avg2 - cur_price) / cur_price < 0.20):
+                    close_filled_price = avg2
 
-            pl = ((cur_price - trade['entry_price']) * qty
+            if close_filled_qty is None:
+                close_filled_qty = qty
+
+            # Use actual fill price for P&L and proceeds calculation
+            cur_price = close_filled_price
+            pl = ((cur_price - trade['entry_price']) * close_filled_qty
                   if trade['side'] == 'buy'
-                  else (trade['entry_price'] - cur_price) * qty)
-            proceeds = qty * cur_price
+                  else (trade['entry_price'] - cur_price) * close_filled_qty)
+            proceeds = close_filled_qty * cur_price
             if close_side == 'sell':
                 # Drain coin sources proportionally (same logic as regular sell)
                 coin_qty = self.bot_coin_qty.get(pair, 0)
@@ -3538,6 +4196,7 @@ class Dashboard(ctk.CTkFrame):
             self.strategy.last_trade_time[pair] = time.time()
             del self.trade_history[tid]
             save_trade_history(self.trade_history)
+            self._save_bot_state()
             if self.root_alive:
                 self.root.after(0, self._refresh_trade_rows)
                 self.root.after(0, self._update_metrics)
@@ -3574,11 +4233,16 @@ class Dashboard(ctk.CTkFrame):
             if qty < 1e-8:
                 continue
             try:
+                import math as _m_sell
+                dp  = self._base_precision.get(pair, 8)
+                qty = _m_sell.floor(qty * (10 ** dp)) / (10 ** dp)
+                if qty < 10 ** (-dp):
+                    continue
                 resp = await asyncio.to_thread(
                     self.client.market_order_sell,
                     client_order_id=str(uuid.uuid4()),
                     product_id=pair,
-                    base_size=str(round(qty, 8))
+                    base_size=f"{qty:.{dp}f}"
                 )
                 proceeds = qty * self.live_prices.get(pair, 0)
                 self.usd_balance        += proceeds
