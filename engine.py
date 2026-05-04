@@ -36,7 +36,7 @@ DISPLAY_CANDLES      = {'1m': 200, '5m': 500, '1h': 300, '1d': 365}
 # 2× display count fetched/stored so EMA/indicators are fully warmed up
 # across the entire visible window — no cold-start distortion.
 FETCH_CANDLES        = {'1m': 400, '5m': 1000, '1h': 600, '1d': 730}
-MA_PERIODS           = [9, 21, 55]   # EMA(9/21) crossover, EMA(55) trend context
+MA_PERIODS           = [3, 8, 21]    # Scalping: EMA(3/8) crossover, EMA(21) trend context
 TIMEFRAMES           = ['1m', '5m', '1h', '1d']
 ORDER_AMOUNT_USD     = 100
 MINIMUM_RESERVE      = 50
@@ -486,26 +486,36 @@ class IndicatorEngine:
 
 # ── MA/EMA Crossover Strategy ────────────────────────────────────────────────
 class MACrossover:
-    """EMA(9)/EMA(21) crossover with 5 quality gates.
+    """Scalping EMA(3)/EMA(8) crossover — full-port, strictly alternating.
 
-    Why EMA(9)/EMA(21) instead of EMA(2)/EMA(5)?
-      EMA(2) α=0.67: tracks every candle almost perfectly — not a trend indicator.
-      EMA(5) α=0.33: only 5 candles of context — crosses every minor fluctuation.
-      EMA(9)/EMA(21) is the most widely used crypto crossover by professional desks:
-        9 candles = 9 hours on 1h (short-term momentum)
-        21 candles = 21 hours (medium trend)
-      They cross ~3-5× less often; each cross represents a real trend shift.
+    Design goals:
+      • Every buy signal is followed by a sell, and vice versa — no duplicates.
+        Enforced naturally: full-port allocation depletes USD after a buy (so
+        _can_buy becomes False) and depletes coins after a sell (_can_sell = False).
+      • Enter as early in the move as possible: EMA(3) α=0.5 reacts to the
+        current candle with 50% weight; EMA(8) provides the trend anchor.
+        Crossover occurs 1-2 candles after momentum shifts — far faster than
+        EMA(9)/EMA(21) which confirm the move only after it's mostly run.
+      • EMA(21) kept as the third period for trend context on the chart.
 
-    5 quality gates (all must pass):
-      1. ADX > 20    — market must be trending; ranging markets kill EMA crosses
-      2. Trend slope — EMA_slow must slope in signal direction for ≥ 3 consecutive bars
-      3. RSI zone    — buys blocked above 65 (overbought); sells blocked below 35
-      4. RSI momentum— RSI must be RISING for buys, FALLING for sells (momentum agrees)
-      5. Structure   — BUY: price must close above EMA_slow (not just a cross on a wick)
-                       SELL: price must close below EMA_slow (real breakdown, not a dip)
+    3 quality gates (lean set for speed):
+      1. Price structure — BUY: close above EMA(8); SELL: close below EMA(8).
+         This blocks crosses that occur on wicks but don't represent real structure.
+      2. RSI extremes — buys blocked above RSI 80 (already exhausted);
+         sells blocked below RSI 20 (already capitulated). Only cuts the very
+         tail — allows entries anywhere else including trending conditions.
+      3. Confirmation TF alignment — lower timeframe EMA(3) must be above EMA(8)
+         for buys (and below for sells), with a 0.02% minimum gap.
+         Prevents entering on a signal-TF cross when the faster TF is already reversing.
 
-    Confirmation TF: same pair on the shorter TF must also show EMA_fast > EMA_slow
-    by a minimum 0.05% threshold (eliminates flat confirmation with no real alignment).
+    What was removed vs v1.0.6b and why:
+      • ADX gate — scalping explicitly targets all market regimes; ranging markets
+        produce valid mean-reversion scalps on EMA(3)/EMA(8).
+      • 3-bar slope requirement — too slow for scalping; a valid cross already
+        implies the EMA changed direction.
+      • RSI zone (65/35 thresholds) and RSI momentum gate — too restrictive;
+        blocked entries at the start of momentum moves and missed real turns.
+        RSI extremes-only (80/20) remain as a safety override.
     """
 
     def __init__(self, indicator_engine: IndicatorEngine):
@@ -523,14 +533,14 @@ class MACrossover:
 
         closes_s = np.array([c[4] for c in candles_signal], dtype=float)
         closes_c = np.array([c[4] for c in candles_conf],   dtype=float)
-        if len(closes_s) < p_slow + 3 or len(closes_c) < p_slow:
+        if len(closes_s) < p_slow + 2 or len(closes_c) < p_slow:
             return None
 
-        # ── EMA crossover on signal TF ───────────────────────────────────────
+        # ── EMA crossover on signal TF ────────────────────────────────────────
         ema_f_s = ema(closes_s, p_fast)
         ema_s_s = ema(closes_s, p_slow)
         valid   = ~(np.isnan(ema_f_s) | np.isnan(ema_s_s))
-        if valid.sum() < 4:          # need 4 bars for slope check
+        if valid.sum() < 2:
             return None
 
         vf = ema_f_s[valid]
@@ -539,60 +549,35 @@ class MACrossover:
         curr_diff = float(vf[-1] - vs[-1])
 
         price_now = float(closes_s[-1])
-        # Minimum cross gap: 0.1% of price — meaningfully larger than noise
+        # 0.1% min gap — eliminates flat-region noise crosses
         min_cross = price_now * 0.001
-
         if abs(curr_diff) < min_cross:
-            return None     # EMAs too close — flat region, skip
+            return None
 
-        # ── Gate 1: ADX > 20 (must be a trending market) ─────────────────────
-        curr_adx = self.ie.data[pair].get('adx', 0.0)
-        if curr_adx < 20:
-            return None     # ranging / choppy market — EMA crosses are noise
-
-        # ── Gate 2: EMA_slow slope sustained ≥ 3 bars ─────────────────────────
-        # One-bar slope fires on any single reversal candle.  Requiring 3 bars
-        # means the trend must be established before we trade it.
-        slope_window = vs[-4:]   # last 4 valid EMA_slow values
-        slope_up   = all(slope_window[i] < slope_window[i+1] for i in range(len(slope_window)-1))
-        slope_down = all(slope_window[i] > slope_window[i+1] for i in range(len(slope_window)-1))
-
-        # ── Gate 3: RSI zone ─────────────────────────────────────────────────
-        # Buys above 65: momentum already exhausted, late entry.
-        # Sells below 35: already oversold, bounce likely.
-        curr_rsi = self.ie.data[pair].get('rsi', 50.0)
-
-        # ── Gate 4: RSI momentum (direction must agree) ───────────────────────
-        rsi_series = self.ie.data[pair].get('rsi_series', [])
-        if len(rsi_series) >= 3:
-            rsi_rising  = rsi_series[-1] > rsi_series[-3]   # RSI up over last 3 bars
-            rsi_falling = rsi_series[-1] < rsi_series[-3]
-        else:
-            rsi_rising = rsi_falling = True   # insufficient history, skip gate
-
-        # ── Gate 5: Price structure ───────────────────────────────────────────
-        # BUY : close must be ABOVE EMA_slow — price is in bullish structure
-        # SELL: close must be BELOW EMA_slow — price broke down through the trend
-        ema_slow_now = float(vs[-1])
+        # ── Gate 1: Price structure ────────────────────────────────────────────
+        ema_slow_now     = float(vs[-1])
         price_above_slow = price_now > ema_slow_now
         price_below_slow = price_now < ema_slow_now
 
-        # ── Confirmation TF alignment ─────────────────────────────────────────
+        # ── Gate 2: RSI extremes only ──────────────────────────────────────────
+        curr_rsi = self.ie.data[pair].get('rsi', 50.0)
+        if np.isnan(curr_rsi):
+            curr_rsi = 50.0
+
+        # ── Gate 3: Confirmation TF alignment ─────────────────────────────────
         ema_f_c = ema(closes_c, p_fast)
         ema_s_c = ema(closes_c, p_slow)
         valid_c = ~(np.isnan(ema_f_c) | np.isnan(ema_s_c))
         if valid_c.sum() < 1:
             return None
         conf_diff = float(ema_f_c[valid_c][-1] - ema_s_c[valid_c][-1])
-        min_conf  = price_now * 0.0005   # 0.05% confirmation threshold
+        min_conf  = price_now * 0.0002   # 0.02% — lighter bar for scalping speed
 
-        # ── BUY ───────────────────────────────────────────────────────────────
-        if (prev_diff < 0 and curr_diff > min_cross   # golden cross, gap confirmed
-                and conf_diff > min_conf               # confirmation TF agrees
-                and slope_up                           # EMA_slow rising for ≥ 3 bars
-                and curr_rsi < 65                      # not overbought
-                and rsi_rising                         # RSI momentum is up
-                and price_above_slow):                 # price in bullish structure
+        # ── BUY: golden cross ─────────────────────────────────────────────────
+        if (prev_diff < 0 and curr_diff > min_cross
+                and price_above_slow
+                and curr_rsi < 80
+                and conf_diff > min_conf):
             if now - self.last_buy_time.get(pair, 0) < COOLDOWN_SECONDS:
                 return None
             return {
@@ -600,16 +585,13 @@ class MACrossover:
                 'price':  price_now,
                 'source': f'EMA{p_fast}/EMA{p_slow}',
                 'rsi':    curr_rsi,
-                'adx':    curr_adx,
             }
 
-        # ── SELL ──────────────────────────────────────────────────────────────
-        if (prev_diff > 0 and curr_diff < -min_cross  # death cross, gap confirmed
-                and conf_diff < -min_conf              # confirmation TF agrees
-                and slope_down                         # EMA_slow falling for ≥ 3 bars
-                and curr_rsi > 35                      # not already oversold
-                and rsi_falling                        # RSI momentum is down
-                and price_below_slow):                 # price broke through trend — real breakdown
+        # ── SELL: death cross ─────────────────────────────────────────────────
+        if (prev_diff > 0 and curr_diff < -min_cross
+                and price_below_slow
+                and curr_rsi > 20
+                and conf_diff < -min_conf):
             if now - self.last_sell_time.get(pair, 0) < COOLDOWN_SECONDS:
                 return None
             return {
@@ -617,7 +599,6 @@ class MACrossover:
                 'price':  price_now,
                 'source': f'EMA{p_fast}/EMA{p_slow}',
                 'rsi':    curr_rsi,
-                'adx':    curr_adx,
             }
 
         return None

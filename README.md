@@ -8,24 +8,34 @@
 
 ## Version History
 
-### v1.0.6b *(current)*
+### v1.0.7b *(current)*
+
+#### Scalping Mode — Full Port, Strict Alternation
+
+- **Full-port sizing** — every buy deploys the entire available bot allocation; every sell liquidates the entire coin position. No more partial fixed-size orders. The bot is always 100% deployed — either in USD or in the coin.
+- **Strict signal alternation** — buying depletes all USD (so `_can_buy` becomes False) and selling depletes all coins (so `_can_sell` becomes False). The capital gate system naturally enforces buy → sell → buy → sell with no duplicate directions possible.
+- **MA periods changed to `[3, 8, 21]`** — EMA(3)/EMA(8) is the tightest practical scalping pair. EMA(3) α=0.5 gives 50% weight to the current candle; EMA(8) provides the swing anchor. Crossovers fire 1-2 candles after the momentum shift, far earlier than EMA(9)/EMA(21).
+- **Signal gates reduced to 3** — lean set optimized for entry speed over confirmation delay:
+  1. **Price structure** — buy cross must be above EMA(8); sell cross must be below EMA(8). Eliminates wick crosses that don't represent actual structure.
+  2. **RSI extremes only** — buys blocked above RSI 80, sells blocked below RSI 20. Only the absolute exhaustion tail is filtered; all other conditions including trending and ranging are allowed.
+  3. **Confirmation TF alignment** — lower TF EMA(3) must agree with signal direction at a 0.02% threshold (reduced from 0.05%). Prevents entering when the faster frame is already reversing.
+- **Removed from v1.0.6b**: ADX gate (scalping targets all regimes), 3-bar slope requirement (too slow for scalp speed), RSI zone (65/35), RSI momentum direction gate. These were correct for swing trading; they were blocking early scalp entries and missing the start of moves.
+
+---
+
+### v1.0.6b
 
 #### Signal Quality — Noise Reduction & Sell Improvement
 
-- **MA periods changed to `[9, 21, 55]`** — EMA(2)/EMA(5) fired on nearly every candle (α=0.67 tracks individual ticks). EMA(9)/EMA(21) are the industry-standard fast/slow pair used across professional systems; EMA(55) provides a clean trend baseline. Crossover frequency drops by ~70%.
-- **ADX gate (new)** — `adx()` implements the full Wilder ADX calculation (+DM/−DM smoothed by RMA, then DX averaged). Signals are blocked when ADX < 20, which means the market is ranging/choppy and MA crosses are noise. Above 25 is trending; above 40 is a strong trend.
-- **Sustained slope (3-bar)** — EMA_slow must slope in the signal direction for 3 consecutive bars (not just the current candle). Single-candle slope reversals that flip back immediately no longer trigger.
-- **RSI zone narrowed** — buys blocked above RSI 65 (was 70); sells blocked below RSI 35 (was 30). More breathing room from exhaustion extremes.
-- **RSI momentum gate** — RSI must be rising for buys and falling for sells over the last 3 bars. A buy cross while RSI is declining = momentum divergence = blocked.
-- **Price structure gate for sells** — SELL requires price to be below EMA_slow at crossover time. This distinguishes a real breakdown from a brief dip that already recovered.
-- **Min crossover gap raised to 0.1%** (from 0.05%). Eliminates micro-crosses on nearly-flat EMAs.
-- **Breakout: ADX gate added** — breakout signals also require ADX > 20. Breakouts in choppy markets are fakeouts.
-- **Breakout: ATR threshold raised to 2× ATR** (from 1.5×). Higher bar for momentum conviction.
-- **Breakout: volume now required** — changed from `vol_surge OR price_move > atr_gate` to `vol_surge AND price_move > atr_gate`. Volume must confirm the move; price alone is not enough.
-- **Breakout: RSI gate** — buys blocked above RSI 75, sells blocked below RSI 25. Prevents chasing already-exhausted breakouts.
-
-#### Chart
-- **ADX displayed alongside RSI** — top-left overlay now shows `RSI 52.3   ADX 31.4 trend`. ADX label appends "chop" (<20), "trend" (≥20), or "strong" (≥40) so market regime is visible at a glance.
+- **MA periods changed to `[9, 21, 55]`**
+- **ADX gate** — signals blocked when ADX < 20 (ranging market)
+- **Sustained slope (3-bar)** — EMA_slow must slope for 3 consecutive bars
+- **RSI zone narrowed** — buys blocked above RSI 65; sells blocked below RSI 35
+- **RSI momentum gate** — RSI must move in signal direction over last 3 bars
+- **Price structure gate for sells** — SELL requires price below EMA_slow
+- **Min crossover gap raised to 0.1%**
+- **Breakout: ADX gate, 2× ATR threshold, volume AND price required, RSI gate**
+- **Chart: ADX displayed alongside RSI in top-left overlay**
 
 ---
 

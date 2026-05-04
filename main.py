@@ -4709,22 +4709,21 @@ class Dashboard(ctk.CTkFrame):
                         f"Buy {pair} skipped — liquid USD ${self.usd_balance:.2f} "
                         f"below minimum reserve ${MINIMUM_RESERVE:.2f}", "warn")
                     return
-                # Auto-compound: scale order size as % of available funds (up to cap)
-                if self.auto_compound_enabled:
-                    compound_size = avail_funds * (self.auto_compound_pct / 100.0)
-                    compound_size = min(compound_size, self.auto_compound_cap)
-                    amount = max(compound_size, 1.0)   # floor at $1 to avoid zero orders
-                amount_usd = min(amount, avail_funds)
+                # Full-port scalping: always deploy the entire available allocation.
+                # Overrides fixed ORDER_AMOUNT_USD and auto-compound — the goal is
+                # to be 100% deployed at all times, cycling between USD and coin
+                # on every alternating buy/sell signal.
+                amount_usd = avail_funds
                 total_cap  = avail_funds + sum(self.bot_exposure.values())
                 if self.bot_exposure[pair] + amount_usd > MAX_EXPOSURE_PER_PAIR * total_cap:
                     self.log_message(f"Exposure cap reached for {pair}", "warn")
                     return
             else:
-                # Sell: use bot-traded exposure OR directly allocated coin qty
+                # Full-port sell: liquidate the entire coin position in one order.
                 bot_exp_usd  = self.bot_exposure.get(pair, 0)
                 coin_qty_val = self.bot_coin_qty.get(pair, 0) * vp if vp else 0
                 total_sell   = bot_exp_usd + coin_qty_val
-                amount_usd   = min(amount, total_sell)
+                amount_usd   = total_sell   # sell everything — no partial exits
                 if amount_usd <= 0:
                     self.log_message(f"No holdings to sell for {pair}", "warn")
                     return
