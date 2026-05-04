@@ -13,8 +13,12 @@ Key references:
 """
 
 import asyncio
+import bisect
 import json
+import math
 import os
+import re
+import shutil
 import sys
 import threading
 import time
@@ -23,9 +27,9 @@ import logging
 import traceback
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
+from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
-from tkinter import messagebox
 import tkinter as tk
 import numpy as np
 import matplotlib
@@ -34,15 +38,16 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.patches as mpatches
 import matplotlib.lines as mlines
+import matplotlib.transforms as mtransforms
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import websockets
 import pytz
 import http.server
 import socketserver
+import engine
 
 # Official Coinbase SDK
 from coinbase.rest import RESTClient
-from coinbase.jwt_generator import build_ws_jwt
 
 from engine import (
     IndicatorEngine, MACrossover, heikin_ashi, normalize_candles, format_price,
@@ -50,9 +55,6 @@ from engine import (
     load_candle_cache, save_candle_cache,
     load_user_settings, save_user_settings,
     make_client, make_ws_jwt,
-    ema as _ema_fn,          # EMA for chart MA lines (replaces np.convolve SMA)
-    rsi as _rsi_fn,          # RSI series for chart display
-    atr_series as _atr_fn,   # Wilder ATR series
     TRADING_PAIRS, WATCHLIST_PAIRS, COINBASE_WS_URL, MAX_HISTORY, DISPLAY_CANDLES, FETCH_CANDLES,
     MA_PERIODS, TIMEFRAMES, ORDER_AMOUNT_USD, MINIMUM_RESERVE, WEBHOOK_PORT,
     STOP_LOSS_PCT, TAKE_PROFIT_PCT, TRAIL_STOP_PCT, ATR_PERIOD, COOLDOWN_SECONDS,
@@ -242,6 +244,9 @@ plt.rcParams.update({
     "grid.alpha":        0.5,
 })
 
+# Confirmation TF for each signal TF — one step shorter
+_CONF_TF_MAP = {'1m': '1m', '5m': '1m', '1h': '5m', '1d': '1h'}
+
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
 class WebhookHandler(http.server.SimpleHTTPRequestHandler):
@@ -296,8 +301,7 @@ class LoginScreen(ctk.CTkFrame):
         center.place(relx=0.5, rely=0.5, anchor="center", relwidth=0.40, relheight=0.78)
 
         # Top highlight strip — tk.Frame avoids CTk canvas resize artifacts
-        import tkinter as _tk
-        _tk.Frame(center, height=1, bg=C_HL, bd=0, highlightthickness=0).pack(fill="x")
+        tk.Frame(center, height=1, bg=C_HL, bd=0, highlightthickness=0).pack(fill="x")
 
         # Glow ring around logo
         logo_ring = ctk.CTkFrame(center, fg_color="transparent",
@@ -418,9 +422,8 @@ class Dashboard(ctk.CTkFrame):
 
         _saved_ma = _s.get('ma_periods')
         if _saved_ma and isinstance(_saved_ma, list) and len(_saved_ma) >= 2:
-            import engine as _eng
-            _eng.MA_PERIODS = _saved_ma
-            globals()['MA_PERIODS'] = list(_saved_ma)   # C1 fix: update local global too
+            engine.MA_PERIODS = _saved_ma
+            globals()['MA_PERIODS'] = list(_saved_ma)
         self.custom_ma_periods = list(MA_PERIODS)  # mutable — user can override
         # Restore numeric trading params if saved
         if 'stop_loss_pct'    in _s: globals()['STOP_LOSS_PCT']    = float(_s['stop_loss_pct'])
@@ -429,7 +432,7 @@ class Dashboard(ctk.CTkFrame):
         if 'minimum_reserve'  in _s: globals()['MINIMUM_RESERVE']  = float(_s['minimum_reserve'])
         if 'cooldown_seconds' in _s:
             globals()['COOLDOWN_SECONDS'] = float(_s['cooldown_seconds'])
-            import engine as _eng2; _eng2.COOLDOWN_SECONDS = float(_s['cooldown_seconds'])
+            engine.COOLDOWN_SECONDS = float(_s['cooldown_seconds'])
         self.alloc_round_tokens     = int(_s.get('alloc_round_tokens', 250))
         self.auto_compound_enabled  = bool(_s.get('auto_compound_enabled', False))
         self.auto_compound_pct      = float(_s.get('auto_compound_pct',  10.0))  # % of avail per trade
@@ -474,13 +477,9 @@ class Dashboard(ctk.CTkFrame):
                     'source': 'history',
                 }
 
-        # Fallback: if trades.json was empty (e.g. all positions closed and wiped),
-        # scan bot.log for the most recent FILLED line to recover last signal display.
-        # Line format: "YYYY-MM-DD HH:MM:SS.mmm  INFO   [TRADE] ◆ FILLED SELL XCN-USD  ... fill_price=$0.005140 ..."
         if self.last_executed_signal is None:
-            import re as _re
             _log_path = os.path.join(os.path.dirname(__file__), 'bot.log')
-            _fill_pat = _re.compile(
+            _fill_pat = re.compile(
                 r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})'   # datetime
                 r'.*◆ FILLED (BUY|SELL) ([A-Z]+-[A-Z]+)'     # side + pair
                 r'.*fill_price=\$?([\d.]+)'                   # fill_price
@@ -496,8 +495,7 @@ class Dashboard(ctk.CTkFrame):
                 pass
             if _best_fill:
                 try:
-                    from datetime import datetime as _dt2
-                    _ts = _dt2.strptime(_best_fill.group(1), '%Y-%m-%d %H:%M:%S').timestamp()
+                    _ts = datetime.strptime(_best_fill.group(1), '%Y-%m-%d %H:%M:%S').timestamp()
                     self.last_executed_signal = {
                         'pair':   _best_fill.group(3),
                         'side':   _best_fill.group(2).lower(),
@@ -519,6 +517,13 @@ class Dashboard(ctk.CTkFrame):
         # currently-forming bar in real-time (not just after the candle closes).
         # (pair, tf) → [ts_ms, open, high, low, close, vol]
         self._forming_candle: dict = {}
+        # Lock: _forming_candle is written by the async WS coroutine and read by
+        # the sync Tkinter thread (_refresh_chart).  The lock prevents torn reads.
+        self._forming_candle_lock = threading.Lock()
+
+        # MA cache — SMA arrays computed once in _ingest_candles (O(N)), read
+        # O(1) on every 1s chart refresh.  Key: (pair, tf), value: {period: np.ndarray}
+        self._ma_cache: dict = {}
 
         # Order book — updated from level2 WS channel.
         # pair → {'bids': sorted list [(price, qty)], 'asks': sorted list [(price, qty)]}
@@ -760,14 +765,11 @@ class Dashboard(ctk.CTkFrame):
 
     def _glass_card(self, parent, accent=None, corner=16, **kw):
         """A glass-effect panel: dark bg + tinted border + top highlight strip."""
-        import tkinter as _tk
         if accent is None:
             accent = C_ACCENT2
         card = ctk.CTkFrame(parent, fg_color=C_GLASS, corner_radius=corner,
                             border_width=1, border_color=C_BORDER2, **kw)
-        # Top highlight — tk.Frame avoids CTk canvas resize artifacts
-        _tk.Frame(card, height=1, bg=C_HL, bd=0, highlightthickness=0).pack(
-            fill="x")
+        tk.Frame(card, height=1, bg=C_HL, bd=0, highlightthickness=0).pack(fill="x")
         return card
 
     # ── Dashboard page ────────────────────────────────────────────────────────
@@ -855,7 +857,7 @@ class Dashboard(ctk.CTkFrame):
             self._bs_pair_alloc_rows[pair] = (r, lbl)
 
         # ── Last Executed Signal (hidden until a real fill happens) ───────────
-        import tkinter as _tk; _tk.Frame(bsc, height=1, bg=C_BORDER, bd=0, highlightthickness=0).pack(
+        tk.Frame(bsc, height=1, bg=C_BORDER, bd=0, highlightthickness=0).pack(
             fill="x", padx=16, pady=(6, 6))
         self._last_sig_frame = ctk.CTkFrame(bsc, fg_color="transparent")
         # Only packed when last_executed_signal is set
@@ -945,7 +947,7 @@ class Dashboard(ctk.CTkFrame):
                      text_color=C_ACCENT).pack(side="left", padx=(0, 6))
         ctk.CTkLabel(af_hdr, text="ACTIVITY FEED", font=("Segoe UI", 9, "bold"),
                      text_color=C_ACCENT).pack(side="left")
-        import tkinter as _tk; _tk.Frame(af, height=1, bg=C_BORDER2, bd=0, highlightthickness=0).pack(
+        tk.Frame(af, height=1, bg=C_BORDER2, bd=0, highlightthickness=0).pack(
             fill="x", padx=0, pady=(8, 0))
 
         self.activity_box = ctk.CTkTextbox(
@@ -957,13 +959,8 @@ class Dashboard(ctk.CTkFrame):
     def _metric_card(self, parent, title, value, color, icon=""):
         card = ctk.CTkFrame(parent, fg_color=C_GLASS, corner_radius=16,
                             border_width=1, border_color=C_BORDER2)
-        # Top highlight strip — use tk.Frame (no CTk canvas) to avoid resize artifacts
-        import tkinter as _tk
-        _tk.Frame(card, height=1, bg=C_HL, bd=0, highlightthickness=0).pack(
-            fill="x")
-        # Colored accent bar along top (2px, full width)
-        _tk.Frame(card, height=2, bg=color, bd=0, highlightthickness=0).pack(
-            fill="x")
+        tk.Frame(card, height=1, bg=C_HL, bd=0, highlightthickness=0).pack(fill="x")
+        tk.Frame(card, height=2, bg=color, bd=0, highlightthickness=0).pack(fill="x")
         # Title row
         th = ctk.CTkFrame(card, fg_color="transparent")
         th.pack(fill="x", padx=16, pady=(10, 2))
@@ -984,13 +981,10 @@ class Dashboard(ctk.CTkFrame):
         return card
 
     def _pair_card(self, parent, pair):
-        import tkinter as _tk
         coin = pair.split("-")[0]
         card = ctk.CTkFrame(parent, fg_color=C_GLASS, corner_radius=14,
                             border_width=1, border_color=C_BORDER2)
-        # Top highlight strip — tk.Frame avoids CTk canvas resize artifacts
-        _tk.Frame(card, height=1, bg=C_HL, bd=0, highlightthickness=0).pack(
-            fill="x")
+        tk.Frame(card, height=1, bg=C_HL, bd=0, highlightthickness=0).pack(fill="x")
         # Header: pair name + change badge
         hdr = ctk.CTkFrame(card, fg_color="transparent")
         hdr.pack(fill="x", padx=14, pady=(10, 4))
@@ -1642,8 +1636,7 @@ class Dashboard(ctk.CTkFrame):
     def _save_logs(self):
         """Save bot.log to a user-chosen file via file dialog."""
         try:
-            from tkinter import filedialog
-            ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
             path = filedialog.asksaveasfilename(
                 parent=self.root,
                 initialfile=f"nexxus_logs_{ts}.txt",
@@ -1655,7 +1648,6 @@ class Dashboard(ctk.CTkFrame):
                 return
             bot_log = os.path.join(os.path.dirname(__file__), 'bot.log')
             if os.path.exists(bot_log):
-                import shutil
                 shutil.copy2(bot_log, path)
                 self.log_message(f"Logs saved → {path}", "info")
             else:
@@ -2059,7 +2051,8 @@ class Dashboard(ctk.CTkFrame):
         _seconds_per = {'1m': 60, '5m': 300, '1h': 3600, '1d': 86400}
         _fc_secs = _seconds_per.get(tf, 3600)
         _fc_period_ms = (int(time.time()) // _fc_secs) * _fc_secs * 1000
-        _fc_raw = self._forming_candle.get((pair, tf))
+        with self._forming_candle_lock:
+            _fc_raw = self._forming_candle.get((pair, tf))
         if _fc_raw is not None:
             _fc_ts = _fc_raw[0]
             if data:
@@ -2099,10 +2092,16 @@ class Dashboard(ctk.CTkFrame):
         atr    = ind['atr']
         price  = self.live_prices.get(pair, 0)
 
-        # Pre-compute warmed MAs from full 2× history; take last `limit` values
-        # so every visible candle has a valid MA — no cold-start distortion.
+        # Warmed MA lookup — read cached SMA arrays built in _ingest_candles (O(1)).
+        # Falls back to live recompute if the cache hasn't been populated yet
+        # (e.g. first frame before the first candle ingest completes).
+        _cached_mas = self._ma_cache.get((pair, tf), {})
         _all_c = np.array([c[4] for c in compute_data])
         def _warmed_ma(period):
+            if period in _cached_mas:
+                ma = _cached_mas[period]
+                return ma[-limit:] if len(ma) >= limit else ma
+            # Fallback: live recompute
             if len(_all_c) < period:
                 return np.array([])
             ma = np.convolve(_all_c, np.ones(period) / period, mode='valid')
@@ -2266,8 +2265,7 @@ class Dashboard(ctk.CTkFrame):
             # ── Precompute confirmation TF MA diff indexed by candle timestamp ─
             # Matches engine.calculate_signals: BUY only if MA_fast > MA_slow on
             # conf TF at the time of the crossover.  SELL requires the opposite.
-            _conf_map = {'1m': '1m', '5m': '1m', '1h': '5m', '1d': '1h'}
-            _conf_tf  = _conf_map.get(self.signal_tf, '1m')
+            _conf_tf  = _CONF_TF_MAP.get(self.signal_tf, '1m')
             _conf_raw = list(self.candle_history[_conf_tf][pair])
             _conf_diff_by_ts: dict = {}   # candle_ts_ms → float (fast_ma − slow_ma)
             if len(_conf_raw) >= p_slow:
@@ -2279,12 +2277,11 @@ class Dashboard(ctk.CTkFrame):
                     _conf_diff_by_ts[_t] = float(_fd) - float(_sd)
             _conf_ts_sorted = sorted(_conf_diff_by_ts.keys())
 
-            import bisect as _bisect
             def _conf_diff_at(ts_ms: int) -> 'float | None':
                 """Conf TF MA diff at the most recent candle ≤ ts_ms. None if unavailable."""
                 if not _conf_ts_sorted:
                     return None
-                idx = _bisect.bisect_right(_conf_ts_sorted, ts_ms) - 1
+                idx = bisect.bisect_right(_conf_ts_sorted, ts_ms) - 1
                 if idx < 0:
                     return None
                 return _conf_diff_by_ts[_conf_ts_sorted[idx]]
@@ -2434,8 +2431,7 @@ class Dashboard(ctk.CTkFrame):
             ax.axhline(y=_les_price, color=_les_color, linestyle='--',
                        linewidth=0.9, alpha=0.55)
             # Right-edge label with entry price
-            import matplotlib.transforms as _mt2
-            _bl2 = _mt2.blended_transform_factory(ax.transAxes, ax.transData)
+            _bl2 = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
             ax.annotate(f" {_les_marker} {format_price(_les_price)} ",
                         xy=(1.0, _les_price), xycoords=_bl2,
                         fontsize=7, color=_les_color, alpha=0.95,
@@ -2449,8 +2445,6 @@ class Dashboard(ctk.CTkFrame):
                 _les_dt  = datetime.fromtimestamp(_les['ts'], pytz.UTC)
                 _les_x   = mdates.date2num(_les_dt)
                 _xl      = ax.get_xlim()
-                # Use the same ATR-based signal_offset as MA crossover arrows
-                # (avoids stale ax.get_ylim() before matplotlib auto-scales).
                 _offset  = signal_offset
                 if _les_side == 'sell':
                     _marker_y = _les_price + _offset
@@ -2463,8 +2457,6 @@ class Dashboard(ctk.CTkFrame):
                                 color=_les_color, fontsize=11, alpha=1.0,
                                 ha='center', va=_va, fontweight='bold',
                                 clip_on=True)
-                # Always register in _signal_data so hover works even when
-                # the marker timestamp is outside the current view window.
                 _les_ma_fast = float(ma_lines.get(p_fast, [0])[-1]) if ma_lines.get(p_fast, []) else 0
                 _les_ma_slow = float(ma_lines.get(p_slow, [0])[-1]) if ma_lines.get(p_slow, []) else 0
                 self._signal_data.append({
@@ -2523,10 +2515,9 @@ class Dashboard(ctk.CTkFrame):
         # The label is clamped to within the visible y-range so it's always shown
         # even when the chart is zoomed to a region that doesn't include the price.
         if price:
-            import matplotlib.transforms as _mt
             _yl_now    = ax.get_ylim()
             _label_y   = max(_yl_now[0], min(_yl_now[1], price))
-            _blended   = _mt.blended_transform_factory(ax.transAxes, ax.transData)
+            _blended   = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
             _price_col = C_GREEN if price >= closes[-1] else C_RED
             ax.annotate(f" {format_price(price)} ",
                         xy=(1.0, _label_y),
@@ -3391,8 +3382,7 @@ class Dashboard(ctk.CTkFrame):
                     v = total * pct / 100
                     n = self.alloc_round_tokens
                     if n > 1:
-                        import math as _math
-                        v = _math.floor(v / n) * n
+                        v = math.floor(v / n) * n
                     fmt = f"{v:.6f}"
                     b.configure(state="normal",
                                 command=lambda x=fmt: (amt.delete(0, "end"), amt.insert(0, x)))
@@ -3407,8 +3397,7 @@ class Dashboard(ctk.CTkFrame):
                 price = self.live_prices.get(p, 0)
                 total = self.real_exposure.get(p, 0) / price if price else 0
                 n = self.alloc_round_tokens
-                import math as _m2
-                total = _m2.floor(total / n) * n if n > 1 else total
+                total = math.floor(total / n) * n if n > 1 else total
                 amt.delete(0, "end"); amt.insert(0, f"{total:.6f}")
 
         def _on_alloc_all_toggle(*_):
@@ -3497,11 +3486,9 @@ class Dashboard(ctk.CTkFrame):
                     self.log_message(
                         f"Allocated ${val:,.2f}{src_tag} → {coin} bot wallet", "trade")
                 else:
-                    # val = coin quantity; apply rounding before validation
                     n = self.alloc_round_tokens
                     if n > 1:
-                        import math as _math
-                        val = _math.floor(val / n) * n
+                        val = math.floor(val / n) * n
                     if val <= 0:
                         err.configure(text=f"Amount rounds to 0 (step: {n} tokens)")
                         return
@@ -3698,9 +3685,8 @@ class Dashboard(ctk.CTkFrame):
             self.auto_compound_enabled = bool(self.ac_enabled_var.get())
             self.auto_compound_pct     = max(0.1, min(100.0, float(self.ac_pct_var.get())))
             self.auto_compound_cap     = max(1.0, float(self.ac_cap_var.get()))
-            import engine as _eng
-            _eng.COOLDOWN_SECONDS = COOLDOWN_SECONDS
-            self.signal_tf        = self.signal_tf_var.get()
+            engine.COOLDOWN_SECONDS = COOLDOWN_SECONDS
+            self.signal_tf          = self.signal_tf_var.get()
             self.signal_direction = self.signal_dir_var.get()
             # Persist swap targets ('USD' maps to '' meaning no swap order placed)
             for pair in TRADING_PAIRS:
@@ -3749,8 +3735,7 @@ class Dashboard(ctk.CTkFrame):
             return
 
         MA_PERIODS = periods
-        import engine as _eng
-        _eng.MA_PERIODS = periods
+        engine.MA_PERIODS = periods
         self.custom_ma_periods = periods
         # Refresh display text (normalized)
         self.ma_periods_var.set(", ".join(str(p) for p in periods))
@@ -3883,24 +3868,15 @@ class Dashboard(ctk.CTkFrame):
                 # to exactly what Coinbase requires (e.g. XCN may be 0.01 = 2dp)
                 base_inc = info.get('base_increment', '0.00000001')
                 try:
-                    inc_f = float(base_inc)  # handles scientific notation (1e-8)
-                    if inc_f >= 1:
-                        dp = 0
-                    else:
-                        import math as _m
-                        dp = max(0, -int(_m.floor(_m.log10(inc_f))))
+                    inc_f = float(base_inc)
+                    dp = 0 if inc_f >= 1 else max(0, -int(math.floor(math.log10(inc_f))))
                     self._base_precision[pair] = dp
                 except Exception:
-                    self._base_precision[pair] = 8  # safe default (BTC-level precision)
-                # Cache quote_increment precision for limit order price formatting
+                    self._base_precision[pair] = 8
                 quote_inc = info.get('quote_increment', '0.01')
                 try:
                     q_f = float(quote_inc)
-                    if q_f >= 1:
-                        qdp = 0
-                    else:
-                        import math as _mq
-                        qdp = max(0, -int(_mq.floor(_mq.log10(q_f))))
+                    qdp = 0 if q_f >= 1 else max(0, -int(math.floor(math.log10(q_f))))
                     self._quote_precision[pair] = qdp
                 except Exception:
                     self._quote_precision[pair] = 2
@@ -4147,8 +4123,8 @@ class Dashboard(ctk.CTkFrame):
                 await asyncio.sleep(0.35)  # rate-limit between batch calls
 
         if all_candles:
-            span_from = datetime.fromtimestamp(all_candles[0][0]/1000 if isinstance(all_candles[0], list) else all_candles[0]['start'] if isinstance(all_candles[0], dict) else 0, pytz.UTC).strftime('%Y-%m-%d %H:%M')
-            span_to   = datetime.fromtimestamp(all_candles[-1][0]/1000 if isinstance(all_candles[-1], list) else all_candles[-1]['start'] if isinstance(all_candles[-1], dict) else 0, pytz.UTC).strftime('%Y-%m-%d %H:%M')
+            span_from = datetime.fromtimestamp(all_candles[0][0]  / 1000, pytz.UTC).strftime('%Y-%m-%d %H:%M')
+            span_to   = datetime.fromtimestamp(all_candles[-1][0] / 1000, pytz.UTC).strftime('%Y-%m-%d %H:%M')
             self.log_message(
                 f"Candles fetched  {pair}/{timeframe}  "
                 f"count={len(all_candles)}  span={span_from} → {span_to}", "monitor")
@@ -4189,14 +4165,22 @@ class Dashboard(ctk.CTkFrame):
             self.indicator_engine.calculate_support_resistance(pair, ha)
             self.indicator_engine.calculate_order_blocks(pair, ha)
             self.indicator_engine.calculate_fair_value_gaps(pair, ha)
-            self.indicator_engine.calculate_rsi(pair, ha)            # RSI gate
-            self.indicator_engine.calculate_ema_trend(pair, ha)      # trend filter
-            self.indicator_engine.calculate_adx(pair, ha)            # ADX trend strength
+            self.indicator_engine.calculate_rsi(pair, ha)
+            self.indicator_engine.calculate_adx(pair, ha)
+
+        # Cache warmed SMA arrays for all MA periods so _refresh_chart reads O(1).
+        # Computed from the full HA history (same source as chart's compute_data).
+        _ha_closes = np.array([c[4] for c in ha])
+        _cached_mas = {}
+        for _p in MA_PERIODS:
+            if len(_ha_closes) >= _p:
+                _cached_mas[_p] = np.convolve(
+                    _ha_closes, np.ones(_p) / _p, mode='valid')
+        if _cached_mas:
+            self._ma_cache[(pair, timeframe)] = _cached_mas
 
         if is_trading_pair and timeframe == self.signal_tf and self.running and not self.paused:
-            # Confirmation frame: one step shorter than the signal TF
-            _conf_map = {'1m': '1m', '5m': '1m', '1h': '5m', '1d': '1h'}
-            conf_tf   = _conf_map.get(self.signal_tf, '1m')
+            conf_tf = _CONF_TF_MAP.get(self.signal_tf, '1m')
             # Capital gates — matched to what _place_order will actually accept.
             # BUY needs USD (bot_balance or bot_pair_alloc >= reserve).
             # SELL needs coins (bot_exposure or bot_coin_qty > 0).
@@ -4253,8 +4237,16 @@ class Dashboard(ctk.CTkFrame):
                         f"@ {format_price(sig['price'])}  "
                         f"conf_candles={len(conf_candles)}  tf={timeframe}→{conf_tf}",
                         "trade")
-                    asyncio.run_coroutine_threadsafe(
-                        self._place_order(pair, sig['action'], fast_exec=True), self.loop)
+                    async def _place_with_timeout(_pair=pair, _action=sig['action']):
+                        try:
+                            await asyncio.wait_for(
+                                self._place_order(_pair, _action, fast_exec=True),
+                                timeout=300)
+                        except asyncio.TimeoutError:
+                            logger.error(
+                                f"_place_order hard timeout 300s — releasing lock for {_pair}")
+                            self.order_locks[_pair] = False
+                    asyncio.run_coroutine_threadsafe(_place_with_timeout(), self.loop)
             elif self.order_locks[pair]:
                 self.log_message(
                     f"Signal check skipped — {pair} order lock active", "info")
@@ -4307,7 +4299,12 @@ class Dashboard(ctk.CTkFrame):
                     while self.running:
                         try:
                             raw  = await asyncio.wait_for(ws.recv(), timeout=30)
-                            data = json.loads(raw)
+                            try:
+                                data = json.loads(raw)
+                            except json.JSONDecodeError as _je:
+                                self.log_message(
+                                    f"WS bad JSON (skipping frame): {_je}", "warn")
+                                continue
 
                             # Renew JWT every 90s (token valid for 120s)
                             if time.time() - self._ws_jwt_ts > 90:
@@ -4373,18 +4370,19 @@ class Dashboard(ctk.CTkFrame):
                                         _now_ts = int(time.time())
                                         _secs_map = {'1m': 60, '5m': 300,
                                                      '1h': 3600, '1d': 86400}
-                                        for _tf, _secs in _secs_map.items():
-                                            _ps_ms = (_now_ts // _secs) * _secs * 1000
-                                            _fkey  = (pid, _tf)
-                                            _fc    = self._forming_candle.get(_fkey)
-                                            if _fc is None or _fc[0] != _ps_ms:
-                                                # New candle period — open at this price
-                                                self._forming_candle[_fkey] = [
-                                                    _ps_ms, p, p, p, p, 0.0]
-                                            else:
-                                                _fc[2] = max(_fc[2], p)  # high
-                                                _fc[3] = min(_fc[3], p)  # low
-                                                _fc[4] = p               # close
+                                        with self._forming_candle_lock:
+                                            for _tf, _secs in _secs_map.items():
+                                                _ps_ms = (_now_ts // _secs) * _secs * 1000
+                                                _fkey  = (pid, _tf)
+                                                _fc    = self._forming_candle.get(_fkey)
+                                                if _fc is None or _fc[0] != _ps_ms:
+                                                    # New candle period — open at this price
+                                                    self._forming_candle[_fkey] = [
+                                                        _ps_ms, p, p, p, p, 0.0]
+                                                else:
+                                                    _fc[2] = max(_fc[2], p)  # high
+                                                    _fc[3] = min(_fc[3], p)  # low
+                                                    _fc[4] = p               # close
                                         if self.root_alive:
                                             self.root.after(0, self._update_pair_cards)
                                         if chan == "ticker":
@@ -4733,9 +4731,8 @@ class Dashboard(ctk.CTkFrame):
                 self.log_message(f"No live price for {pair}", "error")
                 return
 
-            import math as _math
-            bdp  = self._base_precision.get(pair, 8)
-            qdp  = self._quote_precision.get(pair, 2)
+            bdp = self._base_precision.get(pair, 8)
+            qdp = self._quote_precision.get(pair, 2)
 
             # ── Progressive limit order (maker → 0% fee) ─────────────────────
             # Attempt 1: price offset 1 tick from bid/ask — guaranteed maker on ANY
@@ -4766,7 +4763,7 @@ class Dashboard(ctk.CTkFrame):
                         self.log_message(f"BUY limit_px is 0 for {pair} — skipping attempt", "warn")
                         continue
                     raw_qty  = amount_usd / limit_px
-                    floored  = _math.floor(raw_qty * 10**bdp) / 10**bdp
+                    floored  = math.floor(raw_qty * 10**bdp) / 10**bdp
                     if floored <= 0:
                         self.log_message(
                             f"BUY qty rounds to 0 for {pair} (amount=${amount_usd:.2f} px={limit_px}) — skipping", "warn")
@@ -4790,7 +4787,7 @@ class Dashboard(ctk.CTkFrame):
                     # Sell above ask by offset → guaranteed maker; more aggressive each retry
                     limit_px = round(ask + offset, qdp)
                     raw_qty  = amount_usd / price
-                    raw_qty  = _math.floor(raw_qty * 10**bdp) / 10**bdp
+                    raw_qty  = math.floor(raw_qty * 10**bdp) / 10**bdp
                     min_qty  = 10 ** (-bdp)
                     if raw_qty < min_qty:
                         self.log_message(
@@ -4871,7 +4868,7 @@ class Dashboard(ctk.CTkFrame):
                     )
                 else:
                     raw_qty2 = amount_usd / price
-                    raw_qty2 = _math.floor(raw_qty2 * 10**bdp) / 10**bdp
+                    raw_qty2 = math.floor(raw_qty2 * 10**bdp) / 10**bdp
                     order_resp = await asyncio.to_thread(
                         self.client.market_order_sell,
                         client_order_id=order_id,
@@ -5043,12 +5040,11 @@ class Dashboard(ctk.CTkFrame):
         qty        = trade['quantity']
         cur_price  = self.live_prices.get(pair, price)
         try:
-            import math as _m2
             bdp = self._base_precision.get(pair, 8)
             qdp = self._quote_precision.get(pair, 2)
 
             if close_side == 'sell':
-                qty_adj = _m2.floor(qty * 10**bdp) / 10**bdp
+                qty_adj = math.floor(qty * 10**bdp) / 10**bdp
                 if qty_adj < 10**(-bdp):
                     self.log_message(
                         f"Close qty {qty_adj} below min increment — skipping {reason}", "warn")
@@ -5087,7 +5083,7 @@ class Dashboard(ctk.CTkFrame):
                     limit_px    = round(bid - offset, qdp)
                     lp_str      = f"{limit_px:.{qdp}f}"
                     raw_qty_buy = qty * cur_price / limit_px if limit_px else 0
-                    bs_str      = f"{_m2.floor(raw_qty_buy * 10**bdp) / 10**bdp:.{bdp}f}"
+                    bs_str      = f"{math.floor(raw_qty_buy * 10**bdp) / 10**bdp:.{bdp}f}"
                     note        = f"  (bid-{offset:.{qdp}f})" if offset else "  (at bid)"
                     self.log_message(
                         f"CLOSE BUY LIMIT {pair}  qty={bs_str}  price={lp_str}{note}"
@@ -5262,9 +5258,8 @@ class Dashboard(ctk.CTkFrame):
             if qty < 1e-8:
                 continue
             try:
-                import math as _m_sell
                 dp  = self._base_precision.get(pair, 8)
-                qty = _m_sell.floor(qty * (10 ** dp)) / (10 ** dp)
+                qty = math.floor(qty * (10 ** dp)) / (10 ** dp)
                 if qty < 10 ** (-dp):
                     continue
                 resp = await asyncio.to_thread(
@@ -5351,6 +5346,10 @@ class App(ctk.CTk):
 
 
 if __name__ == "__main__":
+    # Guard: MA_PERIODS needs at least 2 entries for fast/slow crossover math.
+    if len(MA_PERIODS) < 2:
+        sys.exit(f"FATAL: MA_PERIODS must have at least 2 periods, got {MA_PERIODS}")
+
     crash_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash.log")
     try:
         app = App()
@@ -5360,8 +5359,7 @@ if __name__ == "__main__":
         with open(crash_log, "w") as f:
             f.write(err)
         try:
-            import tkinter as _tk
-            _r = _tk.Tk(); _r.withdraw()
+            _r = tk.Tk(); _r.withdraw()
             messagebox.showerror("NEXXUS — Startup Error",
                                  f"Crash log saved to:\n{crash_log}\n\n{err[:600]}")
             _r.destroy()

@@ -39,7 +39,7 @@ echo "Installing Python dependencies..."
 $PIP install --quiet --upgrade \
   customtkinter \
   pillow \
-  ccxt \
+  coinbase-advanced-py \
   matplotlib \
   websockets \
   numpy \

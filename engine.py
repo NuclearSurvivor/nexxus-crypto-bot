@@ -352,10 +352,9 @@ class IndicatorEngine:
             'order_blocks':    [],
             'fair_value_gaps': [],
             'atr':             0.0,
-            'rsi':             50.0,   # current RSI value (last bar)
-            'rsi_series':      [],     # full series for chart display
-            'ema_trend_up':    None,   # True/False/None if insufficient data
-            'adx':             0.0,    # ADX — trend strength (0-100)
+            'rsi':             50.0,
+            'rsi_series':      [],
+            'adx':             0.0,
         })
 
     def calculate_support_resistance(self, pair, candles, bin_width=0.001, min_volume=1000):
@@ -451,37 +450,6 @@ class IndicatorEngine:
         """Cache the ADX trend-strength value."""
         self.data[pair]['adx'] = adx(candles, period=14)
 
-    def calculate_ema_trend(self, pair, candles):
-        """Trend direction via EMA(slow_period) slope.
-
-        ema_trend_up = True  → trending up   (bullish bias, prefer buys)
-        ema_trend_up = False → trending down  (bearish bias, prefer sells)
-        ema_trend_up = None  → insufficient data
-        """
-        if len(candles) < 3:
-            self.data[pair]['ema_trend_up'] = None
-            return
-        _, p_slow = sorted(MA_PERIODS)[:2]
-        closes = np.array([c[4] for c in candles])
-        vals   = ema(closes, p_slow)
-        valid  = vals[~np.isnan(vals)]
-        if len(valid) < 2:
-            self.data[pair]['ema_trend_up'] = None
-        else:
-            self.data[pair]['ema_trend_up'] = bool(valid[-1] > valid[-2])
-
-    def get_signals(self, pair, current_price):
-        signals = []
-        for price, is_support, _ in self.data[pair]['sr_zones']:
-            if current_price and abs(current_price - price) / current_price < 0.005:
-                signals.append({'type': 'SR', 'action': 'buy' if is_support else 'sell', 'price': price})
-        for _, high, low, is_bullish in self.data[pair]['order_blocks']:
-            if low <= current_price <= high:
-                signals.append({'type': 'OB', 'action': 'buy' if is_bullish else 'sell', 'price': (high+low)/2})
-        for _, high, low, is_bullish in self.data[pair]['fair_value_gaps']:
-            if low <= current_price <= high:
-                signals.append({'type': 'FVG', 'action': 'buy' if is_bullish else 'sell', 'price': (high+low)/2})
-        return signals
 
 
 # ── MA/EMA Crossover Strategy ────────────────────────────────────────────────
