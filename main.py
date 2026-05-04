@@ -2308,6 +2308,11 @@ class Dashboard(ctk.CTkFrame):
                 _cl        = closes[-_n:]
                 _data_win  = data[-_n:]   # raw candle rows with timestamps
 
+                # State machine: same logic as engine._trend_state
+                # Collapses repeated EMA(2)/EMA(5) re-crosses within one trend
+                # into a single entry and a single exit arrow.
+                _chart_state = 'neutral'
+
                 for i in range(1, _n):
                     prev = _mf[i - 1] - _ms[i - 1]
                     curr = _mf[i]     - _ms[i]
@@ -2318,6 +2323,12 @@ class Dashboard(ctk.CTkFrame):
 
                     action = 'buy' if is_golden else 'sell'
 
+                    # State machine gate — skip duplicate-direction crosses
+                    if action == 'buy'  and _chart_state == 'bull':
+                        continue   # already long, no repeat buy arrows
+                    if action == 'sell' and _chart_state == 'bear':
+                        continue   # already short/flat, no repeat sell arrows
+
                     # Confirmation TF check — same gate as engine.calculate_signals
                     candle_ts_ms = _data_win[i][0]
                     conf_diff = _conf_diff_at(candle_ts_ms)
@@ -2326,6 +2337,9 @@ class Dashboard(ctk.CTkFrame):
                             continue   # conf TF disagrees — engine would reject
                         if action == 'sell' and conf_diff >= 0:
                             continue   # conf TF disagrees — engine would reject
+
+                    # Update chart state (mirroring engine state machine)
+                    _chart_state = 'bull' if action == 'buy' else 'bear'
 
                     if action == 'buy':
                         y_pos  = _lo[i] - signal_offset

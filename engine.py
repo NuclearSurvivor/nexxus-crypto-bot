@@ -509,9 +509,22 @@ class MACrossover:
         self.last_trade_time: dict = defaultdict(float)
         self.last_buy_time:   dict = defaultdict(float)
         self.last_sell_time:  dict = defaultdict(float)
+        # State machine: 'neutral' | 'bull' | 'bear'
+        # Once in bull, ignore all golden crosses until a death cross fires (and vice versa).
+        # This collapses the many EMA(2)/EMA(5) re-crosses within a single trend into
+        # one entry and one exit — the user rides the full move instead of getting
+        # re-signalled on every minor oscillation.
+        self._trend_state: dict = defaultdict(lambda: 'neutral')
 
     def calculate_signals(self, pair, candles_signal, candles_conf):
-        """EMA crossover on the signal TF confirmed by the confirmation TF."""
+        """EMA crossover on the signal TF confirmed by the confirmation TF.
+
+        State machine prevents duplicate signals in the same direction:
+          neutral/bear → golden cross → BUY  (state becomes 'bull')
+          bull         → death cross  → SELL (state becomes 'bear')
+          bull         → golden cross → ignored (already long)
+          bear         → death cross  → ignored (already short/flat)
+        """
         now = time.time()
         if now - self.last_trade_time[pair] < 10:
             return None
@@ -557,13 +570,17 @@ class MACrossover:
         min_cross = price_now * 0.0005   # 0.05%
         min_conf  = price_now * 0.0002   # 0.02%
 
-        # ── Signal evaluation ─────────────────────────────────────────────────
+        state = self._trend_state[pair]
+
+        # ── BUY: golden cross — only if not already bull ──────────────────────
         if (prev_diff < 0 and curr_diff > min_cross
                 and conf_diff > min_conf
                 and trend_up
-                and curr_rsi < 70):
+                and curr_rsi < 70
+                and state != 'bull'):          # state machine: skip if already long
             if now - self.last_buy_time.get(pair, 0) < COOLDOWN_SECONDS:
                 return None
+            self._trend_state[pair] = 'bull'
             return {
                 'action': 'buy',
                 'price':  price_now,
@@ -571,12 +588,15 @@ class MACrossover:
                 'rsi':    curr_rsi,
             }
 
+        # ── SELL: death cross — only if currently bull ────────────────────────
         if (prev_diff > 0 and curr_diff < -min_cross
                 and conf_diff < -min_conf
                 and trend_down
-                and curr_rsi > 30):
+                and curr_rsi > 30
+                and state != 'bear'):          # state machine: skip if already flat/short
             if now - self.last_sell_time.get(pair, 0) < COOLDOWN_SECONDS:
                 return None
+            self._trend_state[pair] = 'bear'
             return {
                 'action': 'sell',
                 'price':  price_now,
