@@ -100,6 +100,10 @@ def save_credentials(api_key: str, api_secret: str, passphrase: str = ""):
     cfg.update({"api_key": api_key, "api_secret": api_secret, "passphrase": passphrase})
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except Exception:
+        pass
 
 
 # ── User Settings Persistence ─────────────────────────────────────────────────
@@ -129,6 +133,10 @@ def save_user_settings(settings: dict):
     cfg[_SETTINGS_KEY] = settings
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except Exception:
+        pass
 
 
 # ── Coinbase REST client factory ──────────────────────────────────────────────
@@ -309,23 +317,24 @@ class MACrossover:
 
     def __init__(self, indicator_engine: IndicatorEngine):
         self.ie = indicator_engine
-        self.last_trade_time: dict = defaultdict(float)
+        self.last_trade_time: dict = defaultdict(float)   # last trade of ANY direction
+        self.last_buy_time:   dict = defaultdict(float)   # last BUY per pair
+        self.last_sell_time:  dict = defaultdict(float)   # last SELL per pair
 
     def calculate_signals(self, pair, candles_signal, candles_conf):
         """MA crossover on the signal TF confirmed by the confirmation TF.
 
-        SMC (OB/FVG) confirmation removed — it rejects breakout moves by design
-        because surges break out OF consolidation zones, not into them.
-
-        Conditions:
-          BUY:  MA_fast crosses above MA_slow on signal TF
-                AND MA_fast > MA_slow on confirmation TF (trend aligned)
-          SELL: MA_fast crosses below MA_slow on signal TF
-                AND MA_fast < MA_slow on confirmation TF
+        Cooldown is tracked per-direction so a BUY cooldown doesn't block a SELL
+        signal that fires right after (and vice versa).
 
         Uses sorted(MA_PERIODS)[:2] so bot and chart always use identical periods.
         """
-        if time.time() - self.last_trade_time[pair] < COOLDOWN_SECONDS:
+        now = time.time()
+        # Per-direction cooldowns — don't let a recent buy block an urgent sell
+        _last_buy  = self.last_buy_time.get(pair, 0)
+        _last_sell = self.last_sell_time.get(pair, 0)
+        # Still enforce a global minimum gap to prevent double-firing on same candle
+        if now - self.last_trade_time[pair] < 10:
             return None
 
         p_fast, p_slow = sorted(MA_PERIODS)[:2]
@@ -347,8 +356,12 @@ class MACrossover:
         curr_conf = ma_fast_c[-1] - ma_slow_c[-1]
 
         if prev_diff < 0 and curr_diff > 0 and curr_conf > 0:
+            if now - _last_buy < COOLDOWN_SECONDS:
+                return None   # buy cooldown active
             return {'action': 'buy',  'price': closes_s[-1], 'source': f'MA{p_fast}/MA{p_slow}'}
         if prev_diff > 0 and curr_diff < 0 and curr_conf < 0:
+            if now - _last_sell < COOLDOWN_SECONDS:
+                return None   # sell cooldown active
             return {'action': 'sell', 'price': closes_s[-1], 'source': f'MA{p_fast}/MA{p_slow}'}
         return None
 
@@ -368,8 +381,9 @@ class MACrossover:
         No SMC confirmation — these moves are too fast to wait for OB/FVG.
         Uses the same cooldown as MA crossover to prevent double-firing.
         """
-        if time.time() - self.last_trade_time[pair] < COOLDOWN_SECONDS:
-            return None
+        now = time.time()
+        if now - self.last_trade_time[pair] < 10:
+            return None   # absolute minimum gap regardless of direction
         if len(candles) < 25:
             return None
 
@@ -392,8 +406,12 @@ class MACrossover:
         momentum  = (cur_close - prev_close) / prev_close if prev_close > 0 else 0
 
         if cur_close > prev_high and (vol_surge or momentum > 0.02):
+            if now - self.last_buy_time.get(pair, 0) < COOLDOWN_SECONDS:
+                return None
             return {'action': 'buy',  'price': cur_close, 'source': 'Breakout↑'}
         if cur_close < prev_low  and (vol_surge or momentum < -0.02):
+            if now - self.last_sell_time.get(pair, 0) < COOLDOWN_SECONDS:
+                return None
             return {'action': 'sell', 'price': cur_close, 'source': 'Breakdown↓'}
         return None
 

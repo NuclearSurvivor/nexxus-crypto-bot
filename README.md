@@ -8,7 +8,20 @@
 
 ## Version History
 
-### v1.0.2b *(current)*
+### v1.0.3b *(current)*
+
+#### Bug Fixes
+- **Bot balance display** — bot capital shown in topbar/key panel now cannot exceed total portfolio value. Proportional scaling clamp in `_fetch_balance` prevents `bot_balance + pair_alloc` from drifting above actual exchange USD. Display is further capped to portfolio with `min()` in `_update_metrics`.
+- **Last signal on all pairs** — key panel "LAST SIGNAL" block now reads from current chart render (`_signal_data`) first, so BTC/ETH and all non-fill pairs show their most recent MA crossover arrow instead of "No signals yet".
+- **Log-based signal recovery** — on startup with an empty `trades.json`, bot scans `bot.log` for the most recent `◆ FILLED` line and seeds `last_executed_signal` from it, so XCN (and any pair) shows the correct last fill after a restart.
+- **Fill marker hover tooltip** — ▼/▲ marker drawn from fill history now correctly registers in the hover hit system. Fixed by: (a) appending to `_signal_data` so the hover scanner can find it, (b) keeping the timestamp UTC-aware throughout (naive datetimes shifted the hit-box by the local UTC offset), (c) using ATR-based `signal_offset` instead of `ax.get_ylim()` (which returns stale limits before matplotlib auto-scales) so the drawn marker position matches the hover proximity check.
+- **Window resize artifacts** — black rectangle outlines appearing on maximize/restore fixed by replacing `CTkFrame(height=1/2, corner_radius=0)` separator strips inside rounded-corner cards with native `tk.Frame` strips (no canvas, no stale background). Added debounced `<Configure>` → `update_idletasks()` as safety net.
+- **Per-direction MA cooldowns** — buy and sell signals now track independent cooldown timers so a recent buy no longer blocks an urgent sell (and vice versa). A 10-second global minimum gap prevents double-firing on the same candle.
+- **config.json permissions** — file is `chmod 600` after every credential/settings save so the private key is not world-readable.
+
+---
+
+### v1.0.2b *(previous)*
 
 #### Order Execution
 - **Progressive limit order offsets** — attempt 1 places 1 tick outside the spread (guaranteed maker, 0% fee), attempt 2 at raw bid/ask, then market fallback. On zero-spread pairs like XCN-USD (bid=ask=$0.00514), the 1-tick cost (~0.19%) beats the taker fee (0.60%).
