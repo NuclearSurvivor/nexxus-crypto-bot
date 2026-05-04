@@ -28,7 +28,7 @@ TRADING_PAIRS        = ["BTC-USD", "ETH-USD", "XCN-USD"]
 # No trades are placed for watchlist-only pairs — they are view + cache only.
 WATCHLIST_PAIRS      = [
     "SOL-USD", "DOGE-USD", "ADA-USD", "AVAX-USD",
-    "LINK-USD", "DOT-USD", "MATIC-USD", "LTC-USD",
+    "LINK-USD", "DOT-USD", "POL-USD", "LTC-USD",
 ]
 COINBASE_WS_URL      = "wss://advanced-trade-ws.coinbase.com"
 MAX_HISTORY          = 2000
