@@ -2099,17 +2099,14 @@ class Dashboard(ctk.CTkFrame):
         atr    = ind['atr']
         price  = self.live_prices.get(pair, 0)
 
-        # Pre-compute warmed EMAs from full 2× history; take last `limit` values
-        # so every visible candle has a fully warmed EMA — no cold-start distortion.
-        # EMA responds 3-5× faster than SMA on the same period; signals fire earlier.
-        _all_c = np.array([c[4] for c in compute_data], dtype=float)
+        # Pre-compute warmed MAs from full 2× history; take last `limit` values
+        # so every visible candle has a valid MA — no cold-start distortion.
+        _all_c = np.array([c[4] for c in compute_data])
         def _warmed_ma(period):
             if len(_all_c) < period:
                 return np.array([])
-            full_ema = _ema_fn(_all_c, period)
-            # Strip leading NaN values, then take last `limit` values
-            valid = full_ema[~np.isnan(full_ema)]
-            return valid[-limit:] if len(valid) >= limit else valid
+            ma = np.convolve(_all_c, np.ones(period) / period, mode='valid')
+            return ma[-limit:] if len(ma) >= limit else ma
 
         # Update chart page header
         pct = (self.percent_change.get('1d', {}).get(pair)
@@ -2274,13 +2271,11 @@ class Dashboard(ctk.CTkFrame):
             _conf_raw = list(self.candle_history[_conf_tf][pair])
             _conf_diff_by_ts: dict = {}   # candle_ts_ms → float (fast_ma − slow_ma)
             if len(_conf_raw) >= p_slow:
-                _conf_c  = np.array([c[4] for c in _conf_raw], dtype=float)
-                _cf_full = _ema_fn(_conf_c, p_fast)
-                _cs_full = _ema_fn(_conf_c, p_slow)
-                # Align: use only indices where both EMAs are valid
-                _valid_c  = ~(np.isnan(_cf_full) | np.isnan(_cs_full))
-                _conf_vts = [_conf_raw[i][0] for i in range(len(_conf_raw)) if _valid_c[i]]
-                for _t, _fd, _sd in zip(_conf_vts, _cf_full[_valid_c], _cs_full[_valid_c]):
+                _conf_c    = np.array([c[4] for c in _conf_raw])
+                _cf_fast   = np.convolve(_conf_c, np.ones(p_fast) / p_fast, 'valid')
+                _cf_slow   = np.convolve(_conf_c, np.ones(p_slow) / p_slow, 'valid')
+                _conf_vts  = [c[0] for c in _conf_raw[(p_slow - 1):]]
+                for _t, _fd, _sd in zip(_conf_vts, _cf_fast, _cf_slow):
                     _conf_diff_by_ts[_t] = float(_fd) - float(_sd)
             _conf_ts_sorted = sorted(_conf_diff_by_ts.keys())
 
@@ -2308,11 +2303,6 @@ class Dashboard(ctk.CTkFrame):
                 _cl        = closes[-_n:]
                 _data_win  = data[-_n:]   # raw candle rows with timestamps
 
-                # State machine: same logic as engine._trend_state
-                # Collapses repeated EMA(2)/EMA(5) re-crosses within one trend
-                # into a single entry and a single exit arrow.
-                _chart_state = 'neutral'
-
                 for i in range(1, _n):
                     prev = _mf[i - 1] - _ms[i - 1]
                     curr = _mf[i]     - _ms[i]
@@ -2323,12 +2313,6 @@ class Dashboard(ctk.CTkFrame):
 
                     action = 'buy' if is_golden else 'sell'
 
-                    # State machine gate — skip duplicate-direction crosses
-                    if action == 'buy'  and _chart_state == 'bull':
-                        continue   # already long, no repeat buy arrows
-                    if action == 'sell' and _chart_state == 'bear':
-                        continue   # already short/flat, no repeat sell arrows
-
                     # Confirmation TF check — same gate as engine.calculate_signals
                     candle_ts_ms = _data_win[i][0]
                     conf_diff = _conf_diff_at(candle_ts_ms)
@@ -2337,9 +2321,6 @@ class Dashboard(ctk.CTkFrame):
                             continue   # conf TF disagrees — engine would reject
                         if action == 'sell' and conf_diff >= 0:
                             continue   # conf TF disagrees — engine would reject
-
-                    # Update chart state (mirroring engine state machine)
-                    _chart_state = 'bull' if action == 'buy' else 'bear'
 
                     if action == 'buy':
                         y_pos  = _lo[i] - signal_offset
@@ -2362,7 +2343,7 @@ class Dashboard(ctk.CTkFrame):
                         'candle_price': float(_cl[i]),
                         'action':       action,
                         'confirmed':    True,   # conf TF was checked above
-                        'source':       f'EMA{p_fast}/EMA{p_slow} Cross',
+                        'source':       f'MA{p_fast}/MA{p_slow} Cross',
                         'price_str':    format_price(_cl[i]),
                         'time_str':     _ts[i].strftime('%Y-%m-%d %H:%M:%S UTC'),
                         'ma9':          float(_mf[i]),
@@ -2633,7 +2614,7 @@ class Dashboard(ctk.CTkFrame):
         items.append(('sp',   None,        None))
         for p, c in zip(MA_PERIODS, ma_colors):
             if len(ma_lines.get(p, [])) > 0:
-                items.append(('sym', c, f"──  EMA {p}"))
+                items.append(('sym', c, f"──  MA {p}"))
         items.append(('sp',   None,        None))
 
         # Signal legend — markers only appear on signal TF view
