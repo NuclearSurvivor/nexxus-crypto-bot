@@ -511,6 +511,19 @@ class Dashboard(ctk.CTkFrame):
         self.surge_last_buy   = defaultdict(float)   # H3: per-pair per-direction cooldown
         self.surge_last_sell  = defaultdict(float)
 
+        # Live forming candle — updated on every WS tick so the chart shows the
+        # currently-forming bar in real-time (not just after the candle closes).
+        # (pair, tf) → [ts_ms, open, high, low, close, vol]
+        self._forming_candle: dict = {}
+
+        # Order book — updated from level2 WS channel.
+        # pair → {'bids': sorted list [(price, qty)], 'asks': sorted list [(price, qty)]}
+        self._order_book: dict = defaultdict(lambda: {'bids': [], 'asks': []})
+        self._ob_window = None   # CTkToplevel reference
+
+        # Active page name — used to gate chart live-refresh to chart tab only
+        self._active_page: str = 'dashboard'
+
         # ── Pre-populate candle history from disk cache ───────────────────────
         # Charts render immediately on startup; live API fills in newer candles.
         _cache = load_candle_cache()
@@ -532,6 +545,7 @@ class Dashboard(ctk.CTkFrame):
         self._start_backend()
         self._start_webhook()
         self.root.after(1000, self._tick_status)
+        self.root.after(1000, self._chart_live_tick)   # 1-second live chart refresh
 
         # Force redraw after any window resize — prevents CTkFrame canvas
         # artifacts (black rectangles) that appear when inner corner_radius=0
@@ -1076,6 +1090,12 @@ class Dashboard(ctk.CTkFrame):
         ).pack(side="right", padx=(4, 0), pady=10)
 
         ctk.CTkButton(
+            row, text="Order Book", width=90, height=32, corner_radius=7,
+            fg_color=C_CARD2, hover_color=C_BORDER2, font=("Segoe UI", 10),
+            command=self._open_orderbook
+        ).pack(side="right", padx=(0, 3), pady=10)
+
+        ctk.CTkButton(
             row, text="−", width=32, height=32, corner_radius=7,
             fg_color=C_CARD2, hover_color=C_BORDER2,
             border_width=1, border_color=C_BORDER2, font=("Segoe UI", 13),
@@ -1516,6 +1536,10 @@ class Dashboard(ctk.CTkFrame):
         self.pages[name].pack(fill="both", expand=True)
         self.page_title.configure(text=title)
         self._set_active_nav(name)
+        self._active_page = name
+        # Immediately redraw chart when switching to it so it's never stale
+        if name == 'charts':
+            self._refresh_chart()
 
     def _show_dashboard(self): self._show_page("dashboard", "Dashboard")
     def _show_charts(self):    self._show_page("charts",    "Live Charts")
@@ -2021,9 +2045,38 @@ class Dashboard(ctk.CTkFrame):
 
         limit        = DISPLAY_CANDLES.get(tf, 200)
         # compute_data: 2× history for accurate MA warm-up
-        compute_data = data[-(2 * limit):]
+        compute_data = list(data[-(2 * limit):])
         # data: only what the user sees on the chart
-        data         = data[-limit:]
+        data         = list(data[-limit:])
+
+        # ── Live forming candle injection ────────────────────────────────────
+        # Synthesise the currently-forming candle from WebSocket ticks so the
+        # chart updates in real-time between REST candle refreshes (~5 min gap).
+        _seconds_per = {'1m': 60, '5m': 300, '1h': 3600, '1d': 86400}
+        _fc_secs = _seconds_per.get(tf, 3600)
+        _fc_period_ms = (int(time.time()) // _fc_secs) * _fc_secs * 1000
+        _fc_raw = self._forming_candle.get((pair, tf))
+        if _fc_raw is not None:
+            _fc_ts = _fc_raw[0]
+            if data:
+                _last_stored_ts = data[-1][0]
+                if _fc_ts >= _last_stored_ts:
+                    # Apply Heikin-Ashi to the raw forming candle using last stored HA candle
+                    _prev_ha = data[-1] if _fc_ts > _last_stored_ts else (data[-2] if len(data) >= 2 else data[-1])
+                    _ha_o = (_prev_ha[1] + _prev_ha[4]) / 2.0
+                    _ha_c = (_fc_raw[1] + _fc_raw[2] + _fc_raw[3] + _fc_raw[4]) / 4.0
+                    _ha_h = max(_fc_raw[2], _ha_o, _ha_c)
+                    _ha_l = min(_fc_raw[3], _ha_o, _ha_c)
+                    _forming_ha = [_fc_ts, _ha_o, _ha_h, _ha_l, _ha_c, _fc_raw[5]]
+                    if _fc_ts > _last_stored_ts:
+                        data = data + [_forming_ha]
+                    else:
+                        data = data[:-1] + [_forming_ha]
+                    # Use the live price as close for indicator freshness (not HA close)
+                    _live_p = self.live_prices.get(pair, 0)
+                    if _live_p:
+                        _forming_ha[4] = (_fc_raw[1] + _fc_raw[2] + _fc_raw[3] + _live_p) / 4.0
+
         ax           = self.chart_ax
 
         # Indicators computed on full 2× history for accuracy
@@ -2352,20 +2405,11 @@ class Dashboard(ctk.CTkFrame):
                         })
                         breakout_drawn = True
 
-        # ── 7. Live price line + right-edge label ────────────────────────────
+        # ── 7. Live price line ────────────────────────────────────────────────
+        # The price label annotation is drawn in section 9 AFTER set_ylim so
+        # the blended-transform y position is always within the visible range.
         if price:
             ax.axhline(y=price, color="#ffffff", linestyle=':', linewidth=0.8, alpha=0.4)
-            # Snap the price label to the right axis edge (blended: axes x, data y)
-            import matplotlib.transforms as _mt
-            _blended = _mt.blended_transform_factory(ax.transAxes, ax.transData)
-            ax.annotate(f" {format_price(price)} ",
-                        xy=(1.0, price),
-                        xycoords=_blended,
-                        fontsize=7.5, color="#ffffff", alpha=0.92,
-                        ha='left', va='center', clip_on=False,
-                        annotation_clip=False,
-                        bbox=dict(boxstyle='round,pad=0.25', fc=C_CARD2,
-                                  ec="#ffffff", alpha=0.88, lw=0.8))
 
         # ── 7b. Last executed trade marker ───────────────────────────────────
         # Drawn from last_executed_signal (seeded from trades.json or bot.log),
@@ -2468,6 +2512,24 @@ class Dashboard(ctk.CTkFrame):
         if self._zoom_locked:
             ax.set_xlim(_saved_xl)
             ax.set_ylim(_saved_yl)
+
+        # ── 9a. Live price label — drawn after set_ylim so y position is correct ──
+        # The label is clamped to within the visible y-range so it's always shown
+        # even when the chart is zoomed to a region that doesn't include the price.
+        if price:
+            import matplotlib.transforms as _mt
+            _yl_now    = ax.get_ylim()
+            _label_y   = max(_yl_now[0], min(_yl_now[1], price))
+            _blended   = _mt.blended_transform_factory(ax.transAxes, ax.transData)
+            _price_col = C_GREEN if price >= closes[-1] else C_RED
+            ax.annotate(f" {format_price(price)} ",
+                        xy=(1.0, _label_y),
+                        xycoords=_blended,
+                        fontsize=7.5, color="#ffffff", alpha=0.95,
+                        ha='left', va='center', clip_on=False,
+                        annotation_clip=False,
+                        bbox=dict(boxstyle='square,pad=0.3', fc=_price_col,
+                                  ec=_price_col, alpha=0.95, lw=0))
 
         zoom_hint   = "  [zoomed]" if self._zoom_locked else ""
         ax.set_title(
@@ -2662,6 +2724,172 @@ class Dashboard(ctk.CTkFrame):
         self.chart_fig.subplots_adjust(left=0.01, right=0.99, top=0.94, bottom=0.10, wspace=0.06)
         try:
             self.chart_canvas.draw_idle()
+        except Exception:
+            pass
+
+    # ── Live chart 1-second refresh ──────────────────────────────────────────
+    def _chart_live_tick(self):
+        """Redraw the chart every second while the Charts page is active.
+
+        This keeps the forming candle and price label current without waiting
+        for a REST candle close (which only triggers every 5 min on 1h TF).
+        The forming candle is synthesized from WS ticks in _refresh_chart.
+        """
+        if self.root_alive and self._active_page == 'charts':
+            try:
+                self._refresh_chart()
+            except Exception:
+                pass
+        if self.root_alive:
+            self.root.after(1000, self._chart_live_tick)
+
+    # ── Order book popup ──────────────────────────────────────────────────────
+    def _open_orderbook(self):
+        """Open a live order book popup for the currently selected chart pair.
+
+        Data comes from the level2 WebSocket channel already subscribed in
+        _websocket_loop. Display updates every 250ms via _update_ob_display.
+        """
+        pair = self.chart_pair_var.get()
+        self._ob_pair = pair
+
+        # Bring existing window forward if already open for the same pair
+        if self._ob_window is not None:
+            try:
+                self._ob_window.lift()
+                return
+            except Exception:
+                self._ob_window = None
+
+        win = ctk.CTkToplevel(self)
+        win.title(f"Order Book  —  {pair}")
+        win.geometry("440x520")
+        win.resizable(True, True)
+        win.configure(fg_color=C_BG)
+        self._ob_window = win
+
+        def _on_close():
+            self._ob_window = None
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+        # ── Header ─────────────────────────────────────────────────────────
+        hdr = ctk.CTkFrame(win, fg_color=C_PANEL, corner_radius=0)
+        hdr.pack(fill="x", pady=(0, 2))
+        ctk.CTkLabel(hdr, text=f"{pair}  Order Book",
+                     font=("Segoe UI", 13, "bold"), text_color=C_TEXT).pack(
+            side="left", padx=14, pady=8)
+        self._ob_spread_lbl = ctk.CTkLabel(
+            hdr, text="Spread: —", font=("Segoe UI", 10), text_color=C_MUTED)
+        self._ob_spread_lbl.pack(side="right", padx=14)
+
+        # ── Asks (top) ─────────────────────────────────────────────────────
+        ask_frame = ctk.CTkFrame(win, fg_color="transparent")
+        ask_frame.pack(fill="both", expand=True, padx=10, pady=(4, 0))
+        ctk.CTkLabel(ask_frame, text="  Price (Ask)        Size         Total",
+                     font=("Segoe UI Mono", 9), text_color=C_MUTED,
+                     anchor="w").pack(fill="x")
+        self._ob_ask_rows = []
+        for _ in range(10):
+            lbl = ctk.CTkLabel(ask_frame, text="", font=("Segoe UI Mono", 10),
+                               text_color=C_RED, anchor="w")
+            lbl.pack(fill="x", pady=1)
+            self._ob_ask_rows.append(lbl)
+
+        # ── Mid-price ───────────────────────────────────────────────────────
+        mid_frame = ctk.CTkFrame(win, fg_color=C_CARD2, corner_radius=0, height=30)
+        mid_frame.pack(fill="x", padx=0, pady=4)
+        self._ob_mid_lbl = ctk.CTkLabel(
+            mid_frame, text="—", font=("Segoe UI", 12, "bold"), text_color=C_TEXT)
+        self._ob_mid_lbl.pack(side="left", padx=14, pady=4)
+        self._ob_imb_lbl = ctk.CTkLabel(
+            mid_frame, text="", font=("Segoe UI", 10), text_color=C_MUTED)
+        self._ob_imb_lbl.pack(side="right", padx=14)
+
+        # ── Bids (bottom) ──────────────────────────────────────────────────
+        bid_frame = ctk.CTkFrame(win, fg_color="transparent")
+        bid_frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        ctk.CTkLabel(bid_frame, text="  Price (Bid)        Size         Total",
+                     font=("Segoe UI Mono", 9), text_color=C_MUTED,
+                     anchor="w").pack(fill="x")
+        self._ob_bid_rows = []
+        for _ in range(10):
+            lbl = ctk.CTkLabel(bid_frame, text="", font=("Segoe UI Mono", 10),
+                               text_color=C_GREEN, anchor="w")
+            lbl.pack(fill="x", pady=1)
+            self._ob_bid_rows.append(lbl)
+
+        # Start live refresh loop
+        self._ob_refresh_loop(win)
+
+    def _ob_refresh_loop(self, win):
+        """Poll order book display every 250ms while the popup is open."""
+        if self._ob_window is None:
+            return
+        try:
+            win.winfo_exists()
+        except Exception:
+            self._ob_window = None
+            return
+        self._update_ob_display()
+        try:
+            win.after(250, lambda: self._ob_refresh_loop(win))
+        except Exception:
+            self._ob_window = None
+
+    def _update_ob_display(self):
+        """Refresh the order book labels with latest level2 data."""
+        if self._ob_window is None:
+            return
+        pair = getattr(self, '_ob_pair', '')
+        ob   = self._order_book.get(pair, {'bids': [], 'asks': []})
+        bids = ob['bids'][:10]
+        asks = ob['asks'][:10]
+
+        # Asks shown top-to-bottom: worst ask first (highest price at top)
+        asks_display = list(reversed(asks[:10]))
+
+        def _fmt_row(price, qty, cum):
+            return f"  {format_price(price):<18}  {qty:>10.4f}  {cum:>10.4f}"
+
+        cum = 0.0
+        for i, lbl in enumerate(self._ob_ask_rows):
+            if i < len(asks_display):
+                _p, _q = asks_display[i]
+                cum += _q
+                lbl.configure(text=_fmt_row(_p, _q, cum))
+            else:
+                lbl.configure(text="")
+
+        cum = 0.0
+        for i, lbl in enumerate(self._ob_bid_rows):
+            if i < len(bids):
+                _p, _q = bids[i]
+                cum += _q
+                lbl.configure(text=_fmt_row(_p, _q, cum))
+            else:
+                lbl.configure(text="")
+
+        try:
+            best_ask = asks[0][0] if asks else 0
+            best_bid = bids[0][0] if bids else 0
+            mid      = (best_bid + best_ask) / 2 if best_bid and best_ask else 0
+            spread   = best_ask - best_bid if best_bid and best_ask else 0
+            self._ob_mid_lbl.configure(text=format_price(mid) if mid else "—")
+            self._ob_spread_lbl.configure(
+                text=f"Spread: {format_price(spread)}" if spread else "Spread: —")
+
+            # Order imbalance ratio
+            bid_vol = sum(q for _, q in bids)
+            ask_vol = sum(q for _, q in asks)
+            total   = bid_vol + ask_vol
+            if total > 0:
+                imb = bid_vol / total
+                imb_col  = C_GREEN if imb > 0.55 else (C_RED if imb < 0.45 else C_MUTED)
+                imb_side = "BID heavy" if imb > 0.55 else ("ASK heavy" if imb < 0.45 else "balanced")
+                self._ob_imb_lbl.configure(
+                    text=f"Imbalance  {imb:.0%} bid  ({imb_side})",
+                    text_color=imb_col)
         except Exception:
             pass
 
@@ -4022,8 +4250,8 @@ class Dashboard(ctk.CTkFrame):
                     jwt = make_ws_jwt(self.api_key, self.api_secret)
                     self._ws_jwt_ts = time.time()
 
-                    # Subscribe to both channels in one shot
-                    for channel in ("ticker", "ticker_batch"):
+                    # Subscribe to price tickers + real-time order book
+                    for channel in ("ticker", "ticker_batch", "level2"):
                         await ws.send(json.dumps({
                             "type":        "subscribe",
                             "product_ids": TRADING_PAIRS,
@@ -4032,7 +4260,8 @@ class Dashboard(ctk.CTkFrame):
                         }))
                     self.log_message(
                         f"WebSocket connected  url={COINBASE_WS_URL}  "
-                        f"pairs={TRADING_PAIRS}  channels=[ticker, ticker_batch]", "trade")
+                        f"pairs={TRADING_PAIRS}  "
+                        f"channels=[ticker, ticker_batch, level2]", "trade")
 
                     _ws_ticks = 0
                     _ws_last_log = time.time()
@@ -4047,6 +4276,40 @@ class Dashboard(ctk.CTkFrame):
                                 self._ws_jwt_ts = time.time()
 
                             chan = data.get("channel", "")
+
+                            # ── level2 order book updates ─────────────────
+                            if chan == "level2":
+                                for evt in data.get("events", []):
+                                    _ev_pid = evt.get("product_id", "")
+                                    if _ev_pid not in TRADING_PAIRS:
+                                        continue
+                                    _ob = self._order_book[_ev_pid]
+                                    for upd in evt.get("updates", []):
+                                        _side = upd.get("side", "")
+                                        try:
+                                            _pp = float(upd.get("price_level", 0))
+                                            _qq = float(upd.get("new_quantity", 0))
+                                        except (TypeError, ValueError):
+                                            continue
+                                        _book_side = _ob["bids"] if _side == "bid" else _ob["asks"]
+                                        # Remove stale entry for this price, add new
+                                        _book_side[:] = [
+                                            x for x in _book_side if x[0] != _pp]
+                                        if _qq > 0:
+                                            _book_side.append((_pp, _qq))
+                                    # Keep bids sorted descending, asks ascending
+                                    _ob["bids"].sort(key=lambda x: -x[0])
+                                    _ob["asks"].sort(key=lambda x:  x[0])
+                                    # Cap to top 50 levels each side
+                                    _ob["bids"] = _ob["bids"][:50]
+                                    _ob["asks"] = _ob["asks"][:50]
+                                    # Update order book popup if open for this pair
+                                    if (self._ob_window is not None and
+                                            getattr(self, '_ob_pair', '') == _ev_pid):
+                                        if self.root_alive:
+                                            self.root.after(0, self._update_ob_display)
+                                continue
+
                             if chan not in ("ticker", "ticker_batch"):
                                 continue
 
@@ -4065,6 +4328,22 @@ class Dashboard(ctk.CTkFrame):
                                         self._price_ts[pid]   = time.time()
                                         self.price_history[pid].append(p)
                                         _ws_ticks += 1
+                                        # ── Forming candle synthesis ─────────
+                                        _now_ts = int(time.time())
+                                        _secs_map = {'1m': 60, '5m': 300,
+                                                     '1h': 3600, '1d': 86400}
+                                        for _tf, _secs in _secs_map.items():
+                                            _ps_ms = (_now_ts // _secs) * _secs * 1000
+                                            _fkey  = (pid, _tf)
+                                            _fc    = self._forming_candle.get(_fkey)
+                                            if _fc is None or _fc[0] != _ps_ms:
+                                                # New candle period — open at this price
+                                                self._forming_candle[_fkey] = [
+                                                    _ps_ms, p, p, p, p, 0.0]
+                                            else:
+                                                _fc[2] = max(_fc[2], p)  # high
+                                                _fc[3] = min(_fc[3], p)  # low
+                                                _fc[4] = p               # close
                                         if self.root_alive:
                                             self.root.after(0, self._update_pair_cards)
                                         if chan == "ticker":

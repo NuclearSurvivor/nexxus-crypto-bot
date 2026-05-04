@@ -8,7 +8,18 @@
 
 ## Version History
 
-### v1.0.3b *(current)*
+### v1.0.4b *(current)*
+
+#### Live Charts
+- **Forming candle** — chart now shows the currently-forming candle in real-time. On every WebSocket price tick, the open/high/low/close of the current period is updated and drawn (Heikin-Ashi transformed) so the last candle body moves with the live price instead of being static until candle close.
+- **1-second chart refresh** — while the Charts page is active the chart redraws every second, keeping the price line, price label, and forming candle continuously current.
+- **Price label locked to live price** — the right-axis price label (colored tag) is now drawn AFTER `set_ylim`, so it always reflects the exact current price. When zoomed in, the label is clamped to the visible y-range so it never disappears off-screen. Color is green/red based on whether price is above/below the last candle close.
+- **Order Book popup** — "Order Book" button in the chart header opens a live popup showing top 10 bids and asks with price, size, and cumulative columns. Data comes from the Coinbase `level2` WebSocket channel, updating up to 4× per second. Shows best bid/ask, spread, and a bid/ask volume imbalance indicator.
+- **level2 WebSocket subscription** — the existing WebSocket connection now also subscribes to the `level2` channel, maintaining a live order book (`_order_book`) for all trading pairs. Bid/ask tables are capped at 50 levels each side.
+
+---
+
+### v1.0.3b
 
 #### Bug Fixes
 - **Bot balance display** — bot capital shown in topbar/key panel now cannot exceed total portfolio value. Proportional scaling clamp in `_fetch_balance` prevents `bot_balance + pair_alloc` from drifting above actual exchange USD. Display is further capped to portfolio with `min()` in `_update_metrics`.
