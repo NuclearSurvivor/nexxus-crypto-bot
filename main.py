@@ -876,7 +876,8 @@ class Dashboard(ctk.CTkFrame):
 
         self.chart_fig = plt.figure(figsize=(13, 7))
         self.chart_fig.patch.set_facecolor(C_CHART_BG)
-        gs = self.chart_fig.add_gridspec(1, 2, width_ratios=[5.2, 1], wspace=0.04)
+        # width_ratios: chart gets ~84%, key gets ~16%; wspace controls the gap
+        gs = self.chart_fig.add_gridspec(1, 2, width_ratios=[5.5, 1], wspace=0.06)
         self.chart_ax  = self.chart_fig.add_subplot(gs[0])
         self.key_ax    = self.chart_fig.add_subplot(gs[1])
         self.chart_ax.set_facecolor(C_CHART_BG)
@@ -958,20 +959,32 @@ class Dashboard(ctk.CTkFrame):
         scroll = ctk.CTkScrollableFrame(page, fg_color=C_BG)
         scroll.pack(fill="both", expand=True, padx=20, pady=20)
 
-        # Bind mouse wheel to scroll — works on all child widgets too
+        # Bind mouse wheel to scroll — use enter/leave on the page so the global
+        # bind is active whenever the mouse is inside the settings area.
         def _on_mousewheel(event):
             try:
-                scroll._parent_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                delta = int(-1 * (event.delta / 120)) if event.delta else 0
+                scroll._parent_canvas.yview_scroll(delta or (1 if event.num == 5 else -1), "units")
             except Exception:
                 pass
-        def _bind_mousewheel(widget):
-            widget.bind("<MouseWheel>",      _on_mousewheel, add="+")
-            widget.bind("<Button-4>",        lambda e: scroll._parent_canvas.yview_scroll(-1, "units"), add="+")
-            widget.bind("<Button-5>",        lambda e: scroll._parent_canvas.yview_scroll( 1, "units"), add="+")
-            for child in widget.winfo_children():
-                _bind_mousewheel(child)
-        # Defer binding until after all children are created
-        page.after(200, lambda: _bind_mousewheel(scroll))
+        def _start_scroll(e=None):
+            try:
+                self.root.bind_all("<MouseWheel>", _on_mousewheel)
+                self.root.bind_all("<Button-4>",   lambda ev: scroll._parent_canvas.yview_scroll(-1, "units"))
+                self.root.bind_all("<Button-5>",   lambda ev: scroll._parent_canvas.yview_scroll( 1, "units"))
+            except Exception:
+                pass
+        def _stop_scroll(e=None):
+            try:
+                self.root.unbind_all("<MouseWheel>")
+                self.root.unbind_all("<Button-4>")
+                self.root.unbind_all("<Button-5>")
+            except Exception:
+                pass
+        page.bind("<Enter>", _start_scroll, add="+")
+        page.bind("<Leave>", _stop_scroll,  add="+")
+        # Also activate immediately in case settings is the first page shown
+        page.after(100, _start_scroll)
 
         def section(title, link=None):
             f = ctk.CTkFrame(scroll, fg_color=C_PANEL, corner_radius=12,
@@ -2151,24 +2164,45 @@ class Dashboard(ctk.CTkFrame):
             color=C_TEXT, fontsize=10, pad=6)
 
         # ── 9b. Last-signal badge (top-right of chart) ───────────────────────
-        if self._signal_data:
-            last_sig = self._signal_data[-1]
-            _la      = last_sig['action']
-            _lp      = last_sig['price_str']
-            _lt      = last_sig.get('time_str', '')
-            _lc      = C_GREEN if _la == 'buy' else (C_RED if _la == 'sell' else C_ACCENT3)
-            _lm      = "▲ BUY" if _la == 'buy' else ("▼ SELL" if _la == 'sell' else "⚡ BREAKOUT")
+        # Prefer the last EXECUTED trade signal for this pair; fall back to the
+        # most recent chart-detected signal if nothing has been executed yet.
+        _es = self.last_executed_signal   # {'pair','side','price','qty','ts','source'}
+        _badge_shown = False
+        if _es and _es.get('pair') == pair:
+            _la = _es['side']
+            _lp = format_price(_es['price'])
+            _lt = datetime.fromtimestamp(_es['ts'], pytz.UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
+            _lc = C_GREEN if _la == 'buy' else C_RED
+            _lm = f"▲ EXECUTED BUY" if _la == 'buy' else f"▼ EXECUTED SELL"
             ax.text(0.99, 0.985, f"{_lm}  {_lp}",
                     transform=ax.transAxes,
-                    color=_lc, fontsize=7.5, ha='right', va='top',
-                    fontweight='bold',
+                    color=_lc, fontsize=7.5, ha='right', va='top', fontweight='bold',
                     bbox=dict(boxstyle='round,pad=0.3', fc=C_BG, ec=_lc, alpha=0.88, lw=0.8))
+            ax.text(0.99, 0.955, _lt,
+                    transform=ax.transAxes,
+                    color=C_MUTED, fontsize=6.5, ha='right', va='top',
+                    bbox=dict(boxstyle='round,pad=0.2', fc=C_BG, ec='none', alpha=0.8))
+            _badge_shown = True
+        elif self._signal_data and is_signal_tf:
+            # Fallback: most recent chart-detected signal (this TF only — historical data)
+            last_sig = self._signal_data[-1]
+            _la  = last_sig['action']
+            _lp  = last_sig['price_str']
+            _lt  = last_sig.get('time_str', '')
+            _lc  = C_GREEN if _la == 'buy' else (C_RED if _la == 'sell' else C_ACCENT3)
+            _lm  = "▲ BUY" if _la == 'buy' else ("▼ SELL" if _la == 'sell' else "⚡ BREAKOUT")
+            ax.text(0.99, 0.985, f"Last: {_lm}  {_lp}",
+                    transform=ax.transAxes,
+                    color=_lc, fontsize=7.5, ha='right', va='top', fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.3', fc=C_BG, ec=_lc, alpha=0.75, lw=0.6))
             if _lt:
                 ax.text(0.99, 0.955, _lt,
                         transform=ax.transAxes,
                         color=C_MUTED, fontsize=6.5, ha='right', va='top',
                         bbox=dict(boxstyle='round,pad=0.2', fc=C_BG, ec='none', alpha=0.8))
-        elif not is_signal_tf:
+            _badge_shown = True
+
+        if not _badge_shown and not is_signal_tf:
             # Soft note when viewing a TF that won't show signals
             ax.text(0.99, 0.985,
                     f"Signals on {self.signal_tf} only",
@@ -2252,7 +2286,8 @@ class Dashboard(ctk.CTkFrame):
                         color=color, fontsize=6.8, va='top', ha='left', clip_on=True)
             y -= step
 
-        self.chart_fig.tight_layout(pad=0.5, rect=[0, 0, 1, 1])
+        # Explicit margins so key panel never overlaps chart area
+        self.chart_fig.subplots_adjust(left=0.01, right=0.99, top=0.94, bottom=0.10, wspace=0.06)
         try:
             self.chart_canvas.draw_idle()
         except Exception:
@@ -2439,7 +2474,9 @@ class Dashboard(ctk.CTkFrame):
             return
         self._drag_last_draw = now
         try:
-            self.chart_canvas.draw_idle()
+            # draw() + flush_events() = synchronous render, no Tk queue backlog
+            self.chart_canvas.draw()
+            self.chart_canvas.flush_events()
         except Exception:
             pass
 
@@ -2513,90 +2550,144 @@ class Dashboard(ctk.CTkFrame):
         return win
 
     def _open_allocate(self, default_pair: str = None):
-        win = self._popup("Allocate to Bot", 460, 480)
+        win = self._popup("Allocate to Bot", 460, 520)
 
         ctk.CTkLabel(win, text="＋  Allocate to Bot",
-                     font=("Segoe UI", 15, "bold"), text_color=C_TEXT).pack(pady=(20, 0))
+                     font=("Segoe UI", 15, "bold"), text_color=C_TEXT).pack(pady=(18, 0))
 
-        # ── Mode toggle: USD budget  vs  Coin holdings ────────────────────────
-        mode_var = ctk.StringVar(value="USD")
+        # ── Mode toggle ───────────────────────────────────────────────────────
+        mode_var = ctk.StringVar(value="USD Budget")
         mode_bar = ctk.CTkSegmentedButton(
             win, values=["USD Budget", "Coin Holdings"],
             variable=mode_var, width=300, height=34)
-        mode_bar.pack(pady=(8, 0))
+        mode_bar.pack(pady=(8, 4))
 
         form = ctk.CTkFrame(win, fg_color="transparent")
-        form.pack(fill="x", padx=32, pady=(6, 0))
-
-        # ── Coin selector ─────────────────────────────────────────────────────
-        ctk.CTkLabel(form, text="Coin", font=("Segoe UI", 12),
-                     text_color=C_MUTED).pack(anchor="w", pady=(4, 5))
+        form.pack(fill="x", padx=28, pady=(4, 0))
 
         pair_var = ctk.StringVar(value=default_pair or TRADING_PAIRS[0])
-        pair_row = ctk.CTkFrame(form, fg_color="transparent")
-        pair_row.pack(fill="x", pady=(0, 6))
 
-        def _make_pair_buttons():
-            for w2 in pair_row.winfo_children():
+        # ── USD Budget: 3 balance cards + pair dropdown ───────────────────────
+        usd_frame = ctk.CTkFrame(form, fg_color="transparent")
+
+        def _build_usd_frame():
+            for w2 in usd_frame.winfo_children():
                 w2.destroy()
-            mode  = mode_var.get()
+            raw_usd = max(0.0, self.usd_balance - self.usdc_balance - self.usdt_balance)
+
+            bal_row = ctk.CTkFrame(usd_frame, fg_color="transparent")
+            bal_row.pack(fill="x", pady=(0, 8))
+
+            for lbl, val in [("Liquid USD", raw_usd),
+                              ("USDC",       self.usdc_balance),
+                              ("USDT",       self.usdt_balance)]:
+                card = ctk.CTkFrame(bal_row, fg_color=C_CARD, corner_radius=10,
+                                    border_width=1, border_color=C_BORDER)
+                card.pack(side="left", expand=True, fill="x", padx=(0, 6))
+                ctk.CTkLabel(card, text=lbl, font=("Segoe UI", 10),
+                             text_color=C_MUTED).pack(pady=(8, 0))
+                ctk.CTkLabel(card, text=f"${val:,.2f}",
+                             font=("Segoe UI", 13, "bold"),
+                             text_color=C_ACCENT3).pack(pady=(0, 8))
+
+            # Total liquid row
+            ctk.CTkLabel(usd_frame,
+                         text=f"Total liquid:  ${self.usd_balance:,.2f}",
+                         font=("Segoe UI", 11), text_color=C_MUTED).pack(anchor="w", pady=(0, 6))
+
+            # Pair selector (compact dropdown — which pair gets the USD)
+            prow = ctk.CTkFrame(usd_frame, fg_color="transparent")
+            prow.pack(fill="x", pady=(0, 6))
+            ctk.CTkLabel(prow, text="Allocate to pair:", font=("Segoe UI", 12),
+                         text_color=C_TEXT).pack(side="left", padx=(0, 8))
+            _pair_labels = [p.split("-")[0] for p in TRADING_PAIRS]
+            _seg = ctk.CTkSegmentedButton(
+                prow, values=_pair_labels, height=30,
+                command=lambda coin: (pair_var.set(f"{coin}-USD"), _update_bot_lbl()))
+            # Set initial selection
+            _sel_coin = pair_var.get().split("-")[0]
+            if _sel_coin in _pair_labels:
+                _seg.set(_sel_coin)
+            else:
+                _seg.set(_pair_labels[0])
+                pair_var.set(TRADING_PAIRS[0])
+            _seg.pack(side="left")
+
+            _bot_lbl = ctk.CTkLabel(usd_frame, text="", font=("Segoe UI", 10),
+                                    text_color=C_MUTED)
+            _bot_lbl.pack(anchor="w", pady=(0, 4))
+
+            def _update_bot_lbl():
+                p    = pair_var.get()
+                coin = p.split("-")[0]
+                _bot_lbl.configure(
+                    text=f"Bot wallet ({coin}):  ${self.bot_pair_alloc.get(p,0):,.2f}")
+            _update_bot_lbl()
+
+        usd_frame.pack(fill="x")
+
+        # ── Coin Holdings: coin buttons ───────────────────────────────────────
+        coin_frame   = ctk.CTkFrame(form, fg_color="transparent")
+        pair_row_h   = ctk.CTkFrame(coin_frame, fg_color="transparent")
+        pair_row_h.pack(fill="x", pady=(0, 4))
+        info_lbl_h   = ctk.CTkLabel(coin_frame, text="", font=("Segoe UI", 11),
+                                    text_color=C_MUTED)
+        info_lbl_h.pack(anchor="w", pady=(0, 4))
+
+        def _make_coin_buttons():
+            for w2 in pair_row_h.winfo_children():
+                w2.destroy()
             for p in TRADING_PAIRS:
                 coin  = p.split("-")[0]
                 price = self.live_prices.get(p, 0)
-                if mode == "USD Budget":
-                    # USD Budget: show only coin name — price is irrelevant here
-                    btn_text = coin
-                    btn_h    = 40
-                else:
-                    holdings_usd = self.real_exposure.get(p, 0)
-                    holdings_qty = holdings_usd / price if price else 0
-                    sub      = f"{holdings_qty:.4f} {coin}" if holdings_qty else "0"
-                    btn_text = f"{coin}\n{sub}"
-                    btn_h    = 54
+                holdings_usd = self.real_exposure.get(p, 0)
+                holdings_qty = holdings_usd / price if price else 0
+                sub      = f"{holdings_qty:.4f} {coin}" if holdings_qty else "0"
                 is_sel = (p == pair_var.get())
                 btn = ctk.CTkButton(
-                    pair_row, text=btn_text,
-                    width=118, height=btn_h, corner_radius=10,
+                    pair_row_h, text=f"{coin}\n{sub}",
+                    width=118, height=54, corner_radius=10,
                     fg_color=C_ACCENT2 if is_sel else C_CARD,
                     hover_color="#6a4de0" if is_sel else C_BORDER,
                     border_width=2 if is_sel else 1,
                     border_color=C_ACCENT2 if is_sel else C_BORDER,
-                    font=("Segoe UI", 11, "bold"), text_color=C_TEXT)
+                    font=("Segoe UI", 11, "bold"), text_color=C_TEXT,
+                    command=lambda pp=p: _select_coin(pp))
                 btn.pack(side="left", padx=(0, 8))
                 btn._pair = p
-            _rewire_pair_buttons()
-            _refresh_labels()
+            _refresh_coin_info()
 
-        def _rewire_pair_buttons():
-            for b in pair_row.winfo_children():
-                b.configure(command=lambda p=b._pair: _select_pair(p))
-
-        def _select_pair(p):
+        def _select_coin(p):
             pair_var.set(p)
-            for b in pair_row.winfo_children():
+            for b in pair_row_h.winfo_children():
                 sel = b._pair == p
-                b.configure(
-                    fg_color=C_ACCENT2 if sel else C_CARD,
-                    hover_color="#6a4de0" if sel else C_BORDER,
-                    border_width=2 if sel else 1,
-                    border_color=C_ACCENT2 if sel else C_BORDER)
-            _refresh_labels()
+                b.configure(fg_color=C_ACCENT2 if sel else C_CARD,
+                            hover_color="#6a4de0" if sel else C_BORDER,
+                            border_width=2 if sel else 1,
+                            border_color=C_ACCENT2 if sel else C_BORDER)
+            _refresh_coin_info()
             _update_qfill()
 
-        # ── Dynamic labels ────────────────────────────────────────────────────
-        info_lbl  = ctk.CTkLabel(form, text="", font=("Segoe UI", 11),
+        def _refresh_coin_info():
+            p     = pair_var.get()
+            coin  = p.split("-")[0]
+            price = self.live_prices.get(p, 0)
+            qty   = self.real_exposure.get(p, 0) / price if price else 0
+            info_lbl_h.configure(
+                text=f"You hold: {qty:.6f} {coin}  ≈ ${self.real_exposure.get(p,0):,.2f}  ·  "
+                     f"Bot manages: {self.bot_coin_qty.get(p,0):.6f} {coin}")
+
+        # ── Shared: amount entry, % buttons, confirm ──────────────────────────
+        input_lbl = ctk.CTkLabel(form, text="Amount", font=("Segoe UI", 12),
                                   text_color=C_MUTED)
-        info_lbl.pack(anchor="w", pady=(0, 6))
-        input_lbl = ctk.CTkLabel(form, text="Amount (USD)", font=("Segoe UI", 12),
-                                  text_color=C_MUTED)
-        input_lbl.pack(anchor="w", pady=(0, 5))
+        input_lbl.pack(anchor="w", pady=(6, 4))
         amt = ctk.CTkEntry(form, placeholder_text="0.00", height=42,
                            fg_color=C_CARD, border_color=C_BORDER,
                            text_color=C_TEXT, font=("Segoe UI", 15))
         amt.pack(fill="x")
         amt.focus()
 
-        qrow = ctk.CTkFrame(form, fg_color="transparent")
+        qrow  = ctk.CTkFrame(form, fg_color="transparent")
         qrow.pack(fill="x", pady=(5, 0))
         qbtns = []
         for pct in (25, 50, 75, 100):
@@ -2606,78 +2697,66 @@ class Dashboard(ctk.CTkFrame):
             b.pack(side="left", padx=(0, 6))
             qbtns.append((pct, b))
 
-        def _allocate_all():
-            mode = mode_var.get()
-            if mode == "USD Budget":
-                v = f"{self.usd_balance:.2f}"
-            else:
-                p     = pair_var.get()
-                price = self.live_prices.get(p, 0)
-                total = self.real_exposure.get(p, 0) / price if price else 0
-                n = self.alloc_round_tokens
-                import math as _m2
-                total = _m2.floor(total / n) * n if n > 1 else total
-                v = f"{total:.6f}"
-            amt.delete(0, "end")
-            amt.insert(0, v)
-
-        ctk.CTkButton(form, text="Allocate All Available", height=32, corner_radius=8,
-                      fg_color=C_CARD2, hover_color=C_BORDER2,
-                      border_width=1, border_color=C_BORDER2,
-                      font=("Segoe UI", 11, "bold"), text_color=C_ACCENT3,
-                      command=_allocate_all).pack(fill="x", pady=(6, 0))
-
-        def _refresh_labels():
-            p    = pair_var.get()
-            mode = mode_var.get()
-            coin = p.split("-")[0]
-            if mode == "USD Budget":
-                raw_usd = max(0.0, self.usd_balance - self.usdc_balance - self.usdt_balance)
-                parts   = [f"USD: ${raw_usd:,.2f}"]
-                if self.usdc_balance > 0.01:
-                    parts.append(f"USDC: ${self.usdc_balance:,.2f}")
-                if self.usdt_balance > 0.01:
-                    parts.append(f"USDT: ${self.usdt_balance:,.2f}")
-                parts.append(f"Total liquid: ${self.usd_balance:,.2f}")
-                parts.append(f"Bot ({coin}): ${self.bot_pair_alloc.get(p,0):,.2f}")
-                info_lbl.configure(text="  ·  ".join(parts))
-                input_lbl.configure(text="Amount in USD")
-                amt.configure(placeholder_text="0.00 USD")
-            else:
-                price = self.live_prices.get(p, 0)
-                qty   = self.real_exposure.get(p, 0) / price if price else 0
-                info_lbl.configure(
-                    text=f"You hold:  {qty:.6f} {coin}  "
-                         f"≈ ${self.real_exposure.get(p,0):,.2f}  ·  "
-                         f"Bot manages: {self.bot_coin_qty.get(p,0):.6f} {coin}")
-                input_lbl.configure(text=f"Amount in {coin}  (or % of holdings)")
-                amt.configure(placeholder_text=f"0.000000 {coin}")
-
         def _update_qfill():
             p    = pair_var.get()
             mode = mode_var.get()
             if mode == "USD Budget":
                 total = self.usd_balance
+                for pct, b in qbtns:
+                    v = f"{total * pct / 100:.2f}"
+                    b.configure(command=lambda x=v: (amt.delete(0,"end"), amt.insert(0,x)))
             else:
                 price = self.live_prices.get(p, 0)
                 total = self.real_exposure.get(p, 0) / price if price else 0
-            for pct, b in qbtns:
-                v = total * pct / 100
-                if mode == "Coin Holdings":
-                    # round down to nearest alloc_round_tokens boundary
+                for pct, b in qbtns:
+                    v = total * pct / 100
                     n = self.alloc_round_tokens
                     if n > 1:
                         import math as _math
                         v = _math.floor(v / n) * n
-                fmt = f"{v:.2f}" if mode == "USD Budget" else f"{v:.6f}"
-                b.configure(command=lambda x=fmt: (amt.delete(0, "end"),
-                                                    amt.insert(0, x)))
+                    fmt = f"{v:.6f}"
+                    b.configure(command=lambda x=fmt: (amt.delete(0,"end"), amt.insert(0,x)))
+
+        def _allocate_all():
+            mode = mode_var.get()
+            if mode == "USD Budget":
+                amt.delete(0, "end"); amt.insert(0, f"{self.usd_balance:.2f}")
+            else:
+                p = pair_var.get()
+                price = self.live_prices.get(p, 0)
+                total = self.real_exposure.get(p, 0) / price if price else 0
+                n = self.alloc_round_tokens
+                import math as _m2
+                total = _m2.floor(total / n) * n if n > 1 else total
+                amt.delete(0, "end"); amt.insert(0, f"{total:.6f}")
+
+        ctk.CTkButton(form, text="Allocate All Available", height=32, corner_radius=8,
+                      fg_color=C_CARD2, hover_color=C_BORDER2,
+                      border_width=1, border_color=C_BORDER2,
+                      font=("Segoe UI", 11, "bold"), text_color=C_ACCENT3,
+                      command=_allocate_all).pack(fill="x", pady=(5, 0))
 
         def _on_mode_change(_=None):
-            _make_pair_buttons()
+            mode = mode_var.get()
+            if mode == "USD Budget":
+                coin_frame.pack_forget()
+                usd_frame.pack(fill="x")
+                _build_usd_frame()
+                input_lbl.configure(text="Amount in USD")
+                amt.configure(placeholder_text="0.00 USD")
+            else:
+                usd_frame.pack_forget()
+                coin_frame.pack(fill="x")
+                _make_coin_buttons()
+                p = pair_var.get(); coin = p.split("-")[0]
+                input_lbl.configure(text=f"Amount in {coin}")
+                amt.configure(placeholder_text=f"0.000000 {coin}")
+            _update_qfill()
 
         mode_bar.configure(command=_on_mode_change)
-        _make_pair_buttons()
+        # Initial build — USD Budget shown first
+        _build_usd_frame()
+        _update_qfill()
 
         err = ctk.CTkLabel(form, text="", text_color=C_RED, font=("Segoe UI", 11))
         err.pack(pady=(6, 4))
@@ -3247,28 +3326,37 @@ class Dashboard(ctk.CTkFrame):
     async def _candles_loop(self):
         """
         Fetch candles sequentially with spacing to avoid Coinbase 429 rate limits.
-        Trading pairs are refreshed every 5 min.  Watchlist pairs are pre-fetched
-        once at startup (best-effort; skipped on rate-limit) and cached to disk.
+        Trading pairs are fetched immediately at startup and refreshed every 5 min.
+        Watchlist pairs are pre-cached once in a background task after the first
+        trading-pair pass completes (so they never delay bot startup).
         """
-        # ── Startup: pre-cache watchlist pairs in the background ─────────────
-        # Delay 60s after bot starts so trading-pair initial fetch takes priority.
-        await asyncio.sleep(60)
-        for pair in WATCHLIST_PAIRS:
-            if not self.running:
-                return
-            # Only fetch if not already in cache (avoids redundant API calls)
-            has_data = any(len(self.candle_history[tf][pair]) > 0 for tf in TIMEFRAMES)
-            if not has_data:
-                await self._fetch_watchlist_pair(pair)
+        _watchlist_cached = False
 
         while self.running:
+            # ── Trading pairs — always highest priority ───────────────────────
             for pair in TRADING_PAIRS:
                 for tf in TIMEFRAMES:
                     if not self.running:
                         return
                     await self._fetch_pair_tf(pair, tf)
-                    await asyncio.sleep(0.5)   # 0.5 s between each call
-            await asyncio.sleep(300)           # full refresh every 5 min
+                    await asyncio.sleep(0.5)
+
+            # ── Watchlist pre-cache — runs once after first trading-pair pass ─
+            if not _watchlist_cached:
+                _watchlist_cached = True
+                asyncio.ensure_future(self._prefetch_watchlist())
+
+            await asyncio.sleep(300)           # trading pairs re-fetched every 5 min
+
+    async def _prefetch_watchlist(self):
+        """Background task: pre-cache all watchlist pairs once after startup."""
+        for pair in WATCHLIST_PAIRS:
+            if not self.running:
+                return
+            has_data = any(len(self.candle_history[tf][pair]) > 0 for tf in TIMEFRAMES)
+            if not has_data:
+                await self._fetch_watchlist_pair(pair)
+            await asyncio.sleep(1.0)   # generous spacing — this is low priority
 
     async def _fetch_watchlist_pair(self, pair: str):
         """Fetch all 4 TFs for a watchlist/on-demand pair and cache to disk.
