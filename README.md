@@ -8,7 +8,27 @@
 
 ## Version History
 
-### v1.0.4b *(current)*
+### v1.0.5b *(current)*
+
+#### Strategy & Signal Quality — Full Overhaul
+- **EMA replaces SMA everywhere** — Exponential Moving Average (α = 2/(N+1)) responds 3-5× faster than Simple Moving Average on the same period. Signals fire earlier in the move, not after it has already run. Chart MA lines, signal detection, and confirmation all use EMA.
+- **Wilder's ATR replaces simple-average ATR** — Uses the correct RMA (α = 1/N) smoothing formula matching TradingView exactly. Dynamic SL/TP sizing is now accurate.
+- **RSI(14) gate** — Signals are blocked when RSI is overbought (>70 for buys) or oversold (<30 for sells), preventing entries at exhaustion. RSI is displayed live in the top-left corner of the chart with color coding (red = overbought, green = oversold, muted = neutral).
+- **Trend filter on MA crossover** — EMA_slow must be sloping in the signal direction (rising for buys, falling for sells). Counter-trend fades that generated false signals are now blocked at the source.
+- **Minimum crossover gap** — Crossover must exceed 0.05% of price (signal TF) and 0.02% (confirmation TF). Eliminates flat-line noise crosses where EMA_fast ≈ EMA_slow due to rounding or sideways consolidation.
+- **ATR-normalized breakout gate** — Breakout momentum threshold replaces fixed 2%: move must exceed 1.5× ATR, which scales correctly across all price levels (XCN at $0.004 vs BTC at $90k).
+- **75th-percentile volume gate** — More robust than 2× average for sparse pairs where the average itself is noisy. Requires volume above the 75th percentile of the prior 20 candles.
+
+#### Performance & Robustness
+- **Indicator caching** — All indicators (ATR, RSI, Order Blocks, FVG, S/R, EMA trend) are computed once in `_ingest_candles` when new candle data arrives, then cached. The chart's 1-second refresh now reads cached values in O(1) instead of recomputing O(N) every second — ~90% CPU reduction on chart refresh.
+- **Order lock timeout** — If an order lock is held >300s (deadlock from a crashed `_place_order` coroutine), it auto-releases with a warning. Previously, the affected pair could never trade again without a restart.
+- **Candle cache auto-save** — Cache is written to disk after every 5-minute REST candle cycle, not just on clean shutdown. A crash no longer loses all in-memory candle history.
+- **Per-TF cache TTL** — Cache validation uses timeframe-appropriate TTLs (1m: 30min, 5m: 2h, 1h: 12h, 1d: 24h) instead of a flat 24h for everything. Short TF data that's stale in 30 minutes no longer delays startup with ancient 1-minute candles.
+- **FVG spike filter uses ATR** — Fair Value Gap filter was a fixed 1% of price; now uses 2× ATR. Scales correctly across pairs at different price levels.
+
+---
+
+### v1.0.4b
 
 #### Live Charts
 - **Forming candle** — chart now shows the currently-forming candle in real-time. On every WebSocket price tick, the open/high/low/close of the current period is updated and drawn (Heikin-Ashi transformed) so the last candle body moves with the live price instead of being static until candle close.

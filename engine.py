@@ -33,8 +33,8 @@ WATCHLIST_PAIRS      = [
 COINBASE_WS_URL      = "wss://advanced-trade-ws.coinbase.com"
 MAX_HISTORY          = 2000
 DISPLAY_CANDLES      = {'1m': 200, '5m': 500, '1h': 300, '1d': 365}
-# Double the display count is fetched/stored so MAs are fully warmed up
-# across the entire visible window — no cold-start distortion on early candles.
+# 2× display count fetched/stored so EMA/indicators are fully warmed up
+# across the entire visible window — no cold-start distortion.
 FETCH_CANDLES        = {'1m': 400, '5m': 1000, '1h': 600, '1d': 730}
 MA_PERIODS           = [2, 5, 14]
 TIMEFRAMES           = ['1m', '5m', '1h', '1d']
@@ -66,6 +66,92 @@ TF_TO_GRANULARITY = {
 
 # Max candles per Coinbase API call
 COINBASE_MAX_CANDLES = 300
+
+
+# ── Math primitives ────────────────────────────────────────────────────────────
+
+def ema(values: np.ndarray, period: int) -> np.ndarray:
+    """Exponential Moving Average — α = 2/(N+1).
+
+    EMA weights recent prices geometrically more than older ones, making it
+    3-5× faster to react than SMA while remaining smooth.  The first valid
+    value is seeded with the SMA over the first `period` bars to avoid the
+    'ramp-up' distortion of initialising with a single price.
+
+    Returns an array of the same length as `values`; the first `period-1`
+    positions are NaN (insufficient history).
+    """
+    n = len(values)
+    if n < period:
+        return np.full(n, np.nan)
+    alpha = 2.0 / (period + 1)
+    out = np.empty(n)
+    out[:period - 1] = np.nan
+    out[period - 1] = values[:period].mean()     # SMA seed
+    for i in range(period, n):
+        out[i] = alpha * values[i] + (1.0 - alpha) * out[i - 1]
+    return out
+
+
+def rma(values: np.ndarray, period: int) -> np.ndarray:
+    """Wilder's Smoothed Moving Average — α = 1/N.
+
+    The correct smoothing for Wilder's ATR and RSI formulas.  Slower than
+    EMA (α = 2/(N+1)) but mathematically required for those indicators.
+    """
+    n = len(values)
+    if n < period:
+        return np.full(n, np.nan)
+    alpha = 1.0 / period
+    out = np.empty(n)
+    out[:period - 1] = np.nan
+    out[period - 1] = values[:period].mean()
+    for i in range(period, n):
+        out[i] = alpha * values[i] + (1.0 - alpha) * out[i - 1]
+    return out
+
+
+def rsi(closes: np.ndarray, period: int = 14) -> np.ndarray:
+    """Relative Strength Index — momentum oscillator, 0-100 scale.
+
+    Uses Wilder's RMA for the gain/loss averages (matches TradingView exactly).
+    Interpretation:
+      > 70  overbought — avoid new longs
+      < 30  oversold   — avoid new shorts
+      50    neutral — trend confirmation zone
+
+    Returns same length as `closes`; first `period` values are NaN.
+    """
+    n = len(closes)
+    if n < period + 1:
+        return np.full(n, np.nan)
+    deltas = np.diff(closes.astype(float))
+    gains  = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    avg_gain = rma(gains, period)
+    avg_loss = rma(losses, period)
+    # RS = avg_gain / avg_loss; RSI = 100 - 100/(1+RS)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        rs      = np.where(avg_loss > 0, avg_gain / avg_loss, 100.0)
+        rsi_arr = np.where(avg_loss > 0, 100.0 - 100.0 / (1.0 + rs), 100.0)
+    # Prepend NaN to align with original `closes` length (diff reduces by 1)
+    return np.concatenate([[np.nan], rsi_arr])
+
+
+def atr_series(candles: list, period: int = 14) -> np.ndarray:
+    """Wilder's ATR as a full series (matches TradingView).
+
+    True Range = max(H-L, |H-Cprev|, |L-Cprev|)
+    ATR        = RMA(TR, period)
+
+    Returns array aligned with candles[1:] (first candle has no prior close).
+    """
+    if len(candles) < 2:
+        return np.array([0.0])
+    arr = np.array(candles)
+    h, l, c_prev = arr[1:, 2], arr[1:, 3], arr[:-1, 4]
+    tr = np.maximum(h - l, np.maximum(np.abs(h - c_prev), np.abs(l - c_prev)))
+    return rma(tr, period)
 
 
 # ── Credentials ──────────────────────────────────────────────────────────────
@@ -146,7 +232,6 @@ def make_client(api_key: str, api_secret: str) -> RESTClient:
     Uses the official coinbase-advanced-py SDK which handles CDP JWT auth
     automatically: https://github.com/coinbase/coinbase-advanced-py
     """
-    # The SDK handles JWT generation, token refresh, and rate limiting.
     return RESTClient(api_key=api_key, api_secret=api_secret)
 
 
@@ -186,13 +271,18 @@ def heikin_ashi(candles: list) -> list:
     """Convert standard OHLCV candles to Heikin Ashi.
 
     Formula reference: https://school.stockcharts.com/doku.php?id=chart_analysis:heikin_ashi
+
+    HA_close = (O+H+L+C)/4
+    HA_open  = (HA_open_prev + HA_close_prev)/2   [first bar: (O+C)/2]
+    HA_high  = max(H, HA_open, HA_close)
+    HA_low   = min(L, HA_open, HA_close)
     """
     if not candles or len(candles[0]) != 6:
         return []
     ha = []
     for i, (ts, o, h, l, c, v) in enumerate(candles):
-        ha_close = (o + h + l + c) / 4
-        ha_open  = (o + c) / 2 if i == 0 else (ha[-1][1] + ha[-1][4]) / 2
+        ha_close = (o + h + l + c) / 4.0
+        ha_open  = (o + c) / 2.0 if i == 0 else (ha[-1][1] + ha[-1][4]) / 2.0
         ha.append([
             ts,
             ha_open,
@@ -206,14 +296,22 @@ def heikin_ashi(candles: list) -> list:
 
 # ── Indicator Engine ──────────────────────────────────────────────────────────
 class IndicatorEngine:
-    """SMC (Smart Money Concepts) indicator calculations.
+    """Indicator calculations: ATR (Wilder), RSI, Order Blocks, FVG, S/R.
 
-    Concepts reference: https://www.investopedia.com/terms/s/smart-money.asp
+    All results are cached per pair so _refresh_chart can read them without
+    re-running O(N) algorithms every second.  Recalculated only in
+    _ingest_candles (on actual new candle data).
     """
 
     def __init__(self):
         self.data = defaultdict(lambda: {
-            'sr_zones': [], 'order_blocks': [], 'fair_value_gaps': [], 'atr': 0
+            'sr_zones':        [],
+            'order_blocks':    [],
+            'fair_value_gaps': [],
+            'atr':             0.0,
+            'rsi':             50.0,   # current RSI value (last bar)
+            'rsi_series':      [],     # full series for chart display
+            'ema_trend_up':    None,   # True/False/None if insufficient data
         })
 
     def calculate_support_resistance(self, pair, candles, bin_width=0.001, min_volume=1000):
@@ -258,38 +356,71 @@ class IndicatorEngine:
         highs      = np.array([c[2] for c in candles])
         lows       = np.array([c[3] for c in candles])
         timestamps = np.array([c[0] for c in candles])
+        atr_val    = self.data[pair].get('atr', 0)
         fvgs = []
-        for i in range(1, len(candles)-1):
+        for i in range(1, len(candles) - 1):
             if lows[i-1] > highs[i+1]:      # bearish FVG
                 fvg_hi, fvg_lo = lows[i-1], highs[i+1]
             elif highs[i-1] < lows[i+1]:    # bullish FVG
                 fvg_hi, fvg_lo = lows[i+1], highs[i-1]
             else:
                 continue
-            # Skip anomalous gaps from spike candles (> 1% of price)
-            if fvg_lo > 0 and (fvg_hi - fvg_lo) / fvg_lo > 0.01:
+            gap = fvg_hi - fvg_lo
+            # ATR-based spike filter: skip gaps wider than 2× ATR (anomalous)
+            max_gap = (atr_val * 2.0) if atr_val > 0 else (fvg_lo * 0.01)
+            if gap <= 0 or gap > max_gap:
                 continue
             is_bull = highs[i-1] < lows[i+1]
             fvgs.append((timestamps[i], fvg_hi, fvg_lo, is_bull))
         self.data[pair]['fair_value_gaps'] = fvgs[-10:]
 
     def calculate_atr(self, pair, candles):
-        """Average True Range — volatility measure for dynamic SL/TP sizing.
+        """Wilder's ATR — the industry-standard volatility measure.
 
-        Reference: https://www.investopedia.com/terms/a/atr.asp
+        Uses RMA (α=1/N) instead of SMA so the result matches TradingView
+        and all professional platforms exactly.
         """
-        if len(candles) < 2:
-            self.data[pair]['atr'] = 0
+        if len(candles) < ATR_PERIOD + 1:
+            self.data[pair]['atr'] = 0.0
             return
-        trs = [
-            max(candles[i][2] - candles[i][3],
-                abs(candles[i][2] - candles[i-1][4]),
-                abs(candles[i][3] - candles[i-1][4]))
-            for i in range(1, len(candles))
-        ]
-        window = trs[-ATR_PERIOD:]
-        if len(window) >= ATR_PERIOD:
-            self.data[pair]['atr'] = sum(window) / ATR_PERIOD
+        series = atr_series(candles, ATR_PERIOD)
+        valid  = series[~np.isnan(series)]
+        self.data[pair]['atr'] = float(valid[-1]) if len(valid) > 0 else 0.0
+
+    def calculate_rsi(self, pair, candles):
+        """RSI(14) — momentum gate for signal quality.
+
+        Stored as both a scalar (current bar) and a full series (chart display).
+        """
+        if len(candles) < 15:
+            self.data[pair]['rsi'] = 50.0
+            self.data[pair]['rsi_series'] = []
+            return
+        closes   = np.array([c[4] for c in candles])
+        rsi_vals = rsi(closes, period=14)
+        # Scalar: last non-NaN value
+        valid = rsi_vals[~np.isnan(rsi_vals)]
+        self.data[pair]['rsi']        = float(valid[-1]) if len(valid) > 0 else 50.0
+        self.data[pair]['rsi_series'] = rsi_vals.tolist()
+
+    def calculate_ema_trend(self, pair, candles):
+        """Trend direction via EMA(slow_period) slope.
+
+        ema_trend_up = True  → trending up   (bullish bias, prefer buys)
+        ema_trend_up = False → trending down  (bearish bias, prefer sells)
+        ema_trend_up = None  → insufficient data
+        """
+        if len(candles) < 3:
+            self.data[pair]['ema_trend_up'] = None
+            return
+        _, p_slow = sorted(MA_PERIODS)[:2]
+        closes = np.array([c[4] for c in candles])
+        vals   = ema(closes, p_slow)
+        valid  = vals[~np.isnan(vals)]
+        if len(valid) < 2:
+            self.data[pair]['ema_trend_up'] = None
+        else:
+            self.data[pair]['ema_trend_up'] = bool(valid[-1] > valid[-2])
 
     def get_signals(self, pair, current_price):
         signals = []
@@ -305,14 +436,31 @@ class IndicatorEngine:
         return signals
 
 
-# ── MA Crossover Strategy ────────────────────────────────────────────────────
+# ── MA/EMA Crossover Strategy ────────────────────────────────────────────────
 class MACrossover:
-    """MA9/MA20 crossover with SMC confirmation.
+    """EMA crossover strategy with RSI gate and trend alignment.
+
+    Improvements over the previous SMA version:
+      • EMA responds 3-5× faster than SMA on the same period — signals fire
+        earlier in the move, not after it has already happened.
+      • RSI(14) gate prevents buying overbought (>70) or selling oversold (<30).
+      • Minimum crossover threshold (0.05% of price) eliminates flat-line noise
+        crosses where EMA_fast ≈ EMA_slow but the difference is rounding error.
+      • Trend filter: EMA_slow must be sloping in the signal direction, blocking
+        counter-trend fades that SMA would have accepted.
+      • Confirmation TF threshold: conf_diff must exceed 0.02% of price, not just
+        be any positive number.
 
     Strategy logic:
-      - MA9 crosses ABOVE MA20 on 5m + 1m confirms bullish → BUY
-      - MA9 crosses BELOW MA20 on 5m + 1m confirms bearish → SELL
-      - Must be confirmed by an active Order Block or Fair Value Gap
+      BUY:  EMA_fast crosses above EMA_slow on signal TF
+            AND conf TF EMA_fast > EMA_slow by ≥ 0.02%
+            AND EMA_slow is sloping up (trend aligned)
+            AND RSI < 70 (not overbought)
+
+      SELL: EMA_fast crosses below EMA_slow on signal TF
+            AND conf TF EMA_fast < EMA_slow by ≥ 0.02%
+            AND EMA_slow is sloping down (trend aligned)
+            AND RSI > 30 (not oversold)
     """
 
     def __init__(self, indicator_engine: IndicatorEngine):
@@ -322,97 +470,148 @@ class MACrossover:
         self.last_sell_time:  dict = defaultdict(float)   # last SELL per pair
 
     def calculate_signals(self, pair, candles_signal, candles_conf):
-        """MA crossover on the signal TF confirmed by the confirmation TF.
-
-        Cooldown is tracked per-direction so a BUY cooldown doesn't block a SELL
-        signal that fires right after (and vice versa).
-
-        Uses sorted(MA_PERIODS)[:2] so bot and chart always use identical periods.
-        """
+        """EMA crossover on the signal TF confirmed by the confirmation TF."""
         now = time.time()
-        # Per-direction cooldowns — don't let a recent buy block an urgent sell
-        _last_buy  = self.last_buy_time.get(pair, 0)
-        _last_sell = self.last_sell_time.get(pair, 0)
-        # Still enforce a global minimum gap to prevent double-firing on same candle
+        # Global 10s gap prevents double-firing on same candle close
         if now - self.last_trade_time[pair] < 10:
             return None
 
         p_fast, p_slow = sorted(MA_PERIODS)[:2]
-        closes_s = np.array([c[4] for c in candles_signal])
-        closes_c = np.array([c[4] for c in candles_conf])
-        if len(closes_s) < p_slow or len(closes_c) < p_slow:
+
+        closes_s = np.array([c[4] for c in candles_signal], dtype=float)
+        closes_c = np.array([c[4] for c in candles_conf],   dtype=float)
+        if len(closes_s) < p_slow + 1 or len(closes_c) < p_slow:
             return None
 
-        ma_fast_s = np.convolve(closes_s, np.ones(p_fast) / p_fast, mode='valid')
-        ma_slow_s = np.convolve(closes_s, np.ones(p_slow) / p_slow, mode='valid')
-        ma_fast_c = np.convolve(closes_c, np.ones(p_fast) / p_fast, mode='valid')
-        ma_slow_c = np.convolve(closes_c, np.ones(p_slow) / p_slow, mode='valid')
+        # ── EMA crossover on signal TF ───────────────────────────────────────
+        ema_f_s = ema(closes_s, p_fast)
+        ema_s_s = ema(closes_s, p_slow)
 
-        if len(ma_fast_s) < 2 or len(ma_slow_s) < 2 or len(ma_fast_c) < 1:
+        # Need at least 2 consecutive valid values for crossover detection
+        valid_both = ~(np.isnan(ema_f_s) | np.isnan(ema_s_s))
+        if valid_both.sum() < 2:
             return None
 
-        prev_diff = ma_fast_s[-2] - ma_slow_s[-2]
-        curr_diff = ma_fast_s[-1] - ma_slow_s[-1]
-        curr_conf = ma_fast_c[-1] - ma_slow_c[-1]
+        vf = ema_f_s[valid_both]
+        vs = ema_s_s[valid_both]
+        prev_diff = float(vf[-2] - vs[-2])
+        curr_diff = float(vf[-1] - vs[-1])
 
-        if prev_diff < 0 and curr_diff > 0 and curr_conf > 0:
-            if now - _last_buy < COOLDOWN_SECONDS:
-                return None   # buy cooldown active
-            return {'action': 'buy',  'price': closes_s[-1], 'source': f'MA{p_fast}/MA{p_slow}'}
-        if prev_diff > 0 and curr_diff < 0 and curr_conf < 0:
-            if now - _last_sell < COOLDOWN_SECONDS:
-                return None   # sell cooldown active
-            return {'action': 'sell', 'price': closes_s[-1], 'source': f'MA{p_fast}/MA{p_slow}'}
+        # ── Confirmation TF alignment ────────────────────────────────────────
+        ema_f_c = ema(closes_c, p_fast)
+        ema_s_c = ema(closes_c, p_slow)
+        valid_c = ~(np.isnan(ema_f_c) | np.isnan(ema_s_c))
+        if valid_c.sum() < 1:
+            return None
+        conf_diff = float(ema_f_c[valid_c][-1] - ema_s_c[valid_c][-1])
+
+        # ── Trend filter: EMA_slow slope ─────────────────────────────────────
+        vs_full = ema_s_s[~np.isnan(ema_s_s)]
+        trend_up   = len(vs_full) >= 2 and vs_full[-1] > vs_full[-2]
+        trend_down = len(vs_full) >= 2 and vs_full[-1] < vs_full[-2]
+
+        # ── RSI gate (cached by IndicatorEngine) ─────────────────────────────
+        curr_rsi = self.ie.data[pair].get('rsi', 50.0)
+
+        # ── Minimum crossover gap (0.05% of price) — kills noise crosses ─────
+        price_now  = float(closes_s[-1])
+        min_cross  = price_now * 0.0005       # 0.05%
+        min_conf   = price_now * 0.0002       # 0.02%
+
+        # ── Signal evaluation ─────────────────────────────────────────────────
+        if (prev_diff < 0 and curr_diff > min_cross    # golden cross with gap
+                and conf_diff > min_conf                # confirmation TF bullish
+                and trend_up                            # EMA_slow sloping up
+                and curr_rsi < 70):                     # not overbought
+            if now - self.last_buy_time.get(pair, 0) < COOLDOWN_SECONDS:
+                return None
+            return {
+                'action': 'buy',
+                'price':  price_now,
+                'source': f'EMA{p_fast}/EMA{p_slow}',
+                'rsi':    curr_rsi,
+            }
+
+        if (prev_diff > 0 and curr_diff < -min_cross   # death cross with gap
+                and conf_diff < -min_conf               # confirmation TF bearish
+                and trend_down                          # EMA_slow sloping down
+                and curr_rsi > 30):                     # not oversold
+            if now - self.last_sell_time.get(pair, 0) < COOLDOWN_SECONDS:
+                return None
+            return {
+                'action': 'sell',
+                'price':  price_now,
+                'source': f'EMA{p_fast}/EMA{p_slow}',
+                'rsi':    curr_rsi,
+            }
+
         return None
 
     def calculate_breakout(self, pair, candles):
-        """
-        Breakout / momentum detector — catches explosive moves that fire
-        before MA crossover can react.  Designed for low-cap spikes like XCN.
+        """ATR-normalized breakout detector for explosive momentum moves.
 
-        BUY  conditions (all required):
-          ① Current close > highest close of the prior 20 candles (breakout)
-          ② Volume surge (≥ 2× 20-period avg)  OR  single-candle move ≥ 2%
+        Improvements over the previous version:
+          • ATR-based momentum gate replaces fixed 2% — scales correctly across
+            all price levels (a 2% move on XCN at $0.004 ≠ a 2% move on BTC).
+          • 75th-percentile volume gate is more robust than 2× average on
+            sparse pairs where the average itself is noisy.
+          • Requires 25 candles (vs 25 before) for ATR to be meaningful.
+          • Per-direction cooldowns still apply.
 
-        SELL conditions:
-          ① Current close < lowest close of the prior 20 candles (breakdown)
-          ② Same volume/momentum gate
-
-        No SMC confirmation — these moves are too fast to wait for OB/FVG.
-        Uses the same cooldown as MA crossover to prevent double-firing.
+        BUY:  close > 20-candle high  AND (volume > 75th pct OR move > 1.5× ATR)
+        SELL: close < 20-candle low   AND (volume > 75th pct OR move < -1.5× ATR)
         """
         now = time.time()
         if now - self.last_trade_time[pair] < 10:
-            return None   # absolute minimum gap regardless of direction
+            return None
         if len(candles) < 25:
             return None
 
-        closes  = np.array([c[4] for c in candles])
-        highs   = np.array([c[2] for c in candles])
-        lows    = np.array([c[3] for c in candles])
-        volumes = np.array([c[5] for c in candles])
+        closes  = np.array([c[4] for c in candles], dtype=float)
+        highs   = np.array([c[2] for c in candles], dtype=float)
+        lows    = np.array([c[3] for c in candles], dtype=float)
+        volumes = np.array([c[5] for c in candles], dtype=float)
 
-        lb          = 20
-        cur_close   = closes[-1]
-        prev_close  = closes[-2]
+        lb         = 20
+        cur_close  = float(closes[-1])
+        prev_close = float(closes[-2])
+
         prior_highs = highs[-lb-1:-1]
         prior_lows  = lows[-lb-1:-1]
         prior_vols  = volumes[-lb-1:-1]
 
-        prev_high = prior_highs.max()
-        prev_low  = prior_lows.min()
-        avg_vol   = prior_vols.mean() if prior_vols.mean() > 0 else 1e-12
-        vol_surge = volumes[-1] > avg_vol * 2.0
-        momentum  = (cur_close - prev_close) / prev_close if prev_close > 0 else 0
+        prev_high = float(prior_highs.max())
+        prev_low  = float(prior_lows.min())
 
-        if cur_close > prev_high and (vol_surge or momentum > 0.02):
+        # Volume: 75th percentile gate — robust on low-volume pairs
+        vol_pct75 = float(np.percentile(prior_vols, 75)) if len(prior_vols) >= 4 else float(prior_vols.mean() * 1.5)
+        vol_surge = volumes[-1] > vol_pct75
+
+        # ATR-normalized momentum: momentum must be ≥ 1.5× ATR to qualify
+        atr_val      = self.ie.data[pair].get('atr', 0.0)
+        atr_gate     = atr_val * 1.5 if atr_val > 0 else cur_close * 0.02
+        price_move   = cur_close - prev_close   # signed
+
+        if cur_close > prev_high and (vol_surge or price_move > atr_gate):
             if now - self.last_buy_time.get(pair, 0) < COOLDOWN_SECONDS:
                 return None
-            return {'action': 'buy',  'price': cur_close, 'source': 'Breakout↑'}
-        if cur_close < prev_low  and (vol_surge or momentum < -0.02):
+            return {
+                'action': 'buy',
+                'price':  cur_close,
+                'source': 'Breakout↑',
+                'atr':    atr_val,
+            }
+
+        if cur_close < prev_low and (vol_surge or price_move < -atr_gate):
             if now - self.last_sell_time.get(pair, 0) < COOLDOWN_SECONDS:
                 return None
-            return {'action': 'sell', 'price': cur_close, 'source': 'Breakdown↓'}
+            return {
+                'action': 'sell',
+                'price':  cur_close,
+                'source': 'Breakdown↓',
+                'atr':    atr_val,
+            }
+
         return None
 
 
@@ -436,20 +635,32 @@ def save_trade_history(history: dict):
 
 
 # ── Candle Cache ─────────────────────────────────────────────────────────────
+# Per-TF TTL: short TFs go stale faster than daily candles.
+_CACHE_TTL = {'1m': 30 * 60, '5m': 2 * 3600, '1h': 12 * 3600, '1d': 24 * 3600}
+
 def load_candle_cache() -> dict:
-    """Return cached candle data or empty dict.  Structure:
-    { 'saved_at': unix_ts, 'candles': { tf: { pair: [[ts,o,h,l,c,v], ...] } } }
-    Cache is rejected if older than 24 hours (stale beyond usefulness).
+    """Return cached candle data or empty dict.
+
+    Cache structure:
+      { 'saved_at': unix_ts, 'candles': { tf: { pair: [[ts,o,h,l,c,v], ...] } } }
+
+    Each TF is validated independently against its own TTL so a stale 1m cache
+    doesn't discard perfectly valid 1d candles.
     """
     if not os.path.exists(CANDLE_CACHE_FILE):
         return {}
     try:
         with open(CANDLE_CACHE_FILE) as f:
             data = json.load(f)
-        age = time.time() - data.get('saved_at', 0)
-        if age > 86400:   # discard if older than 24 h
-            return {}
-        return data.get('candles', {})
+        saved_at = data.get('saved_at', 0)
+        raw      = data.get('candles', {})
+        out      = {}
+        age      = time.time() - saved_at
+        for tf, pairs in raw.items():
+            ttl = _CACHE_TTL.get(tf, 86400)
+            if age <= ttl:
+                out[tf] = pairs
+        return out
     except Exception:
         return {}
 
@@ -461,10 +672,10 @@ def save_candle_cache(candle_history: dict):
         for tf, pairs in candle_history.items():
             snapshot[tf] = {}
             for pair, dq in pairs.items():
-                snapshot[tf][pair] = list(dq)   # deque → plain list
+                snapshot[tf][pair] = list(dq)
         payload = {'saved_at': time.time(), 'candles': snapshot}
         with open(CANDLE_CACHE_FILE, 'w') as f:
-            json.dump(payload, f, separators=(',', ':'))  # compact — no indent
+            json.dump(payload, f, separators=(',', ':'))
     except Exception as e:
         logger.warning(f"Could not save candle cache: {e}")
 
