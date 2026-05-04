@@ -2799,7 +2799,7 @@ class Dashboard(ctk.CTkFrame):
 
         win = ctk.CTkToplevel(self)
         win.title(f"Order Book  —  {pair}")
-        win.geometry("440x520")
+        win.geometry("460x620")
         win.resizable(True, True)
         win.configure(fg_color=C_BG)
         self._ob_window = win
@@ -2819,15 +2819,15 @@ class Dashboard(ctk.CTkFrame):
             hdr, text="Spread: —", font=("Segoe UI", 10), text_color=C_MUTED)
         self._ob_spread_lbl.pack(side="right", padx=14)
 
-        # ── Asks (top) ─────────────────────────────────────────────────────
-        ask_frame = ctk.CTkFrame(win, fg_color="transparent")
-        ask_frame.pack(fill="both", expand=True, padx=10, pady=(4, 0))
-        ctk.CTkLabel(ask_frame, text="  Price (Ask)        Size         Total",
+        # ── Asks — scrollable, worst ask at top ────────────────────────────
+        ctk.CTkLabel(win, text="  Price (Ask)              Size         Total",
                      font=("Segoe UI Mono", 9), text_color=C_MUTED,
-                     anchor="w").pack(fill="x")
+                     anchor="w").pack(fill="x", padx=10, pady=(4, 0))
+        ask_scroll = ctk.CTkScrollableFrame(win, fg_color="transparent", height=200)
+        ask_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 0))
         self._ob_ask_rows = []
-        for _ in range(10):
-            lbl = ctk.CTkLabel(ask_frame, text="", font=("Segoe UI Mono", 10),
+        for _ in range(20):
+            lbl = ctk.CTkLabel(ask_scroll, text="", font=("Segoe UI Mono", 10),
                                text_color=C_RED, anchor="w")
             lbl.pack(fill="x", pady=1)
             self._ob_ask_rows.append(lbl)
@@ -2842,15 +2842,15 @@ class Dashboard(ctk.CTkFrame):
             mid_frame, text="", font=("Segoe UI", 10), text_color=C_MUTED)
         self._ob_imb_lbl.pack(side="right", padx=14)
 
-        # ── Bids (bottom) ──────────────────────────────────────────────────
-        bid_frame = ctk.CTkFrame(win, fg_color="transparent")
-        bid_frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
-        ctk.CTkLabel(bid_frame, text="  Price (Bid)        Size         Total",
+        # ── Bids — scrollable ──────────────────────────────────────────────
+        ctk.CTkLabel(win, text="  Price (Bid)              Size         Total",
                      font=("Segoe UI Mono", 9), text_color=C_MUTED,
-                     anchor="w").pack(fill="x")
+                     anchor="w").pack(fill="x", padx=10, pady=(0, 0))
+        bid_scroll = ctk.CTkScrollableFrame(win, fg_color="transparent", height=200)
+        bid_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 8))
         self._ob_bid_rows = []
-        for _ in range(10):
-            lbl = ctk.CTkLabel(bid_frame, text="", font=("Segoe UI Mono", 10),
+        for _ in range(20):
+            lbl = ctk.CTkLabel(bid_scroll, text="", font=("Segoe UI Mono", 10),
                                text_color=C_GREEN, anchor="w")
             lbl.pack(fill="x", pady=1)
             self._ob_bid_rows.append(lbl)
@@ -2879,11 +2879,11 @@ class Dashboard(ctk.CTkFrame):
             return
         pair = getattr(self, '_ob_pair', '')
         ob   = self._order_book.get(pair, {'bids': [], 'asks': []})
-        bids = ob['bids'][:10]
-        asks = ob['asks'][:10]
+        bids = ob['bids'][:20]
+        asks = ob['asks'][:20]
 
         # Asks shown top-to-bottom: worst ask first (highest price at top)
-        asks_display = list(reversed(asks[:10]))
+        asks_display = list(reversed(asks[:20]))
 
         def _fmt_row(price, qty, cum):
             return f"  {format_price(price):<18}  {qty:>10.4f}  {cum:>10.4f}"
