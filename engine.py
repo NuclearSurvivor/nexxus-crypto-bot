@@ -599,7 +599,7 @@ def load_candle_cache() -> dict:
 
 
 def save_candle_cache(candle_history: dict):
-    """Persist candle_history to disk.  candle_history[tf][pair] is a deque of lists."""
+    """Persist candle_history to disk atomically (temp + rename prevents corruption)."""
     try:
         snapshot = {}
         for tf, pairs in candle_history.items():
@@ -607,8 +607,10 @@ def save_candle_cache(candle_history: dict):
             for pair, dq in pairs.items():
                 snapshot[tf][pair] = list(dq)
         payload = {'saved_at': time.time(), 'candles': snapshot}
-        with open(CANDLE_CACHE_FILE, 'w') as f:
+        tmp = CANDLE_CACHE_FILE + '.tmp'
+        with open(tmp, 'w') as f:
             json.dump(payload, f, separators=(',', ':'))
+        os.replace(tmp, CANDLE_CACHE_FILE)
     except Exception as e:
         logger.warning(f"Could not save candle cache: {e}")
 

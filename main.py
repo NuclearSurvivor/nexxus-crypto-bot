@@ -14,6 +14,7 @@ Key references:
 
 import asyncio
 import bisect
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import os
@@ -232,16 +233,22 @@ _MONITOR_HZ = _detect_monitor_hz()
 _FRAME_DT   = 1.0 / _MONITOR_HZ   # e.g. 6.94 ms @ 144 Hz, 16.67 ms @ 60 Hz
 
 plt.rcParams.update({
-    "figure.facecolor":  C_CHART_BG,
-    "axes.facecolor":    C_CHART_BG,
-    "axes.edgecolor":    C_BORDER,
-    "xtick.color":       C_MUTED,
-    "ytick.color":       C_MUTED,
-    "xtick.labelsize":   7,
-    "ytick.labelsize":   7,
-    "grid.color":        C_GLASS,
-    "grid.linestyle":    "-",
-    "grid.alpha":        0.5,
+    "figure.facecolor":      C_CHART_BG,
+    "axes.facecolor":        C_CHART_BG,
+    "axes.edgecolor":        C_BORDER,
+    "xtick.color":           C_MUTED,
+    "ytick.color":           C_MUTED,
+    "xtick.labelsize":       7,
+    "ytick.labelsize":       7,
+    "grid.color":            C_GLASS,
+    "grid.linestyle":        "-",
+    "grid.alpha":            0.5,
+    # Performance: simplify dense path data and use chunked Agg rendering
+    "path.simplify":          True,
+    "path.simplify_threshold": 0.8,
+    "agg.path.chunksize":     0,
+    # Disable unused features for faster rendering
+    "axes.unicode_minus":    False,
 })
 
 # Confirmation TF for each signal TF — one step shorter
@@ -526,12 +533,24 @@ class Dashboard(ctk.CTkFrame):
         self._ma_cache: dict = {}
 
         # Order book — updated from level2 WS channel.
-        # pair → {'bids': sorted list [(price, qty)], 'asks': sorted list [(price, qty)]}
         self._order_book: dict = defaultdict(lambda: {'bids': [], 'asks': []})
-        self._ob_window = None   # CTkToplevel reference
+        self._ob_window = None
 
         # Active page name — used to gate chart live-refresh to chart tab only
         self._active_page: str = 'dashboard'
+
+        # ── Chart render pipeline ─────────────────────────────────────────────
+        # Off-thread render: main thread draws all artists, background thread
+        # calls canvas.draw() (Agg → GIL-friendly), Tk update scheduled via after().
+        # Blit path: background is saved after each full render; 1s ticks only
+        # redraw the live price line (restore_region + draw_artist + blit = <5ms).
+        self._render_executor  = ThreadPoolExecutor(max_workers=1,
+                                                    thread_name_prefix='chart_render')
+        self._chart_rendering  = False   # True while background render in flight
+        self._chart_dirty      = False   # True when new candle data arrived
+        self._chart_bg         = None    # saved region for blit (no price line)
+        self._chart_bg_valid   = False   # False whenever bg needs to be re-saved
+        self._price_line_artist = None   # axhline drawn on blit layer
 
         # ── Pre-populate candle history from disk cache ───────────────────────
         # Charts render immediately on startup; live API fills in newer candles.
@@ -1575,10 +1594,14 @@ class Dashboard(ctk.CTkFrame):
                 self.root.after(0, self._gui_append_log,      entry)
                 self.root.after(0, self._gui_append_activity, entry)
 
+    _LOG_MAX_LINES = 2000   # cap textbox content to prevent unbounded memory growth
+
     def _gui_append_log(self, entry):
         try:
             self.log_box.configure(state="normal")
             self.log_box.insert("end", entry)
+            if int(self.log_box.index("end-1c").split(".")[0]) > self._LOG_MAX_LINES:
+                self.log_box.delete("1.0", f"{self._LOG_MAX_LINES // 4}.0")
             self.log_box.configure(state="disabled")
             self.log_box.see("end")
         except Exception:
@@ -1590,6 +1613,8 @@ class Dashboard(ctk.CTkFrame):
                 return
             self.monitor_box.configure(state="normal")
             self.monitor_box.insert("end", entry)
+            if int(self.monitor_box.index("end-1c").split(".")[0]) > self._LOG_MAX_LINES:
+                self.monitor_box.delete("1.0", f"{self._LOG_MAX_LINES // 4}.0")
             self.monitor_box.configure(state="disabled")
             self.monitor_box.see("end")
         except Exception:
@@ -1599,6 +1624,8 @@ class Dashboard(ctk.CTkFrame):
         try:
             self.activity_box.configure(state="normal")
             self.activity_box.insert("end", entry)
+            if int(self.activity_box.index("end-1c").split(".")[0]) > self._LOG_MAX_LINES:
+                self.activity_box.delete("1.0", f"{self._LOG_MAX_LINES // 4}.0")
             self.activity_box.configure(state="disabled")
             self.activity_box.see("end")
         except Exception:
@@ -2412,11 +2439,8 @@ class Dashboard(ctk.CTkFrame):
                         })
                         breakout_drawn = True
 
-        # ── 7. Live price line ────────────────────────────────────────────────
-        # The price label annotation is drawn in section 9 AFTER set_ylim so
-        # the blended-transform y position is always within the visible range.
-        if price:
-            ax.axhline(y=price, color="#ffffff", linestyle=':', linewidth=0.8, alpha=0.4)
+        # ── 7. Live price line lives in the blit layer (_on_render_complete) ───
+        # Excluded from the static render so 1s ticks cost <5ms not ~150ms.
 
         # ── 7b. Last executed trade marker ───────────────────────────────────
         # Drawn from last_executed_signal (seeded from trades.json or bot.log),
@@ -2744,38 +2768,83 @@ class Dashboard(ctk.CTkFrame):
 
         # Explicit margins so key panel never overlaps chart area
         self.chart_fig.subplots_adjust(left=0.01, right=0.99, top=0.94, bottom=0.10, wspace=0.06)
-        try:
-            self.chart_canvas.draw_idle()
-        except Exception:
-            pass
+        # Trigger off-thread render. If one is already running, mark dirty so
+        # _on_render_complete re-triggers. Drop frame rather than queue two renders.
+        self._chart_bg_valid = False
+        if not self._chart_rendering:
+            self._chart_rendering = True
+            self._render_executor.submit(self._bg_render)
+        else:
+            self._chart_dirty = True   # retry when current render finishes
 
     # ── Live chart 1-second refresh ──────────────────────────────────────────
     def _chart_live_tick(self):
-        """Redraw the chart every second while the Charts page is active.
-
-        This keeps the forming candle and price label current without waiting
-        for a REST candle close (which only triggers every 5 min on 1h TF).
-        The forming candle is synthesized from WS ticks in _refresh_chart.
-        """
+        """1s heartbeat: full redraw only when needed, blit otherwise."""
         if self.root_alive and self._active_page == 'charts':
             try:
-                self._refresh_chart()
+                if self._chart_dirty and not self._chart_rendering:
+                    self._chart_dirty = False
+                    self._refresh_chart()
+                elif self._chart_bg_valid and not self._chart_rendering:
+                    self._chart_blit_price()
             except Exception:
                 pass
         if self.root_alive:
             self.root.after(1000, self._chart_live_tick)
 
+    def _bg_render(self):
+        """Runs in ThreadPoolExecutor — Agg rendering off main thread.
+        canvas.draw() does the expensive CPU rasterization here, then
+        schedules the Tk display update via after(0, _show) internally.
+        """
+        try:
+            self.chart_canvas.draw()
+        except Exception:
+            pass
+        if self.root_alive:
+            self.root.after(0, self._on_render_complete)
+
+    def _on_render_complete(self):
+        """Main thread callback: save blit background then draw price line."""
+        self._chart_rendering = False
+        try:
+            self._chart_bg       = self.chart_canvas.copy_from_bbox(self.chart_ax.bbox)
+            self._chart_bg_valid = True
+            price = self.live_prices.get(self.chart_pair_var.get(), 0)
+            if price:
+                if self._price_line_artist is not None:
+                    try: self._price_line_artist.remove()
+                    except Exception: pass
+                self._price_line_artist = self.chart_ax.axhline(
+                    y=price, color="#ffffff", linestyle=':', linewidth=0.8, alpha=0.4)
+                self.chart_ax.draw_artist(self._price_line_artist)
+                self.chart_canvas.blit(self.chart_ax.bbox)
+        except Exception:
+            self._chart_bg_valid = False
+        # If new candle data arrived while we were rendering, re-render now
+        if self._chart_dirty:
+            self._chart_dirty = False
+            self._refresh_chart()
+
+    def _chart_blit_price(self):
+        """Sub-5ms price line update: restore saved background + draw line + blit."""
+        price = self.live_prices.get(self.chart_pair_var.get(), 0)
+        if not price or self._price_line_artist is None or not self._chart_bg_valid:
+            return
+        try:
+            self.chart_canvas.restore_region(self._chart_bg)
+            self._price_line_artist.set_ydata([price, price])
+            self.chart_ax.draw_artist(self._price_line_artist)
+            self.chart_canvas.blit(self.chart_ax.bbox)
+        except Exception:
+            self._chart_bg_valid = False
+
     # ── Order book popup ──────────────────────────────────────────────────────
     def _open_orderbook(self):
-        """Open a live order book popup for the currently selected chart pair.
-
-        Data comes from the level2 WebSocket channel already subscribed in
-        _websocket_loop. Display updates every 250ms via _update_ob_display.
-        """
+        """Live order book popup. Uses tk.Text (1 write/update) not 40 CTkLabels."""
         pair = self.chart_pair_var.get()
         self._ob_pair = pair
 
-        # Bring existing window forward if already open for the same pair
         if self._ob_window is not None:
             try:
                 self._ob_window.lift()
@@ -2795,7 +2864,7 @@ class Dashboard(ctk.CTkFrame):
             win.destroy()
         win.protocol("WM_DELETE_WINDOW", _on_close)
 
-        # ── Header ─────────────────────────────────────────────────────────
+        # Header
         hdr = ctk.CTkFrame(win, fg_color=C_PANEL, corner_radius=0)
         hdr.pack(fill="x", pady=(0, 2))
         ctk.CTkLabel(hdr, text=f"{pair}  Order Book",
@@ -2805,20 +2874,19 @@ class Dashboard(ctk.CTkFrame):
             hdr, text="Spread: —", font=("Segoe UI", 10), text_color=C_MUTED)
         self._ob_spread_lbl.pack(side="right", padx=14)
 
-        # ── Asks — scrollable, worst ask at top ────────────────────────────
-        ctk.CTkLabel(win, text="  Price (Ask)              Size         Total",
-                     font=("Segoe UI Mono", 9), text_color=C_MUTED,
-                     anchor="w").pack(fill="x", padx=10, pady=(4, 0))
-        ask_scroll = ctk.CTkScrollableFrame(win, fg_color="transparent", height=200)
-        ask_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 0))
-        self._ob_ask_rows = []
-        for _ in range(20):
-            lbl = ctk.CTkLabel(ask_scroll, text="", font=("Segoe UI Mono", 10),
-                               text_color=C_RED, anchor="w")
-            lbl.pack(fill="x", pady=1)
-            self._ob_ask_rows.append(lbl)
+        _col_hdr = "  Price                    Size         Cumulative"
+        _mono    = ("Courier New", 10)
 
-        # ── Mid-price ───────────────────────────────────────────────────────
+        # Asks (single tk.Text — one write per refresh vs 20 CTkLabel.configure calls)
+        ctk.CTkLabel(win, text=_col_hdr, font=("Courier New", 9),
+                     text_color=C_MUTED, anchor="w").pack(fill="x", padx=10, pady=(4, 0))
+        self._ob_ask_text = tk.Text(
+            win, font=_mono, height=12, bg=C_CARD, fg=C_RED,
+            relief="flat", highlightthickness=0, bd=0, state="disabled",
+            selectbackground=C_BORDER)
+        self._ob_ask_text.pack(fill="both", expand=True, padx=10, pady=(0, 0))
+
+        # Mid-price strip
         mid_frame = ctk.CTkFrame(win, fg_color=C_CARD2, corner_radius=0, height=30)
         mid_frame.pack(fill="x", padx=0, pady=4)
         self._ob_mid_lbl = ctk.CTkLabel(
@@ -2828,24 +2896,18 @@ class Dashboard(ctk.CTkFrame):
             mid_frame, text="", font=("Segoe UI", 10), text_color=C_MUTED)
         self._ob_imb_lbl.pack(side="right", padx=14)
 
-        # ── Bids — scrollable ──────────────────────────────────────────────
-        ctk.CTkLabel(win, text="  Price (Bid)              Size         Total",
-                     font=("Segoe UI Mono", 9), text_color=C_MUTED,
-                     anchor="w").pack(fill="x", padx=10, pady=(0, 0))
-        bid_scroll = ctk.CTkScrollableFrame(win, fg_color="transparent", height=200)
-        bid_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 8))
-        self._ob_bid_rows = []
-        for _ in range(20):
-            lbl = ctk.CTkLabel(bid_scroll, text="", font=("Segoe UI Mono", 10),
-                               text_color=C_GREEN, anchor="w")
-            lbl.pack(fill="x", pady=1)
-            self._ob_bid_rows.append(lbl)
+        # Bids
+        ctk.CTkLabel(win, text=_col_hdr, font=("Courier New", 9),
+                     text_color=C_MUTED, anchor="w").pack(fill="x", padx=10, pady=(0, 0))
+        self._ob_bid_text = tk.Text(
+            win, font=_mono, height=12, bg=C_CARD, fg=C_GREEN,
+            relief="flat", highlightthickness=0, bd=0, state="disabled",
+            selectbackground=C_BORDER)
+        self._ob_bid_text.pack(fill="both", expand=True, padx=10, pady=(0, 8))
 
-        # Start live refresh loop
         self._ob_refresh_loop(win)
 
     def _ob_refresh_loop(self, win):
-        """Poll order book display every 250ms while the popup is open."""
         if self._ob_window is None:
             return
         try:
@@ -2860,7 +2922,7 @@ class Dashboard(ctk.CTkFrame):
             self._ob_window = None
 
     def _update_ob_display(self):
-        """Refresh the order book labels with latest level2 data."""
+        """Rebuild order book in a single tk.Text write — fast and flicker-free."""
         if self._ob_window is None:
             return
         pair = getattr(self, '_ob_pair', '')
@@ -2868,45 +2930,41 @@ class Dashboard(ctk.CTkFrame):
         bids = ob['bids'][:20]
         asks = ob['asks'][:20]
 
-        # Asks shown top-to-bottom: worst ask first (highest price at top)
-        asks_display = list(reversed(asks[:20]))
+        def _build_lines(levels, reverse=False):
+            rows  = list(reversed(levels)) if reverse else levels
+            lines = []
+            cum   = 0.0
+            for p, q in rows:
+                cum += q
+                lines.append(f"  {format_price(p):<18}  {q:>10.4f}  {cum:>12.4f}\n")
+            return "".join(lines)
 
-        def _fmt_row(price, qty, cum):
-            return f"  {format_price(price):<18}  {qty:>10.4f}  {cum:>10.4f}"
-
-        cum = 0.0
-        for i, lbl in enumerate(self._ob_ask_rows):
-            if i < len(asks_display):
-                _p, _q = asks_display[i]
-                cum += _q
-                lbl.configure(text=_fmt_row(_p, _q, cum))
-            else:
-                lbl.configure(text="")
-
-        cum = 0.0
-        for i, lbl in enumerate(self._ob_bid_rows):
-            if i < len(bids):
-                _p, _q = bids[i]
-                cum += _q
-                lbl.configure(text=_fmt_row(_p, _q, cum))
-            else:
-                lbl.configure(text="")
+        # Single delete+insert per widget — far cheaper than 20 .configure() calls
+        for widget, levels, rev in (
+            (self._ob_ask_text, asks, True),
+            (self._ob_bid_text, bids, False),
+        ):
+            try:
+                widget.configure(state="normal")
+                widget.delete("1.0", "end")
+                widget.insert("end", _build_lines(levels, rev))
+                widget.configure(state="disabled")
+            except Exception:
+                pass
 
         try:
             best_ask = asks[0][0] if asks else 0
             best_bid = bids[0][0] if bids else 0
-            mid      = (best_bid + best_ask) / 2 if best_bid and best_ask else 0
-            spread   = best_ask - best_bid if best_bid and best_ask else 0
+            mid    = (best_bid + best_ask) / 2 if best_bid and best_ask else 0
+            spread = best_ask - best_bid if best_bid and best_ask else 0
             self._ob_mid_lbl.configure(text=format_price(mid) if mid else "—")
             self._ob_spread_lbl.configure(
                 text=f"Spread: {format_price(spread)}" if spread else "Spread: —")
-
-            # Order imbalance ratio
             bid_vol = sum(q for _, q in bids)
             ask_vol = sum(q for _, q in asks)
             total   = bid_vol + ask_vol
             if total > 0:
-                imb = bid_vol / total
+                imb      = bid_vol / total
                 imb_col  = C_GREEN if imb > 0.55 else (C_RED if imb < 0.45 else C_MUTED)
                 imb_side = "BID heavy" if imb > 0.55 else ("ASK heavy" if imb < 0.45 else "balanced")
                 self._ob_imb_lbl.configure(
@@ -3044,7 +3102,8 @@ class Dashboard(ctk.CTkFrame):
         ax = self.chart_ax
         if event.inaxes != ax:
             return
-        self._zoom_locked = True
+        self._zoom_locked      = True
+        self._chart_bg_valid   = False   # blit bg no longer valid after axis change
         factor = 0.85 if event.button == 'up' else 1.0 / 0.85
 
         xl = ax.get_xlim()
@@ -3090,7 +3149,8 @@ class Dashboard(ctk.CTkFrame):
         dy_data = (event.y - self._pan_start[1]) * (yl[1] - yl[0]) / bbox.height
         ax.set_xlim([xl[0] - dx_data, xl[1] - dx_data])
         ax.set_ylim([yl[0] - dy_data, yl[1] - dy_data])
-        self._zoom_locked = True
+        self._zoom_locked    = True
+        self._chart_bg_valid = False   # blit bg no longer valid after axis change
         now = time.monotonic()
         if now - self._drag_last_draw < _FRAME_DT:
             return
@@ -4251,11 +4311,11 @@ class Dashboard(ctk.CTkFrame):
                 self.log_message(
                     f"Signal check skipped — {pair} order lock active", "info")
 
-        # Auto-refresh chart if this pair/tf is selected
+        # Signal chart needs redraw — picked up by _chart_live_tick (no after() storm)
         if self.root_alive:
             if (self.chart_pair_var.get() == pair and
                     self.chart_tf_var.get() == timeframe):
-                self.root.after(0, self._refresh_chart)
+                self._chart_dirty = True
             self.root.after(0, self._update_pair_cards)
 
     # ── WebSocket ticker ──────────────────────────────────────────────────────
@@ -5294,6 +5354,7 @@ class Dashboard(ctk.CTkFrame):
     def on_close(self):
         self.running    = False
         self.root_alive = False
+        self._render_executor.shutdown(wait=False, cancel_futures=True)
         save_trade_history(self.trade_history)
         save_candle_cache(self.candle_history)
         try:
@@ -5321,6 +5382,15 @@ class App(ctk.CTk):
         self.geometry("1300x840")
         self.minsize(1100, 700)
         self.configure(fg_color=C_BG)
+
+        # Request hardware-composited (GPU) window on Linux/X11.
+        # The compositor blits the window using the GPU — reduces tearing and
+        # eliminates software-fallback rendering on NVIDIA/AMD systems.
+        try:
+            self.attributes("-alpha", 1.0)   # force composited window path
+            self.tk.call("tk", "useinputmethods", "1")
+        except Exception:
+            pass
 
         icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
         if os.path.exists(icon_path):
