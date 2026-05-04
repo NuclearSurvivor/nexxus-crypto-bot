@@ -862,7 +862,7 @@ class Dashboard(ctk.CTkFrame):
 
         self.chart_fig = plt.figure(figsize=(13, 7))
         self.chart_fig.patch.set_facecolor(C_CHART_BG)
-        gs = self.chart_fig.add_gridspec(1, 2, width_ratios=[5, 1], wspace=0.02)
+        gs = self.chart_fig.add_gridspec(1, 2, width_ratios=[5.2, 1], wspace=0.04)
         self.chart_ax  = self.chart_fig.add_subplot(gs[0])
         self.key_ax    = self.chart_fig.add_subplot(gs[1])
         self.chart_ax.set_facecolor(C_CHART_BG)
@@ -2070,14 +2070,20 @@ class Dashboard(ctk.CTkFrame):
                         })
                         breakout_drawn = True
 
-        # ── 7. Live price line ───────────────────────────────────────────────
+        # ── 7. Live price line + right-edge label ────────────────────────────
         if price:
             ax.axhline(y=price, color="#ffffff", linestyle=':', linewidth=0.8, alpha=0.4)
-            ax.annotate(format_price(price),
-                        xy=(ts[-1], price), fontsize=7.5,
-                        color="#ffffff", alpha=0.85, ha='right', va='center',
-                        bbox=dict(boxstyle='round,pad=0.2', fc="#1e2330",
-                                  ec="#ffffff", alpha=0.7, lw=0.6))
+            # Snap the price label to the right axis edge (blended: axes x, data y)
+            import matplotlib.transforms as _mt
+            _blended = _mt.blended_transform_factory(ax.transAxes, ax.transData)
+            ax.annotate(f" {format_price(price)} ",
+                        xy=(1.0, price),
+                        xycoords=_blended,
+                        fontsize=7.5, color="#ffffff", alpha=0.92,
+                        ha='left', va='center', clip_on=False,
+                        annotation_clip=False,
+                        bbox=dict(boxstyle='round,pad=0.25', fc=C_CARD2,
+                                  ec="#ffffff", alpha=0.88, lw=0.8))
 
         # ── 8. ATR-based SL/TP bands (long bias: SL below, TP above) ────────
         if atr > 0 and price:
@@ -2118,10 +2124,35 @@ class Dashboard(ctk.CTkFrame):
             ax.set_ylim(_saved_yl)
 
         zoom_hint   = "  [zoomed]" if self._zoom_locked else ""
-        tf_note     = f"  [bot: {self.signal_tf}]" if not is_signal_tf else ""
         ax.set_title(
-            f"{pair}  ·  {tf.upper()}  ·  {len(data)} candles{zoom_hint}{tf_note}",
+            f"{pair}  ·  {tf.upper()}  ·  {len(data)} candles{zoom_hint}",
             color=C_TEXT, fontsize=10, pad=6)
+
+        # ── 9b. Last-signal badge (top-right of chart) ───────────────────────
+        if self._signal_data:
+            last_sig = self._signal_data[-1]
+            _la      = last_sig['action']
+            _lp      = last_sig['price_str']
+            _lt      = last_sig.get('time_str', '')
+            _lc      = C_GREEN if _la == 'buy' else (C_RED if _la == 'sell' else C_ACCENT3)
+            _lm      = "▲ BUY" if _la == 'buy' else ("▼ SELL" if _la == 'sell' else "⚡ BREAKOUT")
+            ax.text(0.99, 0.985, f"{_lm}  {_lp}",
+                    transform=ax.transAxes,
+                    color=_lc, fontsize=7.5, ha='right', va='top',
+                    fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.3', fc=C_BG, ec=_lc, alpha=0.88, lw=0.8))
+            if _lt:
+                ax.text(0.99, 0.955, _lt,
+                        transform=ax.transAxes,
+                        color=C_MUTED, fontsize=6.5, ha='right', va='top',
+                        bbox=dict(boxstyle='round,pad=0.2', fc=C_BG, ec='none', alpha=0.8))
+        elif not is_signal_tf:
+            # Soft note when viewing a TF that won't show signals
+            ax.text(0.99, 0.985,
+                    f"Signals on {self.signal_tf} only",
+                    transform=ax.transAxes,
+                    color=C_MUTED, fontsize=7, ha='right', va='top',
+                    bbox=dict(boxstyle='round,pad=0.25', fc=C_BG, ec=C_BORDER, alpha=0.8))
 
         # ── 10. Key panel ────────────────────────────────────────────────────
         ka = self.key_ax
@@ -2131,10 +2162,10 @@ class Dashboard(ctk.CTkFrame):
         ka.set_xlim(0, 1)
         ka.set_ylim(0, 1)
 
-        ka.axvline(x=0.03, color=C_BORDER, linewidth=0.8, alpha=0.5)
+        ka.axvline(x=0.04, color=C_BORDER, linewidth=0.7, alpha=0.4)
 
         items = []   # (kind, color, text)
-        items.append(('hdr',  C_ACCENT,    "CHART KEY"))
+        items.append(('hdr',  C_ACCENT,    "KEY"))
         items.append(('sp',   None,        None))
         items.append(('sym',  C_GREEN,     "▮  Bull Candle (HA)"))
         items.append(('sym',  C_RED,       "▮  Bear Candle (HA)"))
@@ -2146,15 +2177,13 @@ class Dashboard(ctk.CTkFrame):
 
         # Signal legend — markers only appear on signal TF view
         if buy_signal_drawn:
-            items.append(('sym', C_GREEN,   "▲  BUY signal"))
+            items.append(('sym', C_GREEN,   "▲  BUY"))
         if sell_signal_drawn:
-            items.append(('sym', C_RED,     "▼  SELL signal"))
+            items.append(('sym', C_RED,     "▼  SELL"))
         if breakout_drawn:
-            items.append(('sym', C_ACCENT3, "⚡  Breakout signal"))
+            items.append(('sym', C_ACCENT3, "⚡  Breakout"))
         if is_signal_tf and (buy_signal_drawn or sell_signal_drawn or breakout_drawn):
-            items.append(('inf', C_MUTED,   "Conf TF validated"))
-        if not is_signal_tf:
-            items.append(('inf', C_MUTED,   f"Signals: {self.signal_tf} only"))
+            items.append(('inf', C_MUTED,   "conf TF ✓"))
         items.append(('sp', None, None))
 
         if ob_bull_drawn:
@@ -2181,26 +2210,27 @@ class Dashboard(ctk.CTkFrame):
             items.append(('inf', C_MUTED, "Hover ▲▼⚡ for"))
             items.append(('inf', C_MUTED, "signal details"))
 
-        step = 0.95 / max(len(items), 1)
+        step = 0.94 / max(len(items), 1)
         y    = 0.97
+        _x   = 0.16   # left indent — clears the border line
         for kind, color, text in items:
             if kind == 'sp':
-                y -= step * 0.5
+                y -= step * 0.6
                 continue
             if kind == 'hdr':
                 ka.text(0.5, y, text, transform=ka.transAxes,
-                        color=color, fontsize=8.5, fontweight='bold',
+                        color=color, fontsize=8, fontweight='bold',
                         ha='center', va='top', clip_on=True)
             elif kind == 'inf':
-                ka.text(0.12, y, text, transform=ka.transAxes,
-                        color=color, fontsize=6.8, va='top', ha='left',
+                ka.text(_x, y, text, transform=ka.transAxes,
+                        color=color, fontsize=6.5, va='top', ha='left',
                         fontfamily='monospace', clip_on=True)
             else:  # 'sym'
-                ka.text(0.12, y, text, transform=ka.transAxes,
-                        color=color, fontsize=7, va='top', ha='left', clip_on=True)
+                ka.text(_x, y, text, transform=ka.transAxes,
+                        color=color, fontsize=6.8, va='top', ha='left', clip_on=True)
             y -= step
 
-        self.chart_fig.tight_layout(pad=0.4)
+        self.chart_fig.tight_layout(pad=0.5, rect=[0, 0, 1, 1])
         try:
             self.chart_canvas.draw_idle()
         except Exception:
