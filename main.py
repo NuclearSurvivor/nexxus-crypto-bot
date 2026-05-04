@@ -2083,6 +2083,13 @@ class Dashboard(ctk.CTkFrame):
 
         ax           = self.chart_ax
 
+        # ── Save pan/zoom state BEFORE ax.clear() destroys it ────────────────
+        # ax.clear() resets xlim/ylim to matplotlib defaults (0,1).
+        # Reading them AFTER clear (old behaviour) always restored the default,
+        # not the user's actual zoom level.  Save here; restore in section 9.
+        _pre_xl = ax.get_xlim() if self._zoom_locked else None
+        _pre_yl = ax.get_ylim() if self._zoom_locked else None
+
         # Indicators are pre-computed by _ingest_candles on actual candle arrival
         # and cached in indicator_engine.data[pair].  Reading cached values here
         # is O(1) instead of the previous O(N) recompute on every 1s chart refresh.
@@ -2493,11 +2500,6 @@ class Dashboard(ctk.CTkFrame):
                        linestyle=':', linewidth=0.7, alpha=0.4)
 
         # ── 9. Axes formatting ───────────────────────────────────────────────
-        # Restore user's pan/zoom limits if they've interacted with the chart
-        if self._zoom_locked:
-            _saved_xl = ax.get_xlim()
-            _saved_yl = ax.get_ylim()
-
         ax.xaxis.set_major_formatter(
             mdates.DateFormatter('%H:%M' if tf in ('1m', '5m') else '%m/%d'))
         ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=8))
@@ -2517,9 +2519,10 @@ class Dashboard(ctk.CTkFrame):
             _pad  = (_p_hi - _p_lo) * 0.06
             ax.set_ylim(_p_lo - _pad, _p_hi + _pad)
 
-        if self._zoom_locked:
-            ax.set_xlim(_saved_xl)
-            ax.set_ylim(_saved_yl)
+        # Restore pan/zoom from the pre-clear snapshot (saved before ax.clear()).
+        if self._zoom_locked and _pre_xl is not None:
+            ax.set_xlim(_pre_xl)
+            ax.set_ylim(_pre_yl)
 
         # ── 9a. Live price label — drawn after set_ylim so y position is correct ──
         # The label is clamped to within the visible y-range so it's always shown
