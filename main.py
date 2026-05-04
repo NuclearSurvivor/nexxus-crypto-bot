@@ -15,6 +15,8 @@ Key references:
 import asyncio
 import bisect
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from http.server import SimpleHTTPRequestHandler
 import json
 import math
 import os
@@ -27,7 +29,7 @@ import uuid
 import logging
 import traceback
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
@@ -37,13 +39,9 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import matplotlib.patches as mpatches
-import matplotlib.lines as mlines
 import matplotlib.transforms as mtransforms
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import websockets
-import pytz
-import http.server
 import socketserver
 import engine
 
@@ -54,7 +52,7 @@ from engine import (
     IndicatorEngine, MACrossover, heikin_ashi, normalize_candles, format_price,
     load_credentials, save_credentials, load_trade_history, save_trade_history,
     load_candle_cache, save_candle_cache,
-    load_user_settings, save_user_settings,
+    load_user_settings, save_user_settings, save_config_key,
     make_client, make_ws_jwt,
     TRADING_PAIRS, WATCHLIST_PAIRS, COINBASE_WS_URL, MAX_HISTORY, DISPLAY_CANDLES, FETCH_CANDLES,
     MA_PERIODS, TIMEFRAMES, ORDER_AMOUNT_USD, MINIMUM_RESERVE, WEBHOOK_PORT,
@@ -69,7 +67,7 @@ logging.basicConfig(
     format='%(asctime)s.%(msecs)03d  %(levelname)-5s  %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
-        logging.FileHandler(os.path.join(os.path.dirname(__file__), 'bot.log')),
+        logging.FileHandler(_BOT_LOG_PATH),
         logging.StreamHandler(sys.stdout),
     ]
 )
@@ -254,9 +252,31 @@ plt.rcParams.update({
 # Confirmation TF for each signal TF — one step shorter
 _CONF_TF_MAP = {'1m': '1m', '5m': '1m', '1h': '5m', '1d': '1h'}
 
+# ── Module-level paths and patterns ──────────────────────────────────────────
+_BOT_LOG_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bot.log')
+_FILL_LOG_PAT   = re.compile(
+    r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})'
+    r'.*◆ FILLED (BUY|SELL) ([A-Z]+-[A-Z]+)'
+    r'.*fill_price=\$?([\d.]+)'
+)
+
+# ── Font constants — change "Segoe UI" in one place to retheme the whole UI ──
+_UI  = "Segoe UI"
+_MON = "Courier New"
+_F9   = (_UI,  9);          _F9B  = (_UI,  9, "bold")
+_F10  = (_UI, 10);          _F10B = (_UI, 10, "bold")
+_F11  = (_UI, 11);          _F11B = (_UI, 11, "bold")
+_F12  = (_UI, 12);          _F12B = (_UI, 12, "bold")
+_F13  = (_UI, 13);          _F13B = (_UI, 13, "bold")
+_F14B = (_UI, 14, "bold");  _F15  = (_UI, 15);    _F15B = (_UI, 15, "bold")
+_F17B = (_UI, 17, "bold");  _F18B = (_UI, 18, "bold")
+_F21B = (_UI, 21, "bold");  _F22B = (_UI, 22, "bold")
+_F28B = (_UI, 28, "bold");  _F32  = (_UI, 32);    _F52  = (_UI, 52)
+_FM9  = (_MON,  9);         _FM10 = (_MON, 10);   _FM11 = (_MON, 11);   _FM12 = (_MON, 12)
+
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
-class WebhookHandler(http.server.SimpleHTTPRequestHandler):
+class WebhookHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, app=None, **kwargs):
         self.app = app
         super().__init__(*args, **kwargs)
@@ -314,18 +334,18 @@ class LoginScreen(ctk.CTkFrame):
         logo_ring = ctk.CTkFrame(center, fg_color="transparent",
                                  border_width=1, border_color=C_ACCENT, corner_radius=8)
         logo_ring.pack(pady=(28, 2))
-        ctk.CTkLabel(logo_ring, text="⬡", font=("Segoe UI", 52),
+        ctk.CTkLabel(logo_ring, text="⬡", font=_F52,
                      text_color=C_ACCENT).pack(padx=8, pady=4)
-        ctk.CTkLabel(center, text="NEXXUS", font=("Segoe UI", 28, "bold"),
+        ctk.CTkLabel(center, text="NEXXUS", font=_F28B,
                      text_color=C_TEXT).pack()
-        ctk.CTkLabel(center, text="Crypto Trading Bot", font=("Segoe UI", 13),
+        ctk.CTkLabel(center, text="Crypto Trading Bot", font=_F13,
                      text_color=C_MUTED).pack(pady=(0, 24))
 
         form = ctk.CTkFrame(center, fg_color="transparent")
         form.pack(fill="x", padx=36)
 
         def field(label, widget):
-            ctk.CTkLabel(form, text=label, font=("Segoe UI", 12),
+            ctk.CTkLabel(form, text=label, font=_F12,
                          text_color=C_MUTED).pack(anchor="w", pady=(0, 4))
             widget.pack(fill="x", pady=(0, 12))
 
@@ -339,7 +359,7 @@ class LoginScreen(ctk.CTkFrame):
 
         self.secret_box = ctk.CTkTextbox(
             form, height=90, corner_radius=8, fg_color=C_CARD,
-            border_color=C_BORDER, text_color=C_TEXT, font=("Courier New", 10))
+            border_color=C_BORDER, text_color=C_TEXT, font=_FM10)
         field("EC Private Key (PEM)  ·  ECDSA / ES256 required", self.secret_box)
 
         self.pass_entry = ctk.CTkEntry(
@@ -349,20 +369,20 @@ class LoginScreen(ctk.CTkFrame):
         field("Passphrase (optional)", self.pass_entry)
 
         self.status_lbl = ctk.CTkLabel(form, text="", text_color=C_RED,
-                                        font=("Segoe UI", 11))
+                                        font=_F11)
         self.status_lbl.pack()
 
         ctk.CTkButton(
             form, text="Connect to Coinbase", height=44, corner_radius=10,
             fg_color=C_ACCENT2, hover_color="#6a4de0",
-            font=("Segoe UI", 14, "bold"),
+            font=_F14B,
             command=self._do_login
         ).pack(fill="x", pady=(8, 0))
 
         ctk.CTkLabel(
             center,
             text="Coinbase Advanced Trade API  ·  docs.cdp.coinbase.com/advanced-trade/docs/welcome",
-            font=("Segoe UI", 9), text_color=C_MUTED
+            font=_F9, text_color=C_MUTED
         ).pack(pady=(16, 0))
 
     def _do_login(self):
@@ -409,14 +429,15 @@ class Dashboard(ctk.CTkFrame):
         self._price_ts        = defaultdict(float)   # C4: timestamp of last price update
         self._base_precision  = {}                   # pair → int decimal places for base_size
         self._quote_precision = {}                   # pair → int decimal places for limit_price
-        self.price_history   = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
-        self.candle_history  = {tf: defaultdict(lambda: deque(maxlen=MAX_HISTORY))
+        self.price_history   = defaultdict(partial(deque, maxlen=MAX_HISTORY))
+        self.candle_history  = {tf: defaultdict(partial(deque, maxlen=MAX_HISTORY))
                                  for tf in TIMEFRAMES}
         self.percent_change  = {tf: defaultdict(float) for tf in TIMEFRAMES}
         self.pct_24h         = {}   # true 24h change (last 2 daily candles); None until loaded
         self.trade_history   = load_trade_history()
-        self.order_locks     = defaultdict(bool)
-        self.order_lock_ts   = defaultdict(float)  # when the lock was acquired
+        # order_locks: pair → unix timestamp when locked, absent/None = unlocked.
+        # Single dict replaces the old order_locks (bool) + order_lock_ts (float) pair.
+        self.order_locks: dict = {}
 
         # ── Load persisted user settings ──────────────────────────────────────
         _s = load_user_settings()
@@ -485,17 +506,11 @@ class Dashboard(ctk.CTkFrame):
                 }
 
         if self.last_executed_signal is None:
-            _log_path = os.path.join(os.path.dirname(__file__), 'bot.log')
-            _fill_pat = re.compile(
-                r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})'   # datetime
-                r'.*◆ FILLED (BUY|SELL) ([A-Z]+-[A-Z]+)'     # side + pair
-                r'.*fill_price=\$?([\d.]+)'                   # fill_price
-            )
             _best_fill = None
             try:
-                with open(_log_path, 'r', errors='replace') as _lf:
+                with open(_BOT_LOG_PATH, 'r', errors='replace') as _lf:
                     for _line in _lf:
-                        _m = _fill_pat.search(_line)
+                        _m = _FILL_LOG_PAT.search(_line)
                         if _m:
                             _best_fill = _m   # last match wins (latest entry)
             except Exception:
@@ -575,18 +590,16 @@ class Dashboard(ctk.CTkFrame):
         self.root.after(1000, self._tick_status)
         self.root.after(1000, self._chart_live_tick)   # 1-second live chart refresh
 
-        # Force redraw after any window resize — prevents CTkFrame canvas
-        # artifacts (black rectangles) that appear when inner corner_radius=0
-        # frames are inside corner_radius>0 parents and the window is resized.
         self._resize_timer_id = None
-        def _on_root_configure(event):
-            if event.widget is not self.root:
-                return
-            if self._resize_timer_id is not None:
-                self.root.after_cancel(self._resize_timer_id)
-            self._resize_timer_id = self.root.after(
-                80, lambda: self.root.update_idletasks())
-        self.root.bind("<Configure>", _on_root_configure, add="+")
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
+
+    def _on_root_configure(self, event):
+        """Debounce window resize redraws — prevents CTkFrame canvas artifacts."""
+        if event.widget is not self.root:
+            return
+        if self._resize_timer_id is not None:
+            self.root.after_cancel(self._resize_timer_id)
+        self._resize_timer_id = self.root.after(80, self.root.update_idletasks)
 
     # ── Layout ────────────────────────────────────────────────────────────────
     def _build_layout(self):
@@ -608,14 +621,14 @@ class Dashboard(ctk.CTkFrame):
         logo_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         logo_frame.pack(fill="x", padx=20, pady=(24, 0))
 
-        ctk.CTkLabel(logo_frame, text="⬡", font=("Segoe UI", 32),
+        ctk.CTkLabel(logo_frame, text="⬡", font=_F32,
                      text_color=C_ACCENT).pack(side="left", padx=(0, 10))
 
         txt_col = ctk.CTkFrame(logo_frame, fg_color="transparent")
         txt_col.pack(side="left")
-        ctk.CTkLabel(txt_col, text="NEXXUS", font=("Segoe UI", 18, "bold"),
+        ctk.CTkLabel(txt_col, text="NEXXUS", font=_F18B,
                      text_color=C_TEXT).pack(anchor="w")
-        ctk.CTkLabel(txt_col, text="Trading Terminal", font=("Segoe UI", 10),
+        ctk.CTkLabel(txt_col, text="Trading Terminal", font=_F10,
                      text_color=C_MUTED).pack(anchor="w")
 
         ctk.CTkFrame(self.sidebar, height=1, fg_color=C_BORDER2).pack(
@@ -639,10 +652,10 @@ class Dashboard(ctk.CTkFrame):
         status_row = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         status_row.pack(fill="x", padx=20, pady=(0, 4))
         self.status_dot = ctk.CTkLabel(
-            status_row, text="●", font=("Segoe UI", 10), text_color=C_ORANGE)
+            status_row, text="●", font=_F10, text_color=C_ORANGE)
         self.status_dot.pack(side="left", padx=(0, 6))
         self.status_lbl2 = ctk.CTkLabel(
-            status_row, text="CONNECTING", font=("Segoe UI", 10, "bold"),
+            status_row, text="CONNECTING", font=_F10B,
             text_color=C_ORANGE)
         self.status_lbl2.pack(side="left")
 
@@ -650,7 +663,7 @@ class Dashboard(ctk.CTkFrame):
             self.sidebar, text="  ⬛  Emergency Stop", height=40, corner_radius=8,
             fg_color="#1a0a0a", hover_color="#2d1414",
             border_width=1, border_color="#3d1a1a",
-            text_color=C_RED, font=("Segoe UI", 12, "bold"), anchor="w",
+            text_color=C_RED, font=_F12B, anchor="w",
             command=self.emergency_stop
         ).pack(fill="x", padx=12, pady=(4, 3))
 
@@ -658,7 +671,7 @@ class Dashboard(ctk.CTkFrame):
             self.sidebar, text="  ▶  Resume Trading", height=40, corner_radius=8,
             fg_color="#0a1a0a", hover_color="#152515",
             border_width=1, border_color="#1a3a1a",
-            text_color=C_GREEN, font=("Segoe UI", 12, "bold"), anchor="w",
+            text_color=C_GREEN, font=_F12B, anchor="w",
             state="disabled", command=self.resume_trading)
         self.resume_btn.pack(fill="x", padx=12, pady=3)
 
@@ -666,7 +679,7 @@ class Dashboard(ctk.CTkFrame):
         ctk.CTkFrame(self.sidebar, height=1, fg_color=C_GLOW).pack(
             fill="x", padx=16, pady=(16, 8))
         ctk.CTkLabel(self.sidebar, text="v2.0  ·  Coinbase Advanced Trade",
-                     font=("Segoe UI", 9), text_color=C_MUTED).pack(pady=(0, 16))
+                     font=_F9, text_color=C_MUTED).pack(pady=(0, 16))
 
     def _nav_button(self, name: str, icon: str, label: str, cmd):
         """Create a sidebar nav button with glass active-state accent indicator."""
@@ -688,7 +701,7 @@ class Dashboard(ctk.CTkFrame):
         btn = ctk.CTkButton(
             row, text=f" {icon}   {label}", height=44, corner_radius=8,
             fg_color="transparent", hover_color=C_CARD2,
-            font=("Segoe UI", 13), text_color=C_TEXT2, anchor="w",
+            font=_F13, text_color=C_TEXT2, anchor="w",
             command=cmd
         )
         btn.pack(side="left", fill="both", expand=True, padx=(2, 4))
@@ -707,7 +720,7 @@ class Dashboard(ctk.CTkFrame):
                     fg_color="transparent", border_width=0)
             refs['btn'].configure(
                 text_color=C_TEXT if active else C_TEXT2,
-                font=("Segoe UI", 13, "bold") if active else ("Segoe UI", 13),
+                font=_F13B if active else _F13,
             )
 
     def _build_topbar(self):
@@ -731,7 +744,7 @@ class Dashboard(ctk.CTkFrame):
 
         self.page_title = ctk.CTkLabel(
             left, text="Dashboard",
-            font=("Segoe UI", 17, "bold"), text_color=C_TEXT)
+            font=_F17B, text_color=C_TEXT)
         self.page_title.pack(side="left", padx=(14, 0))
 
         # Centre: live price tickers — glass pills
@@ -743,12 +756,12 @@ class Dashboard(ctk.CTkFrame):
                               border_width=2, border_color=C_BORDER2)
             tf.pack(side="left", padx=6, pady=12)
             ctk.CTkLabel(tf, text=pair.replace("-", "/"),
-                         font=("Segoe UI", 9, "bold"), text_color=C_MUTED).pack(
+                         font=_F9B, text_color=C_MUTED).pack(
                 side="left", padx=(10, 4))
-            price_l = ctk.CTkLabel(tf, text="—", font=("Segoe UI", 11, "bold"),
+            price_l = ctk.CTkLabel(tf, text="—", font=_F11B,
                                    text_color=C_TEXT)
             price_l.pack(side="left", padx=(0, 4))
-            pct_l = ctk.CTkLabel(tf, text="", font=("Segoe UI", 10),
+            pct_l = ctk.CTkLabel(tf, text="", font=_F10,
                                  text_color=C_MUTED)
             pct_l.pack(side="left", padx=(0, 10))
             self._ticker_labels[pair] = {'price': price_l, 'pct': pct_l, 'frame': tf}
@@ -761,13 +774,13 @@ class Dashboard(ctk.CTkFrame):
         right.pack(fill="both", expand=True, padx=12, pady=4)
 
         self.bal_label = ctk.CTkLabel(right, text="Portfolio  —",
-                                       font=("Segoe UI", 11), text_color=C_MUTED)
+                                       font=_F11, text_color=C_MUTED)
         self.bal_label.pack(anchor="e")
         self.pnl_label = ctk.CTkLabel(right, text="P&L  —",
-                                       font=("Segoe UI", 12, "bold"), text_color=C_TEXT)
+                                       font=_F12B, text_color=C_TEXT)
         self.pnl_label.pack(anchor="e")
         self.alloc_label = ctk.CTkLabel(right, text="",
-                                         font=("Segoe UI", 10), text_color=C_ACCENT2)
+                                         font=_F10, text_color=C_ACCENT2)
         self.alloc_label.pack(anchor="e", pady=(1, 0))
 
     def _build_content(self):
@@ -834,12 +847,12 @@ class Dashboard(ctk.CTkFrame):
 
         bs_hdr = ctk.CTkFrame(bsc, fg_color="transparent")
         bs_hdr.pack(fill="x", padx=16, pady=(14, 6))
-        ctk.CTkLabel(bs_hdr, text="⚙  BOT STATUS", font=("Segoe UI", 9, "bold"),
+        ctk.CTkLabel(bs_hdr, text="⚙  BOT STATUS", font=_F9B,
                      text_color=C_MUTED).pack(side="left")
         ctk.CTkButton(
             bs_hdr, text="Copy", width=52, height=22, corner_radius=6,
             fg_color=C_CARD2, hover_color=C_BORDER2, text_color=C_TEXT2,
-            font=("Segoe UI", 9),
+            font=_F9,
             command=self._copy_bot_status
         ).pack(side="right")
 
@@ -849,8 +862,8 @@ class Dashboard(ctk.CTkFrame):
             r = ctk.CTkFrame(bs_grid, fg_color="transparent")
             r.pack(fill="x", pady=2)
             ctk.CTkLabel(r, text=label, width=130, anchor="w",
-                         font=("Segoe UI", 11), text_color=C_TEXT2).pack(side="left")
-            lbl = ctk.CTkLabel(r, text=valtext, font=("Segoe UI", 11, "bold"),
+                         font=_F11, text_color=C_TEXT2).pack(side="left")
+            lbl = ctk.CTkLabel(r, text=valtext, font=_F11B,
                                text_color=col)
             lbl.pack(side="left")
             return lbl
@@ -869,8 +882,8 @@ class Dashboard(ctk.CTkFrame):
             r = ctk.CTkFrame(bs_grid, fg_color="transparent")
             r.pack(fill="x", pady=1)
             ctk.CTkLabel(r, text=f"  └ {coin}", width=130, anchor="w",
-                         font=("Segoe UI", 10), text_color=C_MUTED).pack(side="left")
-            lbl = ctk.CTkLabel(r, text="$0.00", font=("Segoe UI", 10, "bold"),
+                         font=_F10, text_color=C_MUTED).pack(side="left")
+            lbl = ctk.CTkLabel(r, text="$0.00", font=_F10B,
                                text_color=C_MUTED)
             lbl.pack(side="left")
             self._bs_pair_alloc_rows[pair] = (r, lbl)
@@ -881,7 +894,7 @@ class Dashboard(ctk.CTkFrame):
         self._last_sig_frame = ctk.CTkFrame(bsc, fg_color="transparent")
         # Only packed when last_executed_signal is set
         ctk.CTkLabel(self._last_sig_frame, text="LAST EXECUTED SIGNAL",
-                     font=("Segoe UI", 9, "bold"), text_color=C_MUTED).pack(
+                     font=_F9B, text_color=C_MUTED).pack(
             anchor="w", padx=16, pady=(0, 4))
         sig_inner = ctk.CTkFrame(self._last_sig_frame, fg_color=C_CARD2,
                                   corner_radius=10, border_width=1, border_color=C_BORDER2)
@@ -890,30 +903,30 @@ class Dashboard(ctk.CTkFrame):
         sig_top = ctk.CTkFrame(sig_inner, fg_color="transparent")
         sig_top.pack(fill="x", padx=14, pady=(10, 4))
         self._bs_sig_side_lbl = ctk.CTkLabel(sig_top, text="BUY",
-                                              font=("Segoe UI", 15, "bold"),
+                                              font=_F15B,
                                               text_color=C_GREEN)
         self._bs_sig_side_lbl.pack(side="left", padx=(0, 8))
         self._bs_sig_pair_lbl = ctk.CTkLabel(sig_top, text="BTC-USD",
-                                              font=("Segoe UI", 13, "bold"),
+                                              font=_F13B,
                                               text_color=C_TEXT)
         self._bs_sig_pair_lbl.pack(side="left")
         self._bs_sig_src_lbl = ctk.CTkLabel(sig_top, text="MA2/MA5",
-                                             font=("Segoe UI", 10),
+                                             font=_F10,
                                              text_color=C_MUTED)
         self._bs_sig_src_lbl.pack(side="right")
 
         sig_bot = ctk.CTkFrame(sig_inner, fg_color="transparent")
         sig_bot.pack(fill="x", padx=14, pady=(0, 10))
         self._bs_sig_price_lbl = ctk.CTkLabel(sig_bot, text="",
-                                               font=("Segoe UI", 12, "bold"),
+                                               font=_F12B,
                                                text_color=C_ACCENT3)
         self._bs_sig_price_lbl.pack(side="left")
         self._bs_sig_spent_lbl = ctk.CTkLabel(sig_bot, text="",
-                                               font=("Segoe UI", 11),
+                                               font=_F11,
                                                text_color=C_TEXT2)
         self._bs_sig_spent_lbl.pack(side="left", padx=(10, 0))
         self._bs_sig_time_lbl  = ctk.CTkLabel(sig_bot, text="",
-                                               font=("Segoe UI", 10),
+                                               font=_F10,
                                                text_color=C_MUTED)
         self._bs_sig_time_lbl.pack(side="right")
 
@@ -921,7 +934,7 @@ class Dashboard(ctk.CTkFrame):
         acts = ctk.CTkFrame(r3, fg_color=C_CARD, corner_radius=14,
                             border_width=1, border_color=C_BORDER)
         acts.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        ctk.CTkLabel(acts, text="⚡  QUICK ACTIONS", font=("Segoe UI", 9, "bold"),
+        ctk.CTkLabel(acts, text="⚡  QUICK ACTIONS", font=_F9B,
                      text_color=C_MUTED).pack(anchor="w", padx=16, pady=(14, 10))
 
         qa_grid = ctk.CTkFrame(acts, fg_color="transparent")
@@ -931,26 +944,26 @@ class Dashboard(ctk.CTkFrame):
         ctk.CTkButton(qa_grid, text="＋  Allocate to Bot",
                       height=40, corner_radius=9,
                       fg_color=C_ACCENT2, hover_color="#5d47bb",
-                      font=("Segoe UI", 12, "bold"),
+                      font=_F12B,
                       command=self._open_allocate
                       ).grid(row=0, column=0, sticky="ew", padx=(0, 5), pady=(0, 5))
         ctk.CTkButton(qa_grid, text="−  Unallocate",
                       height=40, corner_radius=9,
                       fg_color=C_CARD2, hover_color=C_BORDER2,
-                      border_width=1, border_color=C_BORDER2, font=("Segoe UI", 12),
+                      border_width=1, border_color=C_BORDER2, font=_F12,
                       command=self._open_unallocate
                       ).grid(row=0, column=1, sticky="ew", padx=(5, 0), pady=(0, 5))
         ctk.CTkButton(qa_grid, text="📈  View Charts",
                       height=40, corner_radius=9,
                       fg_color=C_CARD2, hover_color=C_BORDER2,
-                      border_width=1, border_color=C_BORDER2, font=("Segoe UI", 12),
+                      border_width=1, border_color=C_BORDER2, font=_F12,
                       command=self._show_charts
                       ).grid(row=1, column=0, sticky="ew", padx=(0, 5), pady=(5, 0))
         ctk.CTkButton(qa_grid, text="🛑  Sell All → USD",
                       height=40, corner_radius=9,
                       fg_color="#1a0a0a", hover_color="#2d1414",
                       border_width=1, border_color="#3d1a1a",
-                      text_color=C_RED, font=("Segoe UI", 12),
+                      text_color=C_RED, font=_F12,
                       command=self._confirm_sell_all
                       ).grid(row=1, column=1, sticky="ew", padx=(5, 0), pady=(5, 0))
 
@@ -962,16 +975,16 @@ class Dashboard(ctk.CTkFrame):
         af_hdr = ctk.CTkFrame(af, fg_color="transparent")
         af_hdr.pack(fill="x", padx=16, pady=(12, 0))
         # Pulsing dot + accent header
-        ctk.CTkLabel(af_hdr, text="●", font=("Segoe UI", 9),
+        ctk.CTkLabel(af_hdr, text="●", font=_F9,
                      text_color=C_ACCENT).pack(side="left", padx=(0, 6))
-        ctk.CTkLabel(af_hdr, text="ACTIVITY FEED", font=("Segoe UI", 9, "bold"),
+        ctk.CTkLabel(af_hdr, text="ACTIVITY FEED", font=_F9B,
                      text_color=C_ACCENT).pack(side="left")
         tk.Frame(af, height=1, bg=C_BORDER2, bd=0, highlightthickness=0).pack(
             fill="x", padx=0, pady=(8, 0))
 
         self.activity_box = ctk.CTkTextbox(
             af, fg_color="transparent", text_color=C_TEXT,
-            font=("Courier New", 11), state="disabled")
+            font=_FM11, state="disabled")
         self.activity_box.pack(fill="both", expand=True, padx=10, pady=(6, 10))
         return page
 
@@ -984,16 +997,16 @@ class Dashboard(ctk.CTkFrame):
         th = ctk.CTkFrame(card, fg_color="transparent")
         th.pack(fill="x", padx=16, pady=(10, 2))
         if icon:
-            ctk.CTkLabel(th, text=icon, font=("Segoe UI", 11),
+            ctk.CTkLabel(th, text=icon, font=_F11,
                          text_color=color).pack(side="left", padx=(0, 6))
-        ctk.CTkLabel(th, text=title.upper(), font=("Segoe UI", 9, "bold"),
+        ctk.CTkLabel(th, text=title.upper(), font=_F9B,
                      text_color=C_TEXT2).pack(side="left")
         # Value
-        vl = ctk.CTkLabel(card, text=value, font=("Segoe UI", 22, "bold"),
+        vl = ctk.CTkLabel(card, text=value, font=_F22B,
                           text_color=C_TEXT)
         vl.pack(anchor="w", padx=16, pady=(2, 2))
         # Sub-line (P&L change, breakdown, etc.)
-        sl = ctk.CTkLabel(card, text="", font=("Segoe UI", 10), text_color=C_MUTED)
+        sl = ctk.CTkLabel(card, text="", font=_F10, text_color=C_MUTED)
         sl.pack(anchor="w", padx=16, pady=(0, 12))
         card._val = vl
         card._sub = sl
@@ -1007,24 +1020,24 @@ class Dashboard(ctk.CTkFrame):
         # Header: pair name + change badge
         hdr = ctk.CTkFrame(card, fg_color="transparent")
         hdr.pack(fill="x", padx=14, pady=(10, 4))
-        ctk.CTkLabel(hdr, text=f"{coin} / USD", font=("Segoe UI", 11, "bold"),
+        ctk.CTkLabel(hdr, text=f"{coin} / USD", font=_F11B,
                      text_color=C_TEXT2).pack(side="left")
         badge_bg = ctk.CTkFrame(hdr, fg_color=C_GLOW, corner_radius=7,
                                 border_width=1, border_color=C_BORDER2)
         badge_bg.pack(side="right")
         pct_lbl = ctk.CTkLabel(badge_bg, text="  —  ",
-                               font=("Segoe UI", 10, "bold"), text_color=C_MUTED)
+                               font=_F10B, text_color=C_MUTED)
         pct_lbl.pack(padx=2, pady=2)
         # Price (large)
-        price_lbl = ctk.CTkLabel(card, text="—", font=("Segoe UI", 21, "bold"),
+        price_lbl = ctk.CTkLabel(card, text="—", font=_F21B,
                                  text_color=C_TEXT)
         price_lbl.pack(anchor="w", padx=14, pady=(0, 6))
         # H/L row
         hl = ctk.CTkFrame(card, fg_color="transparent")
         hl.pack(fill="x", padx=14, pady=(0, 14))
-        high_lbl = ctk.CTkLabel(hl, text="H  —", font=("Segoe UI", 10), text_color=C_MUTED)
+        high_lbl = ctk.CTkLabel(hl, text="H  —", font=_F10, text_color=C_MUTED)
         high_lbl.pack(side="left", padx=(0, 12))
-        low_lbl = ctk.CTkLabel(hl, text="L  —", font=("Segoe UI", 10), text_color=C_MUTED)
+        low_lbl = ctk.CTkLabel(hl, text="L  —", font=_F10, text_color=C_MUTED)
         low_lbl.pack(side="left")
         card._price     = price_lbl
         card._pct       = pct_lbl
@@ -1063,7 +1076,7 @@ class Dashboard(ctk.CTkFrame):
             values=WATCHLIST_PAIRS,
             width=100, height=32,
             fg_color=C_CARD, button_color=C_CARD2,
-            text_color=C_TEXT2, font=("Segoe UI", 11),
+            text_color=C_TEXT2, font=_F11,
             command=lambda p: (self.chart_pair_var.set(p),
                                _wl_var.set("More ▾"),
                                self._on_chart_pair_change(p))
@@ -1084,44 +1097,44 @@ class Dashboard(ctk.CTkFrame):
 
         # Live price inline
         self.chart_hdr_pair_lbl = ctk.CTkLabel(
-            row, text="BTC/USD", font=("Segoe UI", 10, "bold"), text_color=C_TEXT2)
+            row, text="BTC/USD", font=_F10B, text_color=C_TEXT2)
         self.chart_hdr_pair_lbl.pack(side="left", padx=(0, 6))
 
         self.chart_hdr_price_lbl = ctk.CTkLabel(
-            row, text="—", font=("Segoe UI", 13, "bold"), text_color=C_TEXT)
+            row, text="—", font=_F13B, text_color=C_TEXT)
         self.chart_hdr_price_lbl.pack(side="left", padx=(0, 6))
 
         self.chart_hdr_change_lbl = ctk.CTkLabel(
-            row, text="", font=("Segoe UI", 11), text_color=C_MUTED)
+            row, text="", font=_F11, text_color=C_MUTED)
         self.chart_hdr_change_lbl.pack(side="left", padx=(0, 6))
 
         self.chart_hdr_stats_lbl = ctk.CTkLabel(
-            row, text="", font=("Segoe UI", 10), text_color=C_MUTED)
+            row, text="", font=_F10, text_color=C_MUTED)
         self.chart_hdr_stats_lbl.pack(side="left")
 
         # Right side: allocation readout + buttons + refresh
         ctk.CTkButton(
             row, text="⟳", width=32, height=32, corner_radius=7,
-            fg_color=C_CARD2, hover_color=C_BORDER2, font=("Segoe UI", 13),
+            fg_color=C_CARD2, hover_color=C_BORDER2, font=_F13,
             command=self._refresh_chart
         ).pack(side="right", padx=(4, 0), pady=10)
 
         ctk.CTkButton(
             row, text="Order Book", width=90, height=32, corner_radius=7,
-            fg_color=C_CARD2, hover_color=C_BORDER2, font=("Segoe UI", 10),
+            fg_color=C_CARD2, hover_color=C_BORDER2, font=_F10,
             command=self._open_orderbook
         ).pack(side="right", padx=(0, 3), pady=10)
 
         ctk.CTkButton(
             row, text="−", width=32, height=32, corner_radius=7,
             fg_color=C_CARD2, hover_color=C_BORDER2,
-            border_width=1, border_color=C_BORDER2, font=("Segoe UI", 13),
+            border_width=1, border_color=C_BORDER2, font=_F13,
             command=lambda: self._open_unallocate(self.chart_pair_var.get())
         ).pack(side="right", padx=(3, 0), pady=10)
 
         ctk.CTkButton(
             row, text="＋", width=32, height=32, corner_radius=7,
-            fg_color=C_ACCENT2, hover_color="#5d47bb", font=("Segoe UI", 13, "bold"),
+            fg_color=C_ACCENT2, hover_color="#5d47bb", font=_F13B,
             command=lambda: self._open_allocate(self.chart_pair_var.get())
         ).pack(side="right", padx=(3, 0), pady=10)
 
@@ -1129,11 +1142,11 @@ class Dashboard(ctk.CTkFrame):
             side="right", fill="y", padx=8, pady=10)
 
         self.chart_bot_lbl = ctk.CTkLabel(
-            row, text="Bot —", font=("Segoe UI", 10, "bold"), text_color=C_ACCENT2)
+            row, text="Bot —", font=_F10B, text_color=C_ACCENT2)
         self.chart_bot_lbl.pack(side="right", padx=(0, 4))
 
         self.chart_liquid_lbl = ctk.CTkLabel(
-            row, text="Liquid —", font=("Segoe UI", 10), text_color=C_MUTED)
+            row, text="Liquid —", font=_F10, text_color=C_MUTED)
         self.chart_liquid_lbl.pack(side="right", padx=(0, 2))
 
         ctk.CTkFrame(row, width=1, fg_color=C_BORDER2).pack(
@@ -1182,12 +1195,12 @@ class Dashboard(ctk.CTkFrame):
         # Header
         th = ctk.CTkFrame(page, fg_color="transparent")
         th.pack(fill="x", padx=20, pady=(20, 10))
-        ctk.CTkLabel(th, text="ACTIVE POSITIONS", font=("Segoe UI", 10, "bold"),
+        ctk.CTkLabel(th, text="ACTIVE POSITIONS", font=_F10B,
                      text_color=C_MUTED).pack(side="left")
         ctk.CTkButton(
             th, text="Copy All", width=70, height=26, corner_radius=7,
             fg_color=C_CARD2, hover_color=C_BORDER2, text_color=C_TEXT2,
-            font=("Segoe UI", 9),
+            font=_F9,
             command=self._copy_trades
         ).pack(side="right")
 
@@ -1199,7 +1212,7 @@ class Dashboard(ctk.CTkFrame):
         hdr.pack(fill="x", padx=8, pady=(8, 2))
         for col in ["Pair", "Side", "Qty", "Entry", "Current", "P&L", "SL", "TP"]:
             ctk.CTkLabel(hdr, text=col, width=100,
-                         font=("Segoe UI", 10, "bold"), text_color=C_MUTED).pack(
+                         font=_F10B, text_color=C_MUTED).pack(
                 side="left", padx=4, pady=10)
 
         self.trade_scroll = ctk.CTkScrollableFrame(
@@ -1210,7 +1223,7 @@ class Dashboard(ctk.CTkFrame):
         # History
         hh = ctk.CTkFrame(page, fg_color="transparent")
         hh.pack(fill="x", padx=20, pady=(18, 8))
-        ctk.CTkLabel(hh, text="CLOSED TRADE HISTORY", font=("Segoe UI", 10, "bold"),
+        ctk.CTkLabel(hh, text="CLOSED TRADE HISTORY", font=_F10B,
                      text_color=C_MUTED).pack(side="left")
 
         hf = ctk.CTkFrame(page, fg_color=C_CARD, corner_radius=14,
@@ -1218,7 +1231,7 @@ class Dashboard(ctk.CTkFrame):
         hf.pack(fill="both", expand=True, padx=20, pady=(0, 20))
         self.history_box = ctk.CTkTextbox(
             hf, fg_color="transparent", text_color=C_TEXT,
-            font=("Courier New", 11), state="disabled")
+            font=_FM11, state="disabled")
         self.history_box.pack(fill="both", expand=True, padx=12, pady=12)
         return page
 
@@ -1250,52 +1263,46 @@ class Dashboard(ctk.CTkFrame):
             f.pack(fill="x", pady=(0, 14))
             row = ctk.CTkFrame(f, fg_color="transparent")
             row.pack(fill="x", padx=20, pady=(14, 4))
-            ctk.CTkLabel(row, text=title, font=("Segoe UI", 13, "bold"),
+            ctk.CTkLabel(row, text=title, font=_F13B,
                          text_color=C_ACCENT).pack(side="left")
             if link:
                 ctk.CTkLabel(row, text=f"  ↗ {link}",
-                             font=("Segoe UI", 10), text_color=C_MUTED).pack(side="left")
+                             font=_F10, text_color=C_MUTED).pack(side="left")
             return f
 
         def entry_row(parent, label, var, unit=""):
             r = ctk.CTkFrame(parent, fg_color="transparent")
             r.pack(fill="x", padx=20, pady=(0, 10))
             ctk.CTkLabel(r, text=label, width=240, anchor="w",
-                         font=("Segoe UI", 12), text_color=C_TEXT).pack(side="left")
+                         font=_F12, text_color=C_TEXT).pack(side="left")
             e = ctk.CTkEntry(r, textvariable=var, width=100, height=34,
                              fg_color=C_CARD, border_color=C_BORDER, text_color=C_TEXT)
             e.pack(side="left")
             if unit:
-                ctk.CTkLabel(r, text=f"  {unit}", font=("Segoe UI", 11),
+                ctk.CTkLabel(r, text=f"  {unit}", font=_F11,
                              text_color=C_MUTED).pack(side="left")
             return e
 
         # ── Appearance / Theme ────────────────────────────────────────────────
         def _save_theme(t):
-            cfg = {}
-            if os.path.exists(CONFIG_FILE):
-                try:
-                    with open(CONFIG_FILE) as f: cfg = json.load(f)
-                except Exception: pass
-            cfg["theme"] = t
-            with open(CONFIG_FILE, "w") as f: json.dump(cfg, f, indent=2)
+            save_config_key("theme", t)
 
         app_sec = section("Appearance  /  Theme")
         theme_row = ctk.CTkFrame(app_sec, fg_color="transparent")
         theme_row.pack(fill="x", padx=20, pady=(0, 14))
         ctk.CTkLabel(theme_row, text="Color Theme", width=240, anchor="w",
-                     font=("Segoe UI", 12), text_color=C_TEXT).pack(side="left")
+                     font=_F12, text_color=C_TEXT).pack(side="left")
         _theme_var = ctk.StringVar(value=_ACTIVE_THEME)
         _theme_menu = ctk.CTkOptionMenu(
             theme_row, values=list(THEMES.keys()),
             variable=_theme_var, width=160, height=34,
             fg_color=C_CARD, button_color=C_CARD2,
-            text_color=C_TEXT, font=("Segoe UI", 12),
+            text_color=C_TEXT, font=_F12,
             command=lambda t: _save_theme(t)
         )
         _theme_menu.pack(side="left")
         ctk.CTkLabel(theme_row, text="  (restarts to apply)",
-                     font=("Segoe UI", 10), text_color=C_MUTED).pack(side="left")
+                     font=_F10, text_color=C_MUTED).pack(side="left")
 
         self.sl_var  = ctk.StringVar(value=str(round(STOP_LOSS_PCT * 100, 2)))
         self.tp_var  = ctk.StringVar(value=str(round(TAKE_PROFIT_PCT * 100, 2)))
@@ -1317,7 +1324,7 @@ class Dashboard(ctk.CTkFrame):
         tf_row = ctk.CTkFrame(risk, fg_color="transparent")
         tf_row.pack(fill="x", padx=20, pady=(0, 12))
         ctk.CTkLabel(tf_row, text="Signal Timeframe", width=240, anchor="w",
-                     font=("Segoe UI", 12), text_color=C_TEXT).pack(side="left")
+                     font=_F12, text_color=C_TEXT).pack(side="left")
         self.signal_tf_var = ctk.StringVar(value=self.signal_tf)
         ctk.CTkSegmentedButton(
             tf_row, values=["1m", "5m", "1h", "1d"],
@@ -1329,14 +1336,14 @@ class Dashboard(ctk.CTkFrame):
             risk,
             text="  Signals fire on completed candles of this timeframe.\n"
                  "  1m = fastest, most noise  ·  5m = balanced  ·  1h/1d = slower, higher conviction",
-            font=("Segoe UI", 10), text_color=C_MUTED, justify="left",
+            font=_F10, text_color=C_MUTED, justify="left",
         ).pack(anchor="w", padx=20, pady=(0, 10))
 
         # ── Signal direction ──────────────────────────────────────────────────
         dir_row = ctk.CTkFrame(risk, fg_color="transparent")
         dir_row.pack(fill="x", padx=20, pady=(0, 4))
         ctk.CTkLabel(dir_row, text="Signal Direction", width=240, anchor="w",
-                     font=("Segoe UI", 12), text_color=C_TEXT).pack(side="left")
+                     font=_F12, text_color=C_TEXT).pack(side="left")
         self.signal_dir_var = ctk.StringVar(value=self.signal_direction)
         ctk.CTkSegmentedButton(
             dir_row, values=["Both", "Buy Only", "Sell Only"],
@@ -1347,14 +1354,14 @@ class Dashboard(ctk.CTkFrame):
         ctk.CTkLabel(
             risk,
             text="  Both = act on every signal  ·  Buy Only / Sell Only = ignore the other side",
-            font=("Segoe UI", 10), text_color=C_MUTED, justify="left",
+            font=_F10, text_color=C_MUTED, justify="left",
         ).pack(anchor="w", padx=20, pady=(0, 10))
 
         # ── Auto-Compound ─────────────────────────────────────────────────────
         ac_row = ctk.CTkFrame(risk, fg_color="transparent")
         ac_row.pack(fill="x", padx=20, pady=(0, 6))
         ctk.CTkLabel(ac_row, text="Auto-Compound Profits", width=240, anchor="w",
-                     font=("Segoe UI", 12), text_color=C_TEXT).pack(side="left")
+                     font=_F12, text_color=C_TEXT).pack(side="left")
         self.ac_enabled_var = ctk.BooleanVar(value=self.auto_compound_enabled)
         ctk.CTkSwitch(ac_row, text="", variable=self.ac_enabled_var,
                       width=48, height=24,
@@ -1368,12 +1375,12 @@ class Dashboard(ctk.CTkFrame):
             risk,
             text="  When ON, order size = avail_funds × pct% (capped at max).\n"
                  "  Profits automatically scale trade sizes up to the cap.",
-            font=("Segoe UI", 10), text_color=C_MUTED, justify="left",
+            font=_F10, text_color=C_MUTED, justify="left",
         ).pack(anchor="w", padx=20, pady=(0, 10))
 
         ctk.CTkButton(risk, text="Save Settings", width=140, height=36, corner_radius=9,
                       fg_color=C_ACCENT2, hover_color="#5d47bb",
-                      font=("Segoe UI", 12, "bold"),
+                      font=_F12B,
                       command=self._save_settings).pack(anchor="w", padx=20, pady=(0, 14))
 
         # ── Moving Averages ───────────────────────────────────────────────────
@@ -1382,13 +1389,13 @@ class Dashboard(ctk.CTkFrame):
             ma_sec,
             text="Enter up to 3 periods separated by commas.  "
                  "The two shortest are used for crossover signals.",
-            font=("Segoe UI", 11), text_color=C_TEXT2, justify="left",
+            font=_F11, text_color=C_TEXT2, justify="left",
         ).pack(anchor="w", padx=20, pady=(0, 10))
 
         ma_row = ctk.CTkFrame(ma_sec, fg_color="transparent")
         ma_row.pack(fill="x", padx=20, pady=(0, 6))
         ctk.CTkLabel(ma_row, text="Periods", width=120, anchor="w",
-                     font=("Segoe UI", 12), text_color=C_TEXT).pack(side="left")
+                     font=_F12, text_color=C_TEXT).pack(side="left")
         self.ma_periods_var = ctk.StringVar(
             value=", ".join(str(p) for p in self.custom_ma_periods))
         ctk.CTkEntry(ma_row, textvariable=self.ma_periods_var,
@@ -1399,13 +1406,13 @@ class Dashboard(ctk.CTkFrame):
         ctk.CTkLabel(
             ma_sec,
             text="  Examples:  2, 5, 14 (1h)  ·  3, 5, 14 (1h)  ·  9, 20, 50  ·  7, 14, 28  ·  50, 200",
-            font=("Segoe UI", 10), text_color=C_MUTED,
+            font=_F10, text_color=C_MUTED,
         ).pack(anchor="w", padx=20, pady=(0, 4))
 
         ctk.CTkButton(ma_sec, text="Apply MAs", width=120, height=34, corner_radius=9,
                       fg_color=C_CARD2, hover_color=C_BORDER2,
                       border_width=1, border_color=C_BORDER2,
-                      font=("Segoe UI", 12, "bold"), text_color=C_TEXT,
+                      font=_F12B, text_color=C_TEXT,
                       command=self._apply_ma_settings).pack(anchor="w", padx=20, pady=(0, 14))
 
         # ── Swap on Sell ──────────────────────────────────────────────────────
@@ -1414,7 +1421,7 @@ class Dashboard(ctk.CTkFrame):
             swap_sec,
             text="When a sell signal fires (or SL/TP is hit), automatically use the\n"
                  "proceeds to buy another asset instead of holding USD.",
-            font=("Segoe UI", 11), text_color=C_TEXT2, justify="left",
+            font=_F11, text_color=C_TEXT2, justify="left",
         ).pack(anchor="w", padx=20, pady=(0, 12))
 
         self.swap_vars = {}
@@ -1433,7 +1440,7 @@ class Dashboard(ctk.CTkFrame):
             r.pack(fill="x", padx=20, pady=(0, 10))
             ctk.CTkLabel(r, text=f"{coin} / USD  →",
                          width=110, anchor="w",
-                         font=("Segoe UI", 12, "bold"), text_color=C_TEXT).pack(side="left")
+                         font=_F12B, text_color=C_TEXT).pack(side="left")
             ctk.CTkSegmentedButton(
                 r, values=opts, variable=var, height=34
             ).pack(side="left")
@@ -1442,7 +1449,7 @@ class Dashboard(ctk.CTkFrame):
             swap_sec,
             text='  "USD" keeps proceeds as cash.  "USDC"/"USDT" stays in stablecoins.  '
                  'Any coin entry immediately places a buy order for that pair.',
-            font=("Segoe UI", 10), text_color=C_MUTED, justify="left",
+            font=_F10, text_color=C_MUTED, justify="left",
         ).pack(anchor="w", padx=20, pady=(0, 14))
 
         api = section("API Credentials",
@@ -1452,7 +1459,7 @@ class Dashboard(ctk.CTkFrame):
             text="Credentials auto-saved to config.json next to the app.\n"
                  "To rotate keys: visit portal.cdp.coinbase.com → API Keys → create new key\n"
                  "Required permissions:  trade  (to place/cancel orders)  +  view  (balances, prices)",
-            font=("Segoe UI", 11), text_color=C_MUTED, justify="left"
+            font=_F11, text_color=C_MUTED, justify="left"
         ).pack(anchor="w", padx=20, pady=(0, 14))
 
         links = section("Useful Links")
@@ -1467,8 +1474,8 @@ class Dashboard(ctk.CTkFrame):
             r = ctk.CTkFrame(links, fg_color="transparent")
             r.pack(fill="x", padx=20, pady=2)
             ctk.CTkLabel(r, text=f"• {label}", width=300, anchor="w",
-                         font=("Segoe UI", 11), text_color=C_TEXT).pack(side="left")
-            ctk.CTkLabel(r, text=url, font=("Segoe UI", 10),
+                         font=_F11, text_color=C_TEXT).pack(side="left")
+            ctk.CTkLabel(r, text=url, font=_F10,
                          text_color=C_ACCENT).pack(side="left")
         ctk.CTkFrame(links, height=12, fg_color="transparent").pack()
 
@@ -1495,22 +1502,22 @@ class Dashboard(ctk.CTkFrame):
         logs_tab = tabs.tab("Logs")
         lhdr = ctk.CTkFrame(logs_tab, fg_color="transparent")
         lhdr.pack(fill="x", pady=(4, 8))
-        ctk.CTkLabel(lhdr, text="SIGNALS  ·  FILLS  ·  ERRORS", font=("Segoe UI", 9, "bold"),
+        ctk.CTkLabel(lhdr, text="SIGNALS  ·  FILLS  ·  ERRORS", font=_F9B,
                      text_color=C_MUTED).pack(side="left")
         ctk.CTkButton(lhdr, text="Clear", width=68, height=26, corner_radius=6,
                       fg_color=C_CARD2, hover_color=C_BORDER2,
                       border_width=1, border_color=C_BORDER,
-                      font=("Segoe UI", 10), text_color=C_TEXT2,
+                      font=_F10, text_color=C_TEXT2,
                       command=self._clear_logs).pack(side="right", padx=(4, 0))
         ctk.CTkButton(lhdr, text="⎘ Copy", width=72, height=26, corner_radius=6,
                       fg_color=C_CARD2, hover_color=C_BORDER2,
                       border_width=1, border_color=C_BORDER,
-                      font=("Segoe UI", 10), text_color=C_TEXT2,
+                      font=_F10, text_color=C_TEXT2,
                       command=self._copy_logs).pack(side="right", padx=(4, 0))
         ctk.CTkButton(lhdr, text="💾 Save", width=72, height=26, corner_radius=6,
                       fg_color=C_CARD2, hover_color=C_BORDER2,
                       border_width=1, border_color=C_BORDER,
-                      font=("Segoe UI", 10), text_color=C_TEXT2,
+                      font=_F10, text_color=C_TEXT2,
                       command=self._save_logs).pack(side="right", padx=(4, 0))
         self.log_filter = ctk.StringVar(value="All")
         ctk.CTkSegmentedButton(lhdr, values=["All", "Trades", "Errors"],
@@ -1518,7 +1525,7 @@ class Dashboard(ctk.CTkFrame):
                                 command=self._filter_logs).pack(side="right", padx=10)
         self.log_box = ctk.CTkTextbox(
             logs_tab, fg_color="transparent",
-            text_color=C_TEXT, font=("Courier New", 12), state="disabled")
+            text_color=C_TEXT, font=_FM12, state="disabled")
         self.log_box.pack(fill="both", expand=True)
 
         # ── Monitor tab ───────────────────────────────────────────────────────
@@ -1526,20 +1533,20 @@ class Dashboard(ctk.CTkFrame):
         mhdr = ctk.CTkFrame(mon_tab, fg_color="transparent")
         mhdr.pack(fill="x", pady=(4, 8))
         ctk.CTkLabel(mhdr, text="BALANCE SYNC  ·  WS HEARTBEAT  ·  POSITION TICKS",
-                     font=("Segoe UI", 9, "bold"), text_color=C_MUTED).pack(side="left")
+                     font=_F9B, text_color=C_MUTED).pack(side="left")
         ctk.CTkButton(mhdr, text="Clear", width=68, height=26, corner_radius=6,
                       fg_color=C_CARD2, hover_color=C_BORDER2,
                       border_width=1, border_color=C_BORDER,
-                      font=("Segoe UI", 10), text_color=C_TEXT2,
+                      font=_F10, text_color=C_TEXT2,
                       command=self._clear_monitor).pack(side="right", padx=(4, 0))
         ctk.CTkButton(mhdr, text="⎘ Copy", width=72, height=26, corner_radius=6,
                       fg_color=C_CARD2, hover_color=C_BORDER2,
                       border_width=1, border_color=C_BORDER,
-                      font=("Segoe UI", 10), text_color=C_TEXT2,
+                      font=_F10, text_color=C_TEXT2,
                       command=self._copy_monitor).pack(side="right", padx=(4, 0))
         self.monitor_box = ctk.CTkTextbox(
             mon_tab, fg_color="transparent",
-            text_color=C_TEXT2, font=("Courier New", 11), state="disabled")
+            text_color=C_TEXT2, font=_FM11, state="disabled")
         self.monitor_box.pack(fill="both", expand=True)
 
         self._all_logs     = []   # (entry, color, level) — non-monitor messages
@@ -1570,7 +1577,7 @@ class Dashboard(ctk.CTkFrame):
         if message == getattr(self, '_last_log_msg', None):
             return
         self._last_log_msg = message
-        now   = datetime.now(pytz.UTC)
+        now   = datetime.now(timezone.utc)
         ts_ui = now.strftime("%H:%M:%S")
         entry = f"[{ts_ui}] {message}\n"
         # Write to bot.log with full date + ms and level tag
@@ -1673,9 +1680,8 @@ class Dashboard(ctk.CTkFrame):
             )
             if not path:
                 return
-            bot_log = os.path.join(os.path.dirname(__file__), 'bot.log')
-            if os.path.exists(bot_log):
-                shutil.copy2(bot_log, path)
+            if os.path.exists(_BOT_LOG_PATH):
+                shutil.copy2(_BOT_LOG_PATH, path)
                 self.log_message(f"Logs saved → {path}", "info")
             else:
                 # Fall back to saving the in-memory log box content
@@ -2154,10 +2160,11 @@ class Dashboard(ctk.CTkFrame):
             pass
 
         ax.clear()
+        self._price_line_artist = None   # ax.clear() destroys all artists; reset ref
         ax.set_facecolor(C_CHART_BG)
         ax.grid(True, color="#1e2330", linewidth=0.5, alpha=0.5)
 
-        ts     = [datetime.fromtimestamp(c[0]/1000, pytz.UTC) for c in data]
+        ts     = [datetime.fromtimestamp(c[0]/1000, timezone.utc) for c in data]
         opens  = np.array([c[1] for c in data])
         highs  = np.array([c[2] for c in data])
         lows   = np.array([c[3] for c in data])
@@ -2183,7 +2190,7 @@ class Dashboard(ctk.CTkFrame):
         ob_bull_drawn = ob_bear_drawn = False
         obs_visible = [ob for ob in ind['order_blocks'] if ob[0] >= chart_start_ms][-3:]
         for ob_ts, ob_high, ob_low, is_bull in obs_visible:
-            x_start = datetime.fromtimestamp(ob_ts / 1000, pytz.UTC)
+            x_start = datetime.fromtimestamp(ob_ts / 1000, timezone.utc)
             x_end   = ts[-1]
             color   = C_GREEN if is_bull else C_RED
             ax.fill_betweenx([ob_low, ob_high], x_start, x_end,
@@ -2208,7 +2215,7 @@ class Dashboard(ctk.CTkFrame):
         fvgs_visible = [fvg for fvg in ind['fair_value_gaps']
                         if fvg[0] >= chart_start_ms and fvg[0] >= _fvg_min_ts][-3:]
         for fvg_ts, fvg_high, fvg_low, is_bull in fvgs_visible:
-            x_start = datetime.fromtimestamp(fvg_ts / 1000, pytz.UTC)
+            x_start = datetime.fromtimestamp(fvg_ts / 1000, timezone.utc)
             x_end   = ts[-1]
             color   = "#00bcd4" if is_bull else "#e040fb"
             ax.fill_betweenx([fvg_low, fvg_high], x_start, x_end,
@@ -2466,7 +2473,7 @@ class Dashboard(ctk.CTkFrame):
             # Keep _les_dt as UTC-aware — mdates.date2num treats naive datetimes
             # as local time, which would shift the hover hit-box by the UTC offset.
             try:
-                _les_dt  = datetime.fromtimestamp(_les['ts'], pytz.UTC)
+                _les_dt  = datetime.fromtimestamp(_les['ts'], timezone.utc)
                 _les_x   = mdates.date2num(_les_dt)
                 _xl      = ax.get_xlim()
                 _offset  = signal_offset
@@ -2564,7 +2571,7 @@ class Dashboard(ctk.CTkFrame):
         if _es and _es.get('pair') == pair:
             _la = _es['side']
             _lp = format_price(_es['price'])
-            _lt = datetime.fromtimestamp(_es['ts'], pytz.UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
+            _lt = datetime.fromtimestamp(_es['ts'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
             _lc = C_GREEN if _la == 'buy' else C_RED
             _lm = "▲ EXECUTED BUY" if _la == 'buy' else "▼ EXECUTED SELL"
             _src = _es.get('source', '')
@@ -2746,7 +2753,7 @@ class Dashboard(ctk.CTkFrame):
             _la = _es_key['side']
             _lp = format_price(_es_key['price'])
             try:
-                _lt = datetime.fromtimestamp(_es_key['ts'], pytz.UTC).strftime('%m-%d %H:%M')
+                _lt = datetime.fromtimestamp(_es_key['ts'], timezone.utc).strftime('%m-%d %H:%M')
             except Exception:
                 _lt = ''
             _lc = C_GREEN if _la == 'buy' else C_RED
@@ -2868,17 +2875,17 @@ class Dashboard(ctk.CTkFrame):
         hdr = ctk.CTkFrame(win, fg_color=C_PANEL, corner_radius=0)
         hdr.pack(fill="x", pady=(0, 2))
         ctk.CTkLabel(hdr, text=f"{pair}  Order Book",
-                     font=("Segoe UI", 13, "bold"), text_color=C_TEXT).pack(
+                     font=_F13B, text_color=C_TEXT).pack(
             side="left", padx=14, pady=8)
         self._ob_spread_lbl = ctk.CTkLabel(
-            hdr, text="Spread: —", font=("Segoe UI", 10), text_color=C_MUTED)
+            hdr, text="Spread: —", font=_F10, text_color=C_MUTED)
         self._ob_spread_lbl.pack(side="right", padx=14)
 
         _col_hdr = "  Price                    Size         Cumulative"
-        _mono    = ("Courier New", 10)
+        _mono    = _FM10
 
         # Asks (single tk.Text — one write per refresh vs 20 CTkLabel.configure calls)
-        ctk.CTkLabel(win, text=_col_hdr, font=("Courier New", 9),
+        ctk.CTkLabel(win, text=_col_hdr, font=_FM9,
                      text_color=C_MUTED, anchor="w").pack(fill="x", padx=10, pady=(4, 0))
         self._ob_ask_text = tk.Text(
             win, font=_mono, height=12, bg=C_CARD, fg=C_RED,
@@ -2890,14 +2897,14 @@ class Dashboard(ctk.CTkFrame):
         mid_frame = ctk.CTkFrame(win, fg_color=C_CARD2, corner_radius=0, height=30)
         mid_frame.pack(fill="x", padx=0, pady=4)
         self._ob_mid_lbl = ctk.CTkLabel(
-            mid_frame, text="—", font=("Segoe UI", 12, "bold"), text_color=C_TEXT)
+            mid_frame, text="—", font=_F12B, text_color=C_TEXT)
         self._ob_mid_lbl.pack(side="left", padx=14, pady=4)
         self._ob_imb_lbl = ctk.CTkLabel(
-            mid_frame, text="", font=("Segoe UI", 10), text_color=C_MUTED)
+            mid_frame, text="", font=_F10, text_color=C_MUTED)
         self._ob_imb_lbl.pack(side="right", padx=14)
 
         # Bids
-        ctk.CTkLabel(win, text=_col_hdr, font=("Courier New", 9),
+        ctk.CTkLabel(win, text=_col_hdr, font=_FM9,
                      text_color=C_MUTED, anchor="w").pack(fill="x", padx=10, pady=(0, 0))
         self._ob_bid_text = tk.Text(
             win, font=_mono, height=12, bg=C_CARD, fg=C_GREEN,
@@ -3196,7 +3203,7 @@ class Dashboard(ctk.CTkFrame):
                 lbls = {}
                 for col in ["pair","side","qty","entry","cur","pl","sl","tp"]:
                     lb = ctk.CTkLabel(rf, text="", width=100,
-                                      font=("Segoe UI", 11), text_color=C_TEXT)
+                                      font=_F11, text_color=C_TEXT)
                     lb.pack(side="left", padx=4, pady=8)
                     lbls[col] = lb
                 rf._labels = lbls
@@ -3235,7 +3242,7 @@ class Dashboard(ctk.CTkFrame):
         win = self._popup("Allocate to Bot", 460, 560)
 
         ctk.CTkLabel(win, text="＋  Allocate to Bot",
-                     font=("Segoe UI", 15, "bold"), text_color=C_TEXT).pack(pady=(18, 0))
+                     font=_F15B, text_color=C_TEXT).pack(pady=(18, 0))
 
         # ── Mode toggle ───────────────────────────────────────────────────────
         mode_var = ctk.StringVar(value="USD Budget")
@@ -3300,18 +3307,18 @@ class Dashboard(ctk.CTkFrame):
                     height=54, corner_radius=10,
                     fg_color=C_CARD, hover_color=C_BORDER,
                     border_width=1, border_color=C_BORDER,
-                    font=("Segoe UI", 11, "bold"), text_color=C_ACCENT3,
+                    font=_F11B, text_color=C_ACCENT3,
                     command=lambda k=lbl: _select_source(k))
                 btn.pack(side="left", expand=True, fill="x", padx=(0, 6))
                 _usd_source_cards.append((lbl, btn, val))
 
             ctk.CTkLabel(usd_frame,
                          text=f"Total liquid:  ${self.usd_balance:,.2f}",
-                         font=("Segoe UI", 11), text_color=C_MUTED).pack(anchor="w", pady=(2, 6))
+                         font=_F11, text_color=C_MUTED).pack(anchor="w", pady=(2, 6))
 
             prow = ctk.CTkFrame(usd_frame, fg_color="transparent")
             prow.pack(fill="x", pady=(0, 4))
-            ctk.CTkLabel(prow, text="Allocate to pair:", font=("Segoe UI", 12),
+            ctk.CTkLabel(prow, text="Allocate to pair:", font=_F12,
                          text_color=C_TEXT).pack(side="left", padx=(0, 8))
             _pair_labels = [p.split("-")[0] for p in TRADING_PAIRS]
             _seg = ctk.CTkSegmentedButton(
@@ -3325,7 +3332,7 @@ class Dashboard(ctk.CTkFrame):
                 pair_var.set(TRADING_PAIRS[0])
             _seg.pack(side="left")
 
-            bot_lbl = ctk.CTkLabel(usd_frame, text="", font=("Segoe UI", 10),
+            bot_lbl = ctk.CTkLabel(usd_frame, text="", font=_F10,
                                    text_color=C_MUTED)
             bot_lbl.pack(anchor="w", pady=(0, 4))
             _usd_bot_lbl_ref[0] = bot_lbl
@@ -3344,7 +3351,7 @@ class Dashboard(ctk.CTkFrame):
         coin_frame  = ctk.CTkFrame(mode_area, fg_color="transparent")
         pair_row_h  = ctk.CTkFrame(coin_frame, fg_color="transparent")
         pair_row_h.pack(fill="x", pady=(0, 4))
-        info_lbl_h  = ctk.CTkLabel(coin_frame, text="", font=("Segoe UI", 11),
+        info_lbl_h  = ctk.CTkLabel(coin_frame, text="", font=_F11,
                                    text_color=C_MUTED)
         info_lbl_h.pack(anchor="w", pady=(0, 4))
 
@@ -3364,7 +3371,7 @@ class Dashboard(ctk.CTkFrame):
                     hover_color="#6a4de0" if is_sel else C_BORDER,
                     border_width=2 if is_sel else 1,
                     border_color=C_ACCENT2 if is_sel else C_BORDER,
-                    font=("Segoe UI", 11, "bold"), text_color=C_TEXT,
+                    font=_F11B, text_color=C_TEXT,
                     command=lambda pp=p: _select_coin(pp))
                 btn.pack(side="left", padx=(0, 8))
                 btn._pair = p
@@ -3399,19 +3406,19 @@ class Dashboard(ctk.CTkFrame):
         alloc_all_row = ctk.CTkFrame(bottom, fg_color="transparent")
         alloc_all_row.pack(fill="x", pady=(0, 6))
         ctk.CTkLabel(alloc_all_row, text="Allocate All Available",
-                     font=("Segoe UI", 12), text_color=C_ACCENT3).pack(side="left")
+                     font=_F12, text_color=C_ACCENT3).pack(side="left")
         alloc_all_sw = ctk.CTkSwitch(alloc_all_row, text="", variable=alloc_all_var,
                                      width=44, button_color=C_ACCENT3,
                                      progress_color=C_ACCENT2)
         alloc_all_sw.pack(side="right")
 
         # Amount label + entry
-        input_lbl = ctk.CTkLabel(bottom, text="Amount in USD", font=("Segoe UI", 12),
+        input_lbl = ctk.CTkLabel(bottom, text="Amount in USD", font=_F12,
                                  text_color=C_MUTED)
         input_lbl.pack(anchor="w", pady=(0, 4))
         amt = ctk.CTkEntry(bottom, placeholder_text="0.00", height=42,
                            fg_color=C_CARD, border_color=C_BORDER,
-                           text_color=C_TEXT, font=("Segoe UI", 15))
+                           text_color=C_TEXT, font=_F15)
         amt.pack(fill="x")
         amt.focus()
 
@@ -3422,7 +3429,7 @@ class Dashboard(ctk.CTkFrame):
         for pct in (25, 50, 75, 100):
             b = ctk.CTkButton(qrow, text=f"{pct}%", width=72, height=28,
                               corner_radius=6, fg_color=C_CARD, hover_color=C_BORDER,
-                              font=("Segoe UI", 11), text_color=C_MUTED)
+                              font=_F11, text_color=C_MUTED)
             b.pack(side="left", padx=(0, 6))
             qbtns.append((pct, b))
 
@@ -3519,7 +3526,7 @@ class Dashboard(ctk.CTkFrame):
         usd_frame.pack(fill="x", in_=mode_area)
         _update_qfill()
 
-        err = ctk.CTkLabel(bottom, text="", text_color=C_RED, font=("Segoe UI", 11))
+        err = ctk.CTkLabel(bottom, text="", text_color=C_RED, font=_F11)
         err.pack(pady=(6, 2))
 
         def confirm():
@@ -3570,23 +3577,23 @@ class Dashboard(ctk.CTkFrame):
 
         ctk.CTkButton(bottom, text="Confirm Allocation", height=44, corner_radius=10,
                       fg_color=C_ACCENT2, hover_color="#6a4de0",
-                      font=("Segoe UI", 13, "bold"), command=confirm).pack(fill="x", pady=(0, 12))
+                      font=_F13B, command=confirm).pack(fill="x", pady=(0, 12))
 
     def _open_unallocate(self, default_pair: str = None):
         win = self._popup("Unallocate from Bot", 440, 400)
 
         ctk.CTkLabel(win, text="−  Unallocate Funds from Bot",
-                     font=("Segoe UI", 15, "bold"), text_color=C_TEXT).pack(pady=(24, 2))
+                     font=_F15B, text_color=C_TEXT).pack(pady=(24, 2))
 
         total_alloc = sum(self.bot_pair_alloc.values()) + self.bot_balance
         ctk.CTkLabel(win, text=f"Total bot funds:  ${total_alloc:,.2f}",
-                     font=("Segoe UI", 12), text_color=C_MUTED).pack(pady=(0, 4))
+                     font=_F12, text_color=C_MUTED).pack(pady=(0, 4))
 
         form = ctk.CTkFrame(win, fg_color="transparent")
         form.pack(fill="x", padx=36, pady=(4, 0))
 
         # ── Coin selector ─────────────────────────────────────────────────────
-        ctk.CTkLabel(form, text="Coin Wallet", font=("Segoe UI", 12),
+        ctk.CTkLabel(form, text="Coin Wallet", font=_F12,
                      text_color=C_MUTED).pack(anchor="w", pady=(0, 6))
 
         # Default to whichever pair has the most allocation
@@ -3609,7 +3616,7 @@ class Dashboard(ctk.CTkFrame):
                 hover_color="#6a4de0" if is_sel else C_BORDER,
                 border_width=2 if is_sel else 1,
                 border_color=C_ACCENT2 if is_sel else C_BORDER,
-                font=("Segoe UI", 11, "bold"), text_color=C_TEXT,
+                font=_F11B, text_color=C_TEXT,
             )
             btn.pack(side="left", padx=(0, 8))
             btn._pair = p
@@ -3617,19 +3624,19 @@ class Dashboard(ctk.CTkFrame):
         avail_lbl = ctk.CTkLabel(
             form,
             text=f"Available to unallocate: ${self.bot_pair_alloc.get(pair_var.get(), 0):,.2f}",
-            font=("Segoe UI", 11), text_color=C_MUTED)
+            font=_F11, text_color=C_MUTED)
         avail_lbl.pack(anchor="w", pady=(0, 10))
 
         amt = ctk.CTkEntry(form, placeholder_text="0.00", height=42,
                            fg_color=C_CARD, border_color=C_BORDER,
-                           text_color=C_TEXT, font=("Segoe UI", 15))
+                           text_color=C_TEXT, font=_F15)
 
         qrow = ctk.CTkFrame(form, fg_color="transparent")
         qbtns_u = []
         for pct in (25, 50, 75, 100):
             b = ctk.CTkButton(qrow, text=f"{pct}%", width=70, height=28,
                               corner_radius=6, fg_color=C_CARD, hover_color=C_BORDER,
-                              font=("Segoe UI", 11), text_color=C_MUTED)
+                              font=_F11, text_color=C_MUTED)
             b.pack(side="left", padx=(0, 6))
             qbtns_u.append((pct, b))
 
@@ -3658,14 +3665,14 @@ class Dashboard(ctk.CTkFrame):
         for b in u_btns:
             b.configure(command=lambda p=b._pair, bs=u_btns: _sel_pair_u(p, bs))
 
-        ctk.CTkLabel(form, text="Amount (USD)", font=("Segoe UI", 12),
+        ctk.CTkLabel(form, text="Amount (USD)", font=_F12,
                      text_color=C_MUTED).pack(anchor="w", pady=(0, 6))
         amt.pack(fill="x")
         amt.focus()
         qrow.pack(fill="x", pady=(6, 0))
         _update_u_qfill()
 
-        err = ctk.CTkLabel(form, text="", text_color=C_RED, font=("Segoe UI", 11))
+        err = ctk.CTkLabel(form, text="", text_color=C_RED, font=_F11)
         err.pack(pady=(8, 4))
 
         def confirm():
@@ -3692,7 +3699,7 @@ class Dashboard(ctk.CTkFrame):
         ctk.CTkButton(form, text="Confirm Unallocate", height=44, corner_radius=10,
                       fg_color=C_CARD, hover_color=C_BORDER,
                       border_width=1, border_color=C_BORDER,
-                      font=("Segoe UI", 13, "bold"), text_color=C_TEXT,
+                      font=_F13B, text_color=C_TEXT,
                       command=confirm).pack(fill="x")
 
     def _confirm_sell_all(self):
@@ -3757,8 +3764,9 @@ class Dashboard(ctk.CTkFrame):
                 for p in TRADING_PAIRS
                 if self.swap_vars[p].get() != 'USD'
             ) or 'none'
-            # ── Persist to config.json ────────────────────────────────────────
-            save_user_settings({
+            # ── Persist to config.json (merge so bot_balance etc. are preserved) ──
+            s = load_user_settings()
+            s.update({
                 'signal_tf':               self.signal_tf,
                 'signal_direction':        self.signal_direction,
                 'ma_periods':              list(self.custom_ma_periods),
@@ -3773,6 +3781,7 @@ class Dashboard(ctk.CTkFrame):
                 'auto_compound_pct':       self.auto_compound_pct,
                 'auto_compound_cap':       self.auto_compound_cap,
             })
+            save_user_settings(s)
             self.log_message(
                 f"Settings saved  ·  Signal TF: {self.signal_tf}  ·  Swaps: {swap_summary}",
                 "trade")
@@ -3797,24 +3806,10 @@ class Dashboard(ctk.CTkFrame):
         MA_PERIODS = periods
         engine.MA_PERIODS = periods
         self.custom_ma_periods = periods
-        # Refresh display text (normalized)
         self.ma_periods_var.set(", ".join(str(p) for p in periods))
-        # Persist MA change alongside current settings
-        save_user_settings({
-            'signal_tf':               self.signal_tf,
-            'signal_direction':        self.signal_direction,
-            'ma_periods':              list(periods),
-            'swap_targets':            dict(self.swap_targets),
-            'stop_loss_pct':           STOP_LOSS_PCT,
-            'take_profit_pct':         TAKE_PROFIT_PCT,
-            'order_amount_usd':        ORDER_AMOUNT_USD,
-            'minimum_reserve':         MINIMUM_RESERVE,
-            'cooldown_seconds':        COOLDOWN_SECONDS,
-            'alloc_round_tokens':      self.alloc_round_tokens,
-            'auto_compound_enabled':   self.auto_compound_enabled,
-            'auto_compound_pct':       self.auto_compound_pct,
-            'auto_compound_cap':       self.auto_compound_cap,
-        })
+        s = load_user_settings()
+        s['ma_periods'] = list(periods)
+        save_user_settings(s)
         self.log_message(f"Moving averages updated: {periods}", "trade")
         self._refresh_chart()
 
@@ -3859,7 +3854,7 @@ class Dashboard(ctk.CTkFrame):
         try:
             self.loop.run_until_complete(self._async_main())
         except Exception as e:
-            logger.error(traceback.format_exc())
+            logger.error("Backend thread crashed", exc_info=True)
             if self.root_alive:
                 self.root.after(0, self.log_message, f"Backend crashed: {e}", "error")
 
@@ -3909,7 +3904,7 @@ class Dashboard(ctk.CTkFrame):
                 retries += 1
                 wait = min(2 ** retries, 120)
                 self.log_message(f"Task '{name}' error: {e} — retry in {wait}s", "warn")
-                logger.error(f"Task {name}:\n{traceback.format_exc()}")
+                logger.error(f"Task '{name}' crashed", exc_info=True)
                 if not self.running:
                     return
                 await asyncio.sleep(wait)
@@ -4087,7 +4082,7 @@ class Dashboard(ctk.CTkFrame):
                 self.root.after(0, self._update_pair_cards)
         except Exception as e:
             self.log_message(f"Balance error: {e}", "warn")
-            logger.error(traceback.format_exc())
+            logger.error("Unhandled exception", exc_info=True)
 
     # ── Candles ───────────────────────────────────────────────────────────────
     async def _candles_loop(self):
@@ -4183,8 +4178,8 @@ class Dashboard(ctk.CTkFrame):
                 await asyncio.sleep(0.35)  # rate-limit between batch calls
 
         if all_candles:
-            span_from = datetime.fromtimestamp(all_candles[0][0]  / 1000, pytz.UTC).strftime('%Y-%m-%d %H:%M')
-            span_to   = datetime.fromtimestamp(all_candles[-1][0] / 1000, pytz.UTC).strftime('%Y-%m-%d %H:%M')
+            span_from = datetime.fromtimestamp(all_candles[0][0]  / 1000, timezone.utc).strftime('%Y-%m-%d %H:%M')
+            span_to   = datetime.fromtimestamp(all_candles[-1][0] / 1000, timezone.utc).strftime('%Y-%m-%d %H:%M')
             self.log_message(
                 f"Candles fetched  {pair}/{timeframe}  "
                 f"count={len(all_candles)}  span={span_from} → {span_to}", "monitor")
@@ -4252,7 +4247,7 @@ class Dashboard(ctk.CTkFrame):
             # Log capital state on every signal-TF candle close for full traceability
             self.log_message(
                 f"Candle close  {pair}/{timeframe}  "
-                f"can_buy={_can_buy}  can_sell={_can_sell}  locked={self.order_locks[pair]}  "
+                f"can_buy={_can_buy}  can_sell={_can_sell}  locked={pair in self.order_locks}  "
                 f"bot_balance=${self.bot_balance:.2f}  "
                 f"pair_alloc=${self.bot_pair_alloc.get(pair,0):.2f}  "
                 f"exposure=${self.bot_exposure[pair]:.2f}  "
@@ -4260,7 +4255,7 @@ class Dashboard(ctk.CTkFrame):
                 f"live_price={format_price(self.live_prices.get(pair,0))}  "
                 f"direction={self.signal_direction}",
                 "monitor")
-            if cap and not self.order_locks[pair]:
+            if cap and pair not in self.order_locks:
                 conf_candles = list(self.candle_history[conf_tf][pair])
                 sig = (self.strategy.calculate_signals(pair, ha, conf_candles) or
                        self.strategy.calculate_breakout(pair, ha))
@@ -4289,8 +4284,7 @@ class Dashboard(ctk.CTkFrame):
                         f"direction={self.signal_direction}  can_buy={_can_buy}  can_sell={_can_sell}",
                         "info")
                 if sig:
-                    self.order_locks[pair]    = True
-                    self.order_lock_ts[pair]  = time.time()
+                    self.order_locks[pair] = time.time()
                     self._last_signal_source  = sig['source']
                     self.log_message(
                         f"► SIGNAL [{sig['source']}] {sig['action'].upper()} {pair} "
@@ -4305,9 +4299,9 @@ class Dashboard(ctk.CTkFrame):
                         except asyncio.TimeoutError:
                             logger.error(
                                 f"_place_order hard timeout 300s — releasing lock for {_pair}")
-                            self.order_locks[_pair] = False
+                            self.order_locks.pop(_pair, None)
                     asyncio.run_coroutine_threadsafe(_place_with_timeout(), self.loop)
-            elif self.order_locks[pair]:
+            elif pair in self.order_locks:
                 self.log_message(
                     f"Signal check skipped — {pair} order lock active", "info")
 
@@ -4466,13 +4460,13 @@ class Dashboard(ctk.CTkFrame):
                             await ws.ping()
                         except Exception as e:
                             self.log_message(f"WS recv error: {e}", "warn")
-                            logger.error(traceback.format_exc())
+                            logger.error("Unhandled exception", exc_info=True)
                             break
 
             except Exception as e:
                 self.log_message(
                     f"WS disconnected: {e} — reconnect in {_ws_backoff}s", "warn")
-                logger.error(traceback.format_exc())
+                logger.error("Unhandled exception", exc_info=True)
                 await asyncio.sleep(_ws_backoff)
                 _ws_backoff = min(_ws_backoff * 2, 60)
 
@@ -4545,7 +4539,7 @@ class Dashboard(ctk.CTkFrame):
 
         if not (pair_cap or has_exposure or has_coins):
             return
-        if self.order_locks[pair]:
+        if pair in self.order_locks:
             return
         if cd_remaining > 0:
             return
@@ -4570,7 +4564,7 @@ class Dashboard(ctk.CTkFrame):
             self.surge_last_buy[pair]  = now
         else:
             self.surge_last_sell[pair] = now
-        self.order_locks[pair] = True
+        self.order_locks[pair] = time.time()
 
         self._last_signal_source = f"Surge⚡ {move*100:+.1f}%"
         self.log_message(
@@ -4593,14 +4587,13 @@ class Dashboard(ctk.CTkFrame):
                 # This prevents a deadlock where _place_order raised before its
                 # finally block could clear the lock.
                 _now = time.time()
-                for _lp in list(self.order_locks.keys()):
-                    if self.order_locks[_lp]:
-                        _lock_age = _now - self.order_lock_ts.get(_lp, _now)
-                        if _lock_age > 300:
-                            self.order_locks[_lp] = False
-                            self.log_message(
-                                f"Order lock auto-released for {_lp} "
-                                f"(held {_lock_age:.0f}s — deadlock guard)", "warn")
+                for _lp, _lock_ts in list(self.order_locks.items()):
+                    _lock_age = _now - _lock_ts
+                    if _lock_age > 300:
+                        self.order_locks.pop(_lp, None)
+                        self.log_message(
+                            f"Order lock auto-released for {_lp} "
+                            f"(held {_lock_age:.0f}s — deadlock guard)", "warn")
 
                 active = [(tid, t) for tid, t in self.trade_history.items()
                           if t.get('event') == 'trade']
@@ -4712,7 +4705,7 @@ class Dashboard(ctk.CTkFrame):
                 break
             except Exception as e:
                 self.log_message(f"Monitor error: {e}", "error")
-                logger.error(traceback.format_exc())
+                logger.error("Unhandled exception", exc_info=True)
                 await asyncio.sleep(5)
 
     # ── Order placement ───────────────────────────────────────────────────────
@@ -5009,7 +5002,7 @@ class Dashboard(ctk.CTkFrame):
                 'stop_loss': sl, 'take_profit': tp,
                 'timestamp': time.time() * 1000
             }
-            save_trade_history(self.trade_history)
+            await asyncio.to_thread(save_trade_history, self.trade_history)
             _now = time.time()
             self.strategy.last_trade_time[pair] = _now
             if side == 'buy':
@@ -5049,9 +5042,9 @@ class Dashboard(ctk.CTkFrame):
 
         except Exception as e:
             self.log_message(f"Order error {pair} {side}: {e}", "error")
-            logger.error(traceback.format_exc())
+            logger.error("Unhandled exception", exc_info=True)
         finally:
-            self.order_locks[pair] = False
+            self.order_locks.pop(pair, None)
 
     async def _execute_swap(self, sold_pair: str, proceeds_usd: float):
         """After selling `sold_pair`, immediately buy the configured swap target.
@@ -5223,7 +5216,7 @@ class Dashboard(ctk.CTkFrame):
                     # Remove the zombie trade from history so the monitor stops retrying.
                     # _closing stays True to block any concurrent calls that haven't returned yet.
                     self.trade_history.pop(tid, None)
-                    save_trade_history(self.trade_history)
+                    await asyncio.to_thread(save_trade_history, self.trade_history)
                     if self.root_alive:
                         self.root.after(0, self._refresh_trade_rows)
                     return
@@ -5274,7 +5267,7 @@ class Dashboard(ctk.CTkFrame):
             else:
                 self.strategy.last_buy_time[pair] = _ct
             del self.trade_history[tid]
-            save_trade_history(self.trade_history)
+            await asyncio.to_thread(save_trade_history, self.trade_history)
             self._save_bot_state()
             if self.root_alive:
                 self.root.after(0, self._refresh_trade_rows)
@@ -5282,7 +5275,7 @@ class Dashboard(ctk.CTkFrame):
             await self._fetch_balance()
         except Exception as e:
             self.log_message(f"Close trade error {pair}: {e}", "error")
-            logger.error(traceback.format_exc())
+            logger.error("Unhandled exception", exc_info=True)
             # CRITICAL: reset _closing so the monitor can retry on the next tick.
             # Without this, a Python exception leaves the flag True forever, silently
             # preventing any future close attempt on this position.

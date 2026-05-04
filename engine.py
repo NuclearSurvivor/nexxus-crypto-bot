@@ -6,7 +6,6 @@ Docs & references:
   CDP API Key setup:            https://docs.cdp.coinbase.com/coinbase-app/docs/authentication
   coinbase-advanced-py SDK:     https://github.com/coinbase/coinbase-advanced-py
   Advanced Trade WebSocket:     https://docs.cdp.coinbase.com/advanced-trade/docs/ws-overview
-  CCXT coinbaseadvanced:        https://docs.ccxt.com/#/?id=coinbaseadvanced
 """
 
 import json
@@ -199,73 +198,63 @@ def adx(candles: list, period: int = 14) -> float:
 
 # ── Credentials ──────────────────────────────────────────────────────────────
 def load_credentials():
-    """Load from config.json or environment variables.
-
-    Setup guide: https://docs.cdp.coinbase.com/coinbase-app/docs/authentication
-    """
+    """Load API credentials from env vars (priority) or config.json."""
     env_key    = os.environ.get("COINBASE_API_KEY", "")
     env_secret = os.environ.get("COINBASE_API_SECRET", "")
     if env_key and env_secret:
         return env_key, env_secret, ""
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE) as f:
-                cfg = json.load(f)
-            return cfg.get("api_key", ""), cfg.get("api_secret", ""), cfg.get("passphrase", "")
-        except Exception:
-            pass
-    return "", "", ""
+    cfg = _load_config()
+    return cfg.get("api_key", ""), cfg.get("api_secret", ""), cfg.get("passphrase", "")
 
 
 def save_credentials(api_key: str, api_secret: str, passphrase: str = ""):
-    # Preserve any existing settings block when re-saving credentials.
-    cfg = {}
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE) as f:
-                cfg = json.load(f)
-        except Exception:
-            cfg = {}
+    cfg = _load_config()
     cfg.update({"api_key": api_key, "api_secret": api_secret, "passphrase": passphrase})
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
-    try:
-        os.chmod(CONFIG_FILE, 0o600)
-    except Exception:
-        pass
+    _write_config(cfg)
 
 
-# ── User Settings Persistence ─────────────────────────────────────────────────
-_SETTINGS_KEY = "settings"
-
-def load_user_settings() -> dict:
-    """Return persisted user settings or empty dict (caller applies defaults)."""
+# ── Config helpers ────────────────────────────────────────────────────────────
+def _load_config() -> dict:
+    """Read config.json; return empty dict on any error."""
     if not os.path.exists(CONFIG_FILE):
         return {}
     try:
         with open(CONFIG_FILE) as f:
-            cfg = json.load(f)
-        return cfg.get(_SETTINGS_KEY, {})
-    except Exception:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
         return {}
+
+
+def _write_config(cfg: dict):
+    """Atomic write: temp file → os.replace so crashes never corrupt config."""
+    tmp = CONFIG_FILE + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, CONFIG_FILE)
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except OSError:
+        pass
+
+
+# ── User Settings Persistence ─────────────────────────────────────────────────
+def load_user_settings() -> dict:
+    """Return persisted user settings or empty dict (caller applies defaults)."""
+    return _load_config().get("settings", {})
 
 
 def save_user_settings(settings: dict):
     """Merge *settings* into the config file without touching credentials."""
-    cfg = {}
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE) as f:
-                cfg = json.load(f)
-        except Exception:
-            cfg = {}
-    cfg[_SETTINGS_KEY] = settings
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
-    try:
-        os.chmod(CONFIG_FILE, 0o600)
-    except Exception:
-        pass
+    cfg = _load_config()
+    cfg["settings"] = settings
+    _write_config(cfg)
+
+
+def save_config_key(key: str, value) -> None:
+    """Write a single top-level key to config.json (used for theme etc.)."""
+    cfg = _load_config()
+    cfg[key] = value
+    _write_config(cfg)
 
 
 # ── Coinbase REST client factory ──────────────────────────────────────────────
@@ -616,12 +605,12 @@ def save_candle_cache(candle_history: dict):
 
 
 # ── Price Formatting ──────────────────────────────────────────────────────────
-def format_price(price):
+_PRICE_TIERS = ((0.001, 8), (0.01, 7), (1.0, 4), (10.0, 3), (100_000.0, 2))
+
+def format_price(price) -> str:
     if not isinstance(price, (int, float)) or price == 0:
         return "N/A"
-    if price < 0.001:   return f"${price:,.8f}"
-    if price < 0.01:    return f"${price:,.7f}"
-    if price < 1:       return f"${price:,.4f}"
-    if price < 10:      return f"${price:,.3f}"
-    if price < 100000:  return f"${price:,.2f}"
+    for threshold, decimals in _PRICE_TIERS:
+        if price < threshold:
+            return f"${price:,.{decimals}f}"
     return f"${price:,.0f}"
