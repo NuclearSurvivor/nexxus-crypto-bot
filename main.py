@@ -61,6 +61,9 @@ from engine import (
     MAX_EXPOSURE_PER_PAIR, TF_TO_GRANULARITY, COINBASE_MAX_CANDLES, CONFIG_FILE
 )
 
+# ── Paths (needed before logging setup) ──────────────────────────────────────
+_BOT_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bot.log')
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -252,8 +255,7 @@ plt.rcParams.update({
 # Confirmation TF for each signal TF — one step shorter
 _CONF_TF_MAP = {'1m': '1m', '5m': '1m', '1h': '5m', '1d': '1h'}
 
-# ── Module-level paths and patterns ──────────────────────────────────────────
-_BOT_LOG_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bot.log')
+# ── Module-level compiled patterns ───────────────────────────────────────────
 _FILL_LOG_PAT   = re.compile(
     r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})'
     r'.*◆ FILLED (BUY|SELL) ([A-Z]+-[A-Z]+)'
