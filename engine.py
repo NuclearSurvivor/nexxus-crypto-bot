@@ -486,18 +486,22 @@ class IndicatorEngine:
 
 # ── MA/EMA Crossover Strategy ────────────────────────────────────────────────
 class MACrossover:
-    """EMA(9)/EMA(21) crossover with 5 quality gates — full-port scalping mode.
+    """EMA crossover strategy with RSI gate and trend alignment — v1.0.5b signals.
 
-    Signal quality gates (all must pass):
-      1. ADX > 20    — market must be trending; ranging markets produce noise crosses
-      2. Trend slope — EMA_slow must slope in signal direction for ≥ 3 consecutive bars
-      3. RSI zone    — buys blocked above 65; sells blocked below 35
-      4. RSI momentum— RSI must be RISING for buys, FALLING for sells
-      5. Structure   — BUY: price above EMA_slow; SELL: price below EMA_slow
+    Strategy logic:
+      BUY:  EMA_fast crosses above EMA_slow on signal TF
+            AND conf TF EMA_fast > EMA_slow by ≥ 0.02%
+            AND EMA_slow is sloping up (trend aligned, single-bar)
+            AND RSI < 70 (not overbought)
 
-    Execution: full-port (all available capital per trade), buy→sell→buy alternation
-    enforced naturally by capital gates — after a full buy, no USD remains so the
-    next buy signal is suppressed until the position is sold.
+      SELL: EMA_fast crosses below EMA_slow on signal TF
+            AND conf TF EMA_fast < EMA_slow by ≥ 0.02%
+            AND EMA_slow is sloping down (trend aligned, single-bar)
+            AND RSI > 30 (not oversold)
+
+    Execution: full-port (entire allocation per trade), alternation enforced
+    by capital gates — after a full buy, no USD remains so duplicate buys
+    are blocked until the position is sold.
     """
 
     def __init__(self, indicator_engine: IndicatorEngine):
@@ -507,6 +511,7 @@ class MACrossover:
         self.last_sell_time:  dict = defaultdict(float)
 
     def calculate_signals(self, pair, candles_signal, candles_conf):
+        """EMA crossover on the signal TF confirmed by the confirmation TF."""
         now = time.time()
         if now - self.last_trade_time[pair] < 10:
             return None
@@ -515,70 +520,48 @@ class MACrossover:
 
         closes_s = np.array([c[4] for c in candles_signal], dtype=float)
         closes_c = np.array([c[4] for c in candles_conf],   dtype=float)
-        if len(closes_s) < p_slow + 3 or len(closes_c) < p_slow:
+        if len(closes_s) < p_slow + 1 or len(closes_c) < p_slow:
             return None
 
         # ── EMA crossover on signal TF ────────────────────────────────────────
         ema_f_s = ema(closes_s, p_fast)
         ema_s_s = ema(closes_s, p_slow)
-        valid   = ~(np.isnan(ema_f_s) | np.isnan(ema_s_s))
-        if valid.sum() < 4:
+
+        valid_both = ~(np.isnan(ema_f_s) | np.isnan(ema_s_s))
+        if valid_both.sum() < 2:
             return None
 
-        vf = ema_f_s[valid]
-        vs = ema_s_s[valid]
+        vf = ema_f_s[valid_both]
+        vs = ema_s_s[valid_both]
         prev_diff = float(vf[-2] - vs[-2])
         curr_diff = float(vf[-1] - vs[-1])
 
-        price_now = float(closes_s[-1])
-        min_cross = price_now * 0.001   # 0.1% — eliminates flat noise crosses
-        if abs(curr_diff) < min_cross:
-            return None
-
-        # ── Gate 1: ADX > 20 ──────────────────────────────────────────────────
-        curr_adx = self.ie.data[pair].get('adx', 0.0)
-        if curr_adx < 20:
-            return None
-
-        # ── Gate 2: EMA_slow slope sustained ≥ 3 bars ─────────────────────────
-        slope_window = vs[-4:]
-        slope_up   = all(slope_window[i] < slope_window[i+1] for i in range(len(slope_window)-1))
-        slope_down = all(slope_window[i] > slope_window[i+1] for i in range(len(slope_window)-1))
-
-        # ── Gate 3: RSI zone ──────────────────────────────────────────────────
-        curr_rsi = self.ie.data[pair].get('rsi', 50.0)
-        if np.isnan(curr_rsi):
-            curr_rsi = 50.0
-
-        # ── Gate 4: RSI momentum ──────────────────────────────────────────────
-        rsi_series = self.ie.data[pair].get('rsi_series', [])
-        if len(rsi_series) >= 3:
-            rsi_rising  = rsi_series[-1] > rsi_series[-3]
-            rsi_falling = rsi_series[-1] < rsi_series[-3]
-        else:
-            rsi_rising = rsi_falling = True
-
-        # ── Gate 5: Price structure ────────────────────────────────────────────
-        ema_slow_now     = float(vs[-1])
-        price_above_slow = price_now > ema_slow_now
-        price_below_slow = price_now < ema_slow_now
-
-        # ── Confirmation TF alignment ──────────────────────────────────────────
+        # ── Confirmation TF alignment ─────────────────────────────────────────
         ema_f_c = ema(closes_c, p_fast)
         ema_s_c = ema(closes_c, p_slow)
         valid_c = ~(np.isnan(ema_f_c) | np.isnan(ema_s_c))
         if valid_c.sum() < 1:
             return None
         conf_diff = float(ema_f_c[valid_c][-1] - ema_s_c[valid_c][-1])
-        min_conf  = price_now * 0.0005   # 0.05%
 
-        # ── BUY ───────────────────────────────────────────────────────────────
+        # ── Trend filter: EMA_slow slope (single bar) ─────────────────────────
+        vs_full    = ema_s_s[~np.isnan(ema_s_s)]
+        trend_up   = len(vs_full) >= 2 and vs_full[-1] > vs_full[-2]
+        trend_down = len(vs_full) >= 2 and vs_full[-1] < vs_full[-2]
+
+        # ── RSI gate ──────────────────────────────────────────────────────────
+        curr_rsi = self.ie.data[pair].get('rsi', 50.0)
+
+        # ── Minimum crossover gap ─────────────────────────────────────────────
+        price_now = float(closes_s[-1])
+        min_cross = price_now * 0.0005   # 0.05%
+        min_conf  = price_now * 0.0002   # 0.02%
+
+        # ── Signal evaluation ─────────────────────────────────────────────────
         if (prev_diff < 0 and curr_diff > min_cross
                 and conf_diff > min_conf
-                and slope_up
-                and curr_rsi < 65
-                and rsi_rising
-                and price_above_slow):
+                and trend_up
+                and curr_rsi < 70):
             if now - self.last_buy_time.get(pair, 0) < COOLDOWN_SECONDS:
                 return None
             return {
@@ -586,16 +569,12 @@ class MACrossover:
                 'price':  price_now,
                 'source': f'EMA{p_fast}/EMA{p_slow}',
                 'rsi':    curr_rsi,
-                'adx':    curr_adx,
             }
 
-        # ── SELL ──────────────────────────────────────────────────────────────
         if (prev_diff > 0 and curr_diff < -min_cross
                 and conf_diff < -min_conf
-                and slope_down
-                and curr_rsi > 35
-                and rsi_falling
-                and price_below_slow):
+                and trend_down
+                and curr_rsi > 30):
             if now - self.last_sell_time.get(pair, 0) < COOLDOWN_SECONDS:
                 return None
             return {
@@ -603,21 +582,15 @@ class MACrossover:
                 'price':  price_now,
                 'source': f'EMA{p_fast}/EMA{p_slow}',
                 'rsi':    curr_rsi,
-                'adx':    curr_adx,
             }
 
         return None
 
     def calculate_breakout(self, pair, candles):
-        """ATR-normalized breakout detector for explosive momentum moves.
+        """ATR-normalized breakout detector — v1.0.5b logic.
 
-        Gates (all must pass):
-          • ADX > 20  — only fires in trending markets, not chop
-          • ATR momentum ≥ 2× ATR (raised from 1.5×) — higher bar, fewer false breaks
-          • Volume > 75th percentile of prior 20 candles
-          • RSI < 75 for buys (not already exhausted), RSI > 25 for sells
-          • BUY:  close > 20-candle high
-          • SELL: close < 20-candle low
+        BUY:  close > 20-candle high  AND (volume > 75th pct OR move > 1.5× ATR)
+        SELL: close < 20-candle low   AND (volume > 75th pct OR move < -1.5× ATR)
         """
         now = time.time()
         if now - self.last_trade_time[pair] < 10:
@@ -641,26 +614,14 @@ class MACrossover:
         prev_high = float(prior_highs.max())
         prev_low  = float(prior_lows.min())
 
-        # ADX gate — no breakout signals in ranging markets
-        curr_adx = self.ie.data[pair].get('adx', 0.0)
-        if curr_adx < 20:
-            return None
-
-        # RSI gate
-        curr_rsi = self.ie.data[pair].get('rsi', 50.0)
-        if np.isnan(curr_rsi):
-            curr_rsi = 50.0
-
-        # Volume: 75th percentile gate — robust on low-volume pairs
         vol_pct75 = float(np.percentile(prior_vols, 75)) if len(prior_vols) >= 4 else float(prior_vols.mean() * 1.5)
         vol_surge = volumes[-1] > vol_pct75
 
-        # ATR-normalized momentum: raised to 2× ATR — fewer, higher-conviction fires
-        atr_val      = self.ie.data[pair].get('atr', 0.0)
-        atr_gate     = atr_val * 2.0 if atr_val > 0 else cur_close * 0.025
-        price_move   = cur_close - prev_close   # signed
+        atr_val    = self.ie.data[pair].get('atr', 0.0)
+        atr_gate   = atr_val * 1.5 if atr_val > 0 else cur_close * 0.02
+        price_move = cur_close - prev_close
 
-        if cur_close > prev_high and vol_surge and price_move > atr_gate and curr_rsi < 75:
+        if cur_close > prev_high and (vol_surge or price_move > atr_gate):
             if now - self.last_buy_time.get(pair, 0) < COOLDOWN_SECONDS:
                 return None
             return {
@@ -670,7 +631,7 @@ class MACrossover:
                 'atr':    atr_val,
             }
 
-        if cur_close < prev_low and vol_surge and price_move < -atr_gate and curr_rsi > 25:
+        if cur_close < prev_low and (vol_surge or price_move < -atr_gate):
             if now - self.last_sell_time.get(pair, 0) < COOLDOWN_SECONDS:
                 return None
             return {

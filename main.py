@@ -4287,7 +4287,7 @@ class Dashboard(ctk.CTkFrame):
                 async with websockets.connect(
                     COINBASE_WS_URL,
                     ping_interval=20, ping_timeout=30,
-                    max_size=2**21
+                    max_size=None        # level2 BTC snapshots can exceed 2MB
                 ) as ws:
                     _ws_backoff = 2   # reset on successful connection
                     # Fresh JWT for this connection
@@ -4322,7 +4322,9 @@ class Dashboard(ctk.CTkFrame):
                             chan = data.get("channel", "")
 
                             # ── level2 order book updates ─────────────────
-                            if chan == "level2":
+                            # Coinbase sends subscription as "level2" but
+                            # incoming messages arrive with channel "l2_data"
+                            if chan in ("level2", "l2_data"):
                                 for evt in data.get("events", []):
                                     _ev_pid = evt.get("product_id", "")
                                     if _ev_pid not in TRADING_PAIRS:
