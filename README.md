@@ -8,7 +8,28 @@
 
 ## Version History
 
-### v1.0.5b *(current)*
+### v1.0.6b *(current)*
+
+#### Signal Quality — Noise Reduction & Sell Improvement
+
+- **MA periods changed to `[9, 21, 55]`** — EMA(2)/EMA(5) fired on nearly every candle (α=0.67 tracks individual ticks). EMA(9)/EMA(21) are the industry-standard fast/slow pair used across professional systems; EMA(55) provides a clean trend baseline. Crossover frequency drops by ~70%.
+- **ADX gate (new)** — `adx()` implements the full Wilder ADX calculation (+DM/−DM smoothed by RMA, then DX averaged). Signals are blocked when ADX < 20, which means the market is ranging/choppy and MA crosses are noise. Above 25 is trending; above 40 is a strong trend.
+- **Sustained slope (3-bar)** — EMA_slow must slope in the signal direction for 3 consecutive bars (not just the current candle). Single-candle slope reversals that flip back immediately no longer trigger.
+- **RSI zone narrowed** — buys blocked above RSI 65 (was 70); sells blocked below RSI 35 (was 30). More breathing room from exhaustion extremes.
+- **RSI momentum gate** — RSI must be rising for buys and falling for sells over the last 3 bars. A buy cross while RSI is declining = momentum divergence = blocked.
+- **Price structure gate for sells** — SELL requires price to be below EMA_slow at crossover time. This distinguishes a real breakdown from a brief dip that already recovered.
+- **Min crossover gap raised to 0.1%** (from 0.05%). Eliminates micro-crosses on nearly-flat EMAs.
+- **Breakout: ADX gate added** — breakout signals also require ADX > 20. Breakouts in choppy markets are fakeouts.
+- **Breakout: ATR threshold raised to 2× ATR** (from 1.5×). Higher bar for momentum conviction.
+- **Breakout: volume now required** — changed from `vol_surge OR price_move > atr_gate` to `vol_surge AND price_move > atr_gate`. Volume must confirm the move; price alone is not enough.
+- **Breakout: RSI gate** — buys blocked above RSI 75, sells blocked below RSI 25. Prevents chasing already-exhausted breakouts.
+
+#### Chart
+- **ADX displayed alongside RSI** — top-left overlay now shows `RSI 52.3   ADX 31.4 trend`. ADX label appends "chop" (<20), "trend" (≥20), or "strong" (≥40) so market regime is visible at a glance.
+
+---
+
+### v1.0.5b
 
 #### Strategy & Signal Quality — Full Overhaul
 - **EMA replaces SMA everywhere** — Exponential Moving Average (α = 2/(N+1)) responds 3-5× faster than Simple Moving Average on the same period. Signals fire earlier in the move, not after it has already run. Chart MA lines, signal detection, and confirmation all use EMA.

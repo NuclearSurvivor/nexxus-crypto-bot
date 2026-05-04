@@ -2573,17 +2573,29 @@ class Dashboard(ctk.CTkFrame):
                     color=C_MUTED, fontsize=7, ha='right', va='top',
                     bbox=dict(boxstyle='round,pad=0.25', fc=C_BG, ec=C_BORDER, alpha=0.8))
 
-        # ── RSI overlay (top-left) ────────────────────────────────────────────
+        # ── RSI + ADX overlay (top-left) ─────────────────────────────────────
         _rsi_val = ind.get('rsi', None)
+        _adx_val = ind.get('adx', None)
+        _overlay_parts = []
+        _overlay_col   = C_MUTED
         if _rsi_val is not None and not np.isnan(_rsi_val):
             _rsi_col = (C_RED   if _rsi_val > 70 else
                         C_GREEN if _rsi_val < 30 else C_MUTED)
-            _rsi_zone = (" overbought" if _rsi_val > 70 else
-                         " oversold"   if _rsi_val < 30 else "")
-            ax.text(0.01, 0.99, f"RSI  {_rsi_val:.1f}{_rsi_zone}",
+            _rsi_zone = (" OB" if _rsi_val > 70 else
+                         " OS" if _rsi_val < 30 else "")
+            _overlay_parts.append(f"RSI {_rsi_val:.1f}{_rsi_zone}")
+            _overlay_col = _rsi_col
+        if _adx_val is not None and not np.isnan(_adx_val):
+            _adx_str = (f"ADX {_adx_val:.1f}"
+                        + (" strong" if _adx_val >= 40 else
+                           " trend"  if _adx_val >= 20 else
+                           " chop"))
+            _overlay_parts.append(_adx_str)
+        if _overlay_parts:
+            ax.text(0.01, 0.99, "   ".join(_overlay_parts),
                     transform=ax.transAxes,
-                    color=_rsi_col, fontsize=7, ha='left', va='top',
-                    bbox=dict(boxstyle='round,pad=0.25', fc=C_BG, ec=_rsi_col,
+                    color=_overlay_col, fontsize=7, ha='left', va='top',
+                    bbox=dict(boxstyle='round,pad=0.25', fc=C_BG, ec=_overlay_col,
                               alpha=0.82, lw=0.7))
 
         # ── 10. Key panel ────────────────────────────────────────────────────
@@ -4181,6 +4193,7 @@ class Dashboard(ctk.CTkFrame):
             self.indicator_engine.calculate_fair_value_gaps(pair, ha)
             self.indicator_engine.calculate_rsi(pair, ha)            # RSI gate
             self.indicator_engine.calculate_ema_trend(pair, ha)      # trend filter
+            self.indicator_engine.calculate_adx(pair, ha)            # ADX trend strength
 
         if is_trading_pair and timeframe == self.signal_tf and self.running and not self.paused:
             # Confirmation frame: one step shorter than the signal TF
