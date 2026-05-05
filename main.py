@@ -2308,8 +2308,12 @@ class Dashboard(ctk.CTkFrame):
                 _conf_c    = np.array([c[4] for c in _conf_raw])
                 _cf_fast   = np.convolve(_conf_c, np.ones(p_fast) / p_fast, 'valid')
                 _cf_slow   = np.convolve(_conf_c, np.ones(p_slow) / p_slow, 'valid')
+                # Timestamps start at the first candle where SMA_slow is valid (index p_slow-1).
+                # _cf_fast has p_slow-p_fast more elements than _cf_slow — skip the leading
+                # ones so fast[j] and slow[j] are both "as of" the same candle.
+                _cf_fast_aligned = _cf_fast[p_slow - p_fast:]
                 _conf_vts  = [c[0] for c in _conf_raw[(p_slow - 1):]]
-                for _t, _fd, _sd in zip(_conf_vts, _cf_fast, _cf_slow):
+                for _t, _fd, _sd in zip(_conf_vts, _cf_fast_aligned, _cf_slow):
                     _conf_diff_by_ts[_t] = float(_fd) - float(_sd)
             _conf_ts_sorted = sorted(_conf_diff_by_ts.keys())
 
