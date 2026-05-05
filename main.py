@@ -4998,15 +4998,21 @@ class Dashboard(ctk.CTkFrame):
                 # ── Swap-on-sell ──────────────────────────────────────────────
                 await self._execute_swap(pair, spent)
 
-            tid = str(uuid.uuid4())
-            self.trade_history[tid] = {
-                'event': 'trade', 'id': tid, 'symbol': pair, 'side': side,
-                'quantity': qty_filled, 'entry_price': filled_price,
-                'current_price': filled_price, 'pl': 0.0,
-                'stop_loss': sl, 'take_profit': tp,
-                'timestamp': time.time() * 1000
-            }
-            await asyncio.to_thread(save_trade_history, self.trade_history)
+            # Only BUY fills get a monitored SL/TP trade record.
+            # SELL signals liquidate coin holdings to USD — the bot is long-only.
+            # Creating a sell-side record would open a phantom short position that
+            # the monitor tries to close by buying back at a (potentially) higher
+            # price than the proceeds, causing "Insufficient balance" crashes.
+            if side == 'buy':
+                tid = str(uuid.uuid4())
+                self.trade_history[tid] = {
+                    'event': 'trade', 'id': tid, 'symbol': pair, 'side': 'buy',
+                    'quantity': qty_filled, 'entry_price': filled_price,
+                    'current_price': filled_price, 'pl': 0.0,
+                    'stop_loss': sl, 'take_profit': tp,
+                    'timestamp': time.time() * 1000
+                }
+                await asyncio.to_thread(save_trade_history, self.trade_history)
             _now = time.time()
             self.strategy.last_trade_time[pair] = _now
             if side == 'buy':
@@ -5138,11 +5144,12 @@ class Dashboard(ctk.CTkFrame):
                         post_only=True
                     )
                 else:
-                    limit_px    = round(bid - offset, qdp)
-                    lp_str      = f"{limit_px:.{qdp}f}"
-                    raw_qty_buy = qty * cur_price / limit_px if limit_px else 0
-                    bs_str      = f"{math.floor(raw_qty_buy * 10**bdp) / 10**bdp:.{bdp}f}"
-                    note        = f"  (bid-{offset:.{qdp}f})" if offset else "  (at bid)"
+                    limit_px = round(bid - offset, qdp)
+                    lp_str   = f"{limit_px:.{qdp}f}"
+                    # Buy back exactly the original quantity — don't inflate it with
+                    # qty * cur_price / limit_px (that overstates when price has risen).
+                    bs_str   = f"{math.floor(qty * 10**bdp) / 10**bdp:.{bdp}f}"
+                    note     = f"  (bid-{offset:.{qdp}f})" if offset else "  (at bid)"
                     self.log_message(
                         f"CLOSE BUY LIMIT {pair}  qty={bs_str}  price={lp_str}{note}"
                         f"  {reason}  attempt {attempt+1}", "info")
