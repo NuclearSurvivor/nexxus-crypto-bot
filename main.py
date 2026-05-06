@@ -2479,17 +2479,9 @@ class Dashboard(ctk.CTkFrame):
             _les_side  = _les.get('side', '')
             _les_color = C_RED if _les_side == 'sell' else C_GREEN
             _les_marker = '▼' if _les_side == 'sell' else '▲'
-            # Dashed entry line across chart
+            # Dashed entry line — visual reference for the fill price level
             ax.axhline(y=_les_price, color=_les_color, linestyle='--',
                        linewidth=0.9, alpha=0.55)
-            # Right-edge label with entry price
-            _bl2 = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
-            ax.annotate(f" {_les_marker} {format_price(_les_price)} ",
-                        xy=(1.0, _les_price), xycoords=_bl2,
-                        fontsize=7, color=_les_color, alpha=0.95,
-                        ha='left', va='center', clip_on=False, annotation_clip=False,
-                        bbox=dict(boxstyle='round,pad=0.2', fc=C_CARD2,
-                                  ec=_les_color, alpha=0.88, lw=0.8))
             # Arrow marker at the time on chart + hover-tooltip entry.
             # Keep _les_dt as UTC-aware — mdates.date2num treats naive datetimes
             # as local time, which would shift the hover hit-box by the UTC offset.
@@ -3606,127 +3598,123 @@ class Dashboard(ctk.CTkFrame):
                       font=_F13B, command=confirm).pack(fill="x", pady=(0, 12))
 
     def _open_unallocate(self, default_pair: str = None):
-        win = self._popup("Unallocate from Bot", 440, 400)
+        win = self._popup("Unallocate from Bot", 460, 560)
 
-        ctk.CTkLabel(win, text="−  Unallocate Funds from Bot",
-                     font=_F15B, text_color=C_TEXT).pack(pady=(24, 2))
+        ctk.CTkLabel(win, text="−  Unallocate from Bot",
+                     font=_F15B, text_color=C_TEXT).pack(pady=(18, 2))
 
-        total_alloc = sum(self.bot_pair_alloc.values()) + self.bot_balance
-        ctk.CTkLabel(win, text=f"Total bot funds:  ${total_alloc:,.2f}",
-                     font=_F12, text_color=C_MUTED).pack(pady=(0, 4))
+        outer = ctk.CTkFrame(win, fg_color="transparent")
+        outer.pack(fill="both", expand=True, padx=24)
 
-        form = ctk.CTkFrame(win, fg_color="transparent")
-        form.pack(fill="x", padx=36, pady=(4, 0))
+        err = ctk.CTkLabel(outer, text="", text_color=C_RED, font=_F11)
 
-        # ── Coin selector ─────────────────────────────────────────────────────
-        ctk.CTkLabel(form, text="Coin Wallet", font=_F12,
-                     text_color=C_MUTED).pack(anchor="w", pady=(0, 6))
+        # ── Per-bucket rows ───────────────────────────────────────────────────
+        # Each row: label | amount | [Unallocate All] button
+        def _bucket_row(parent, label, get_val, do_unalloc):
+            """Single-line bucket row with amount display and unallocate button."""
+            row = ctk.CTkFrame(parent, fg_color=C_CARD, corner_radius=10,
+                               border_width=1, border_color=C_BORDER)
+            row.pack(fill="x", pady=(0, 6))
+            inner = ctk.CTkFrame(row, fg_color="transparent")
+            inner.pack(fill="x", padx=12, pady=8)
+            ctk.CTkLabel(inner, text=label, font=_F11B,
+                         text_color=C_TEXT2).pack(side="left")
+            val_lbl = ctk.CTkLabel(inner, text=get_val(),
+                                   font=_F11B, text_color=C_ACCENT3)
+            val_lbl.pack(side="left", padx=(8, 0))
+            def _do(vl=val_lbl, fn=do_unalloc, gv=get_val):
+                fn()
+                vl.configure(text=gv())
+                err.configure(text="")
+            ctk.CTkButton(inner, text="Unallocate", width=96, height=28,
+                          corner_radius=6, fg_color=C_CARD,
+                          hover_color=C_BORDER, border_width=1,
+                          border_color=C_BORDER, font=_F11,
+                          text_color=C_MUTED, command=_do).pack(side="right")
 
-        # Default to whichever pair has the most allocation
-        if default_pair is None:
-            default_pair = max(TRADING_PAIRS,
-                               key=lambda p: self.bot_pair_alloc.get(p, 0))
-        pair_var = ctk.StringVar(value=default_pair)
+        # General pool (bot_balance)
+        def _unalloc_general():
+            amt = self.bot_balance
+            if amt <= 0:
+                err.configure(text="General pool is already empty")
+                return
+            self.usd_balance  += amt
+            self.bot_balance   = 0.0
+            self._save_bot_state(); self._update_metrics()
+            self.log_message(f"Unallocated ${amt:,.2f} general pool → Liquid", "trade")
 
-        pair_row = ctk.CTkFrame(form, fg_color="transparent")
-        pair_row.pack(fill="x", pady=(0, 10))
+        _bucket_row(outer, "General Pool",
+                    lambda: f"${self.bot_balance:,.2f}",
+                    _unalloc_general)
+
+        # Per-pair USD budgets
+        for p in TRADING_PAIRS:
+            coin = p.split("-")[0]
+            def _unalloc_pair(_p=p):
+                amt = self.bot_pair_alloc.get(_p, 0)
+                if amt <= 0:
+                    err.configure(text=f"{_p.split('-')[0]} wallet is already empty")
+                    return
+                self.usd_balance           += amt
+                self.bot_pair_alloc[_p]    = 0.0
+                self._save_bot_state(); self._update_metrics()
+                self.log_message(f"Unallocated ${amt:,.2f} {_p.split('-')[0]} → Liquid", "trade")
+            _bucket_row(outer, f"{coin} Budget",
+                        lambda _p=p: f"${self.bot_pair_alloc.get(_p, 0):,.2f}",
+                        _unalloc_pair)
+
+        # Per-pair coin holdings managed by bot
         for p in TRADING_PAIRS:
             coin  = p.split("-")[0]
-            alloc = self.bot_pair_alloc.get(p, 0)
-            is_sel = (p == pair_var.get())
-            btn = ctk.CTkButton(
-                pair_row,
-                text=f"{coin}\n${alloc:,.2f}",
-                width=110, height=56, corner_radius=10,
-                fg_color=C_ACCENT2 if is_sel else C_CARD,
-                hover_color="#6a4de0" if is_sel else C_BORDER,
-                border_width=2 if is_sel else 1,
-                border_color=C_ACCENT2 if is_sel else C_BORDER,
-                font=_F11B, text_color=C_TEXT,
-            )
-            btn.pack(side="left", padx=(0, 8))
-            btn._pair = p
-
-        avail_lbl = ctk.CTkLabel(
-            form,
-            text=f"Available to unallocate: ${self.bot_pair_alloc.get(pair_var.get(), 0):,.2f}",
-            font=_F11, text_color=C_MUTED)
-        avail_lbl.pack(anchor="w", pady=(0, 10))
-
-        amt = ctk.CTkEntry(form, placeholder_text="0.00", height=42,
-                           fg_color=C_CARD, border_color=C_BORDER,
-                           text_color=C_TEXT, font=_F15)
-
-        qrow = ctk.CTkFrame(form, fg_color="transparent")
-        qbtns_u = []
-        for pct in (25, 50, 75, 100):
-            b = ctk.CTkButton(qrow, text=f"{pct}%", width=70, height=28,
-                              corner_radius=6, fg_color=C_CARD, hover_color=C_BORDER,
-                              font=_F11, text_color=C_MUTED)
-            b.pack(side="left", padx=(0, 6))
-            qbtns_u.append((pct, b))
-
-        def _update_u_qfill():
-            v_max = self.bot_pair_alloc.get(pair_var.get(), 0)
-            for pct, b in qbtns_u:
-                v = v_max * pct / 100
-                b.configure(command=lambda x=v: (amt.delete(0, "end"),
-                                                  amt.insert(0, f"{x:.2f}")))
-
-        def _sel_pair_u(p, buttons):
-            pair_var.set(p)
-            avail_lbl.configure(
-                text=f"Available to unallocate: ${self.bot_pair_alloc.get(p, 0):,.2f}")
-            _update_u_qfill()
-            for b in buttons:
-                sel = b._pair == p
-                b.configure(
-                    fg_color=C_ACCENT2 if sel else C_CARD,
-                    hover_color="#6a4de0" if sel else C_BORDER,
-                    border_width=2 if sel else 1,
-                    border_color=C_ACCENT2 if sel else C_BORDER,
-                )
-
-        u_btns = pair_row.winfo_children()
-        for b in u_btns:
-            b.configure(command=lambda p=b._pair, bs=u_btns: _sel_pair_u(p, bs))
-
-        ctk.CTkLabel(form, text="Amount (USD)", font=_F12,
-                     text_color=C_MUTED).pack(anchor="w", pady=(0, 6))
-        amt.pack(fill="x")
-        amt.focus()
-        qrow.pack(fill="x", pady=(6, 0))
-        _update_u_qfill()
-
-        err = ctk.CTkLabel(form, text="", text_color=C_RED, font=_F11)
-        err.pack(pady=(8, 4))
-
-        def confirm():
-            try:
-                a = float(amt.get())
-                p = pair_var.get()
-                avail = self.bot_pair_alloc.get(p, 0)
-                if a <= 0:
-                    err.configure(text="Enter an amount greater than 0")
+            price = self.live_prices.get(p, 0)
+            def _unalloc_coins(_p=p):
+                qty = self.bot_coin_qty.get(_p, 0)
+                if qty <= 0:
+                    err.configure(text=f"No {_p.split('-')[0]} holdings managed")
                     return
-                if a > avail:
-                    err.configure(text=f"Max available for {p.split('-')[0]}: ${avail:,.2f}")
-                    return
-                self.bot_pair_alloc[p] -= a
-                self.usd_balance       += a
-                self._save_bot_state()
-                self._update_metrics()
-                self.log_message(
-                    f"Unallocated ${a:,.2f} from {p.split('-')[0]} → Liquid", "trade")
-                win.destroy()
-            except ValueError:
-                err.configure(text="Enter a valid number")
+                self.bot_coin_qty[_p] = 0.0
+                self._save_bot_state(); self._update_metrics()
+                self.log_message(f"Released {qty:.4f} {_p.split('-')[0]} coin holdings from bot", "trade")
+            _pr = self.live_prices.get(p, 0)
+            _qty = self.bot_coin_qty.get(p, 0)
+            if _qty > 0:
+                _bucket_row(outer, f"{coin} Holdings",
+                            lambda _p=p: (
+                                f"{self.bot_coin_qty.get(_p,0):.4f} {_p.split('-')[0]}"
+                                f"  ≈ ${self.bot_coin_qty.get(_p,0)*self.live_prices.get(_p,0):,.2f}"),
+                            _unalloc_coins)
 
-        ctk.CTkButton(form, text="Confirm Unallocate", height=44, corner_radius=10,
+        tk.Frame(outer, height=1, bg=C_BORDER).pack(fill="x", pady=(6, 10))
+
+        err.pack(pady=(0, 4))
+
+        # ── Unallocate All ────────────────────────────────────────────────────
+        def _unalloc_all():
+            total_usd = self.bot_balance + sum(self.bot_pair_alloc.values())
+            self.usd_balance += total_usd
+            self.bot_balance  = 0.0
+            for _p in TRADING_PAIRS:
+                self.bot_pair_alloc[_p] = 0.0
+                self.bot_coin_qty[_p]   = 0.0
+            self._save_bot_state()
+            self._update_metrics()
+            self.log_message(
+                f"Unallocated all bot funds (${total_usd:,.2f} USD + all coin holdings) → default state",
+                "trade")
+            win.destroy()
+
+        ctk.CTkButton(outer, text="Unallocate Everything  ·  Reset to Default",
+                      height=44, corner_radius=10,
+                      fg_color="#3a1a1a", hover_color="#5a2a2a",
+                      border_width=1, border_color=C_RED,
+                      font=_F13B, text_color=C_RED,
+                      command=_unalloc_all).pack(fill="x", pady=(0, 4))
+
+        ctk.CTkButton(outer, text="Done", height=36, corner_radius=10,
                       fg_color=C_CARD, hover_color=C_BORDER,
                       border_width=1, border_color=C_BORDER,
-                      font=_F13B, text_color=C_TEXT,
-                      command=confirm).pack(fill="x")
+                      font=_F12, text_color=C_MUTED,
+                      command=win.destroy).pack(fill="x", pady=(0, 12))
 
     def _confirm_sell_all(self):
         held = [p for p in TRADING_PAIRS
