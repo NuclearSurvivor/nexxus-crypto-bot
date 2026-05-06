@@ -4761,16 +4761,17 @@ class Dashboard(ctk.CTkFrame):
                 # Hard cap: the bot cannot spend more than the actual liquid USD
                 # balance on exchange — prevents stale accounting from over-ordering.
                 avail_funds = min(avail_funds, self.usd_balance)
-                if avail_funds < MINIMUM_RESERVE:
+                # Always leave MINIMUM_RESERVE on the exchange; deploy only the rest.
+                # Coinbase's preview check holds amount + fee estimate — deploying
+                # 100% of balance leaves nothing for that hold and causes
+                # PREVIEW_INSUFFICIENT_FUND on every attempt.
+                amount_usd = avail_funds - MINIMUM_RESERVE
+                if amount_usd < MINIMUM_RESERVE:
                     self.log_message(
-                        f"Buy {pair} skipped — liquid USD ${self.usd_balance:.2f} "
-                        f"below minimum reserve ${MINIMUM_RESERVE:.2f}", "warn")
+                        f"Buy {pair} skipped — spendable ${amount_usd:.2f} "
+                        f"(${avail_funds:.2f} − reserve ${MINIMUM_RESERVE:.2f}) "
+                        f"is below minimum order size ${MINIMUM_RESERVE:.2f}", "warn")
                     return
-                # Full-port scalping: always deploy the entire available allocation.
-                # Overrides fixed ORDER_AMOUNT_USD and auto-compound — the goal is
-                # to be 100% deployed at all times, cycling between USD and coin
-                # on every alternating buy/sell signal.
-                amount_usd = avail_funds
                 total_cap  = avail_funds + sum(self.bot_exposure.values())
                 if self.bot_exposure[pair] + amount_usd > MAX_EXPOSURE_PER_PAIR * total_cap:
                     self.log_message(f"Exposure cap reached for {pair}", "warn")
