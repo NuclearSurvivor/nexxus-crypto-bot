@@ -424,6 +424,7 @@ class Dashboard(ctk.CTkFrame):
         self.bot_balance     = 0.0        # general (unassigned) bot pool
         self.bot_pair_alloc  = defaultdict(float)   # per-coin USD budget
         self.bot_coin_qty    = defaultdict(float)   # coins handed to bot from holdings
+        self.bot_bought_qty  = defaultdict(float)   # exact coin qty purchased by bot
         self.initial_balance = 0.0
         self.bot_exposure    = defaultdict(float)
         self.real_exposure   = defaultdict(float)
@@ -4743,6 +4744,7 @@ class Dashboard(ctk.CTkFrame):
             sl_pct = (1.5 * atr / vp) if (atr > 0 and vp) else STOP_LOSS_PCT
             tp_pct = (3.0 * atr / vp) if (atr > 0 and vp) else TAKE_PROFIT_PCT
 
+            sell_qty_base = 0  # actual coins to sell; set in sell branch below
             if side == 'buy':
                 # Prefer per-coin allocation; fall back to general bot_balance
                 pair_funds    = self.bot_pair_alloc.get(pair, 0)
@@ -4778,10 +4780,15 @@ class Dashboard(ctk.CTkFrame):
                     return
             else:
                 # Full-port sell: liquidate the entire coin position in one order.
+                # Use exact tracked qty (bot_bought_qty + bot_coin_qty) so the order
+                # matches what's actually on the exchange regardless of price movement.
+                # Deriving qty from bot_exposure / current_price overstates when price
+                # has fallen since the buy, causing PREVIEW_INSUFFICIENT_FUND.
+                _bot_bought  = self.bot_bought_qty.get(pair, 0)
+                _user_coins  = self.bot_coin_qty.get(pair, 0)
+                sell_qty_base = _bot_bought + _user_coins
                 bot_exp_usd  = self.bot_exposure.get(pair, 0)
-                coin_qty_val = self.bot_coin_qty.get(pair, 0) * vp if vp else 0
-                total_sell   = bot_exp_usd + coin_qty_val
-                amount_usd   = total_sell   # sell everything — no partial exits
+                amount_usd   = (sell_qty_base * vp) if (vp and sell_qty_base > 0) else bot_exp_usd
                 if amount_usd <= 0:
                     self.log_message(f"No holdings to sell for {pair}", "warn")
                     return
@@ -4848,7 +4855,7 @@ class Dashboard(ctk.CTkFrame):
                 else:
                     # Sell above ask by offset → guaranteed maker; more aggressive each retry
                     limit_px = round(ask + offset, qdp)
-                    raw_qty  = amount_usd / price
+                    raw_qty  = sell_qty_base if sell_qty_base > 0 else (amount_usd / price)
                     raw_qty  = math.floor(raw_qty * 10**bdp) / 10**bdp
                     min_qty  = 10 ** (-bdp)
                     if raw_qty < min_qty:
@@ -4929,7 +4936,7 @@ class Dashboard(ctk.CTkFrame):
                         quote_size=quote_str
                     )
                 else:
-                    raw_qty2 = amount_usd / price
+                    raw_qty2 = sell_qty_base if sell_qty_base > 0 else (amount_usd / price)
                     raw_qty2 = math.floor(raw_qty2 * 10**bdp) / 10**bdp
                     order_resp = await asyncio.to_thread(
                         self.client.market_order_sell,
@@ -4972,33 +4979,30 @@ class Dashboard(ctk.CTkFrame):
                     self.bot_pair_alloc[pair] = max(0, self.bot_pair_alloc[pair] - spent)
                 else:
                     self.bot_balance = max(0, self.bot_balance - spent)
-                self.bot_exposure[pair] += spent
-                # NOTE: bot_coin_qty is USER-allocation only. Bot-bought coins are
-                # tracked solely via bot_exposure (USD cost basis). Do NOT increment
-                # bot_coin_qty here — that would double-count coins in sell capacity
-                # and corrupt the proceeds routing user_frac/bot_frac split.
+                self.bot_exposure[pair]   += spent
+                self.bot_bought_qty[pair] += qty_filled
             else:
-                # H1 fix: route proceeds to the correct bucket based on coin source.
-                # bot_coin_qty coins came from user (not from bot-traded USD), so
-                # proceeds return to bot_balance (liquid bot pool), not bot_pair_alloc.
-                # bot_exposure coins came from bot buying with bot_pair_alloc USD, so
-                # proceeds return to bot_pair_alloc to replenish that trading budget.
+                # Route proceeds to the correct bucket based on coin source:
+                # bot_coin_qty (user-allocated coins) → bot_balance
+                # bot_bought_qty (bot-purchased coins) → bot_pair_alloc / bot_balance
                 coin_qty   = self.bot_coin_qty.get(pair, 0)
+                bot_bought = self.bot_bought_qty.get(pair, 0)
                 bot_exp    = self.bot_exposure.get(pair, 0)
-                total_qty  = coin_qty + (bot_exp / filled_price if filled_price else 0)
+                total_qty  = coin_qty + bot_bought
                 if total_qty > 0:
-                    # Proportional split of proceeds back to each bucket
-                    user_frac = coin_qty / total_qty if total_qty > 0 else 0
+                    user_frac = coin_qty / total_qty
                     bot_frac  = 1.0 - user_frac
                     self.bot_balance          += spent * user_frac
                     self.bot_pair_alloc[pair] += spent * bot_frac
                 else:
                     self.bot_balance += spent
-                # Drain tracked quantities — clamp to prevent negatives if price moved
-                drained_qty = min(qty_filled, coin_qty)
-                bot_frac_drain = bot_frac if total_qty > 0 else 0
-                self.bot_coin_qty[pair] = max(0, coin_qty - drained_qty)
-                self.bot_exposure[pair] = max(0, bot_exp - min(spent * bot_frac_drain, bot_exp))
+                    bot_frac = 1.0
+                # Drain user coins first, then bot-bought coins
+                drained_user = min(qty_filled, coin_qty)
+                drained_bot  = min(qty_filled - drained_user, bot_bought)
+                self.bot_coin_qty[pair]   = max(0, coin_qty - drained_user)
+                self.bot_bought_qty[pair] = max(0, bot_bought - drained_bot)
+                self.bot_exposure[pair]   = 0  # position fully closed
 
                 # ── Swap-on-sell ──────────────────────────────────────────────
                 await self._execute_swap(pair, spent)
@@ -5047,6 +5051,7 @@ class Dashboard(ctk.CTkFrame):
                 f"bot_balance=${self.bot_balance:.4f}  "
                 f"pair_alloc=${self.bot_pair_alloc[pair]:.4f}  "
                 f"bot_exposure=${self.bot_exposure[pair]:.4f}  "
+                f"bought_qty={self.bot_bought_qty[pair]:.4f}  "
                 f"coin_qty={self.bot_coin_qty[pair]:.4f}  "
                 f"order_id={order_id}", "trade")
             self._save_bot_state()
@@ -5253,10 +5258,10 @@ class Dashboard(ctk.CTkFrame):
                   else (trade['entry_price'] - cur_price) * close_filled_qty)
             proceeds = close_filled_qty * cur_price
             if close_side == 'sell':
-                # Drain coin sources proportionally (same logic as regular sell)
-                coin_qty = self.bot_coin_qty.get(pair, 0)
-                bot_exp  = self.bot_exposure.get(pair, 0)
-                total_q  = coin_qty + (bot_exp / cur_price if cur_price else 0)
+                coin_qty   = self.bot_coin_qty.get(pair, 0)
+                bot_bought = self.bot_bought_qty.get(pair, 0)
+                bot_exp    = self.bot_exposure.get(pair, 0)
+                total_q    = coin_qty + bot_bought
                 if total_q > 0:
                     user_frac = coin_qty / total_q
                     bot_frac  = 1.0 - user_frac
@@ -5264,9 +5269,11 @@ class Dashboard(ctk.CTkFrame):
                     self.bot_pair_alloc[pair] += proceeds * bot_frac
                 else:
                     self.bot_pair_alloc[pair] += proceeds
-                drained = min(qty, coin_qty)
-                self.bot_coin_qty[pair] = max(0, coin_qty - drained)
-                self.bot_exposure[pair] = max(0, bot_exp - proceeds * (1.0 - (coin_qty / total_q if total_q else 0)))
+                drained_user = min(qty, coin_qty)
+                drained_bot  = min(qty - drained_user, bot_bought)
+                self.bot_coin_qty[pair]   = max(0, coin_qty - drained_user)
+                self.bot_bought_qty[pair] = max(0, bot_bought - drained_bot)
+                self.bot_exposure[pair]   = 0  # position fully closed
                 # Apply swap-on-sell for SL/TP closes too
                 await self._execute_swap(pair, proceeds)
             else:
