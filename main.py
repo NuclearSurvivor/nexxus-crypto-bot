@@ -1899,7 +1899,7 @@ class Dashboard(ctk.CTkFrame):
             if sig:
                 side      = sig['side']
                 side_col  = C_GREEN if side == 'buy' else C_RED
-                ts_str    = datetime.fromtimestamp(sig['ts']).strftime("%b %d  %H:%M:%S")
+                ts_str    = datetime.fromtimestamp(sig['ts'], timezone.utc).strftime("%b %d  %H:%M:%S UTC")
                 self._bs_sig_side_lbl.configure(
                     text=side.upper(), text_color=side_col)
                 self._bs_sig_pair_lbl.configure(text=sig['pair'])
@@ -2341,6 +2341,11 @@ class Dashboard(ctk.CTkFrame):
                 _cl        = closes[-_n:]
                 _data_win  = data[-_n:]   # raw candle rows with timestamps
 
+                # Collect all confirmed crossovers; draw only the most recent
+                # BUY and the most recent SELL so the chart stays uncluttered.
+                # All crossovers are kept in _signal_data for hover tooltips.
+                _last_buy_sig  = None
+                _last_sell_sig = None
                 for i in range(1, _n):
                     prev = _mf[i - 1] - _ms[i - 1]
                     curr = _mf[i]     - _ms[i]
@@ -2356,31 +2361,30 @@ class Dashboard(ctk.CTkFrame):
                     conf_diff = _conf_diff_at(candle_ts_ms)
                     if conf_diff is not None:
                         if action == 'buy'  and conf_diff <= 0:
-                            continue   # conf TF disagrees — engine would reject
+                            continue
                         if action == 'sell' and conf_diff >= 0:
-                            continue   # conf TF disagrees — engine would reject
+                            continue
 
                     if action == 'buy':
                         y_pos  = _lo[i] - signal_offset
                         color  = C_GREEN
                         marker = "▲"
                         va     = 'top'
+                        _last_buy_sig = (i, y_pos, color, marker, va)
                     else:
                         y_pos  = _hi[i] + signal_offset
                         color  = C_RED
                         marker = "▼"
                         va     = 'bottom'
+                        _last_sell_sig = (i, y_pos, color, marker, va)
 
-                    ax.annotate(marker, (_ts[i], y_pos),
-                                color=color, fontsize=10, alpha=1.0,
-                                ha='center', va=va, fontweight='bold')
-
+                    _ts_str = _ts[i].strftime('%m-%d  %H:%M:%S')
                     self._signal_data.append({
                         'ts':           _ts[i],
                         'price':        y_pos,
                         'candle_price': float(_cl[i]),
                         'action':       action,
-                        'confirmed':    True,   # conf TF was checked above
+                        'confirmed':    True,
                         'source':       f'MA{p_fast}/MA{p_slow} Cross',
                         'price_str':    format_price(_cl[i]),
                         'time_str':     _ts[i].strftime('%Y-%m-%d %H:%M:%S UTC'),
@@ -2390,8 +2394,24 @@ class Dashboard(ctk.CTkFrame):
                         'p_slow':       p_slow,
                         'atr':          atr,
                     })
-                    if action == 'buy':  buy_signal_drawn  = True
-                    else:                sell_signal_drawn = True
+
+                # Draw only the most recent confirmed signal per direction
+                for _sig_draw in filter(None, [_last_buy_sig, _last_sell_sig]):
+                    _di, _dy, _dc, _dm, _dva = _sig_draw
+                    _ts_dt = _ts[_di]
+                    _cl_p  = float(_cl[_di])
+                    ax.annotate(_dm, (_ts_dt, _dy),
+                                color=_dc, fontsize=10, alpha=1.0,
+                                ha='center', va=_dva, fontweight='bold')
+                    # Time label directly below/above the arrow
+                    _time_lbl = _ts_dt.strftime('%H:%M:%S')
+                    _lbl_va   = 'top'    if _dva == 'bottom' else 'bottom'
+                    _lbl_y    = _dy + signal_offset * 0.8 if _dva == 'bottom' else _dy - signal_offset * 0.8
+                    ax.annotate(_time_lbl, (_ts_dt, _lbl_y),
+                                color=_dc, fontsize=6, alpha=0.85,
+                                ha='center', va=_lbl_va)
+                    if _dm == "▲":  buy_signal_drawn  = True
+                    else:            sell_signal_drawn = True
 
             # ── 6b. Breakout signals (signal TF only — matches calculate_breakout) ─
             if len(data) >= 25:
@@ -2402,6 +2422,7 @@ class Dashboard(ctk.CTkFrame):
                 _vol_a = np.array([c[5] for c in data])
                 _ma9_last  = float(ma_lines.get(p_fast, [0])[-1]) if len(ma_lines.get(p_fast, [])) > 0 else 0
                 _ma20_last = float(ma_lines.get(p_slow, [0])[-1]) if len(ma_lines.get(p_slow, [])) > 0 else 0
+                _last_bo = None   # most recent breakout (any direction)
                 for i in range(_lb + 4, len(data)):
                     _cur    = _cl_a[i]
                     _prev   = _cl_a[i - 1]
@@ -2412,9 +2433,6 @@ class Dashboard(ctk.CTkFrame):
                     _mom    = (_cur - _prev) / _prev if _prev > 0 else 0
                     if _cur > _p_hi and (_vsurge or _mom > 0.02):
                         y_pos = _lo_a[i] - signal_offset * 2.2
-                        ax.annotate("⚡", (ts[i], y_pos),
-                                    color=C_ACCENT3, fontsize=9,
-                                    ha='center', va='top', fontweight='bold')
                         self._signal_data.append({
                             'ts':           ts[i],
                             'price':        y_pos,
@@ -2430,12 +2448,9 @@ class Dashboard(ctk.CTkFrame):
                             'p_slow':       p_slow,
                             'atr':          atr,
                         })
-                        breakout_drawn = True
+                        _last_bo = (i, y_pos, 'top')
                     elif _cur < _p_lo and (_vsurge or _mom < -0.02):
                         y_pos = _hi_a[i] + signal_offset * 2.2
-                        ax.annotate("⚡", (ts[i], y_pos),
-                                    color=C_ACCENT3, fontsize=9,
-                                    ha='center', va='bottom', fontweight='bold')
                         self._signal_data.append({
                             'ts':           ts[i],
                             'price':        y_pos,
@@ -2451,7 +2466,19 @@ class Dashboard(ctk.CTkFrame):
                             'p_slow':       p_slow,
                             'atr':          atr,
                         })
-                        breakout_drawn = True
+                        _last_bo = (i, y_pos, 'bottom')
+
+                # Draw only the most recent breakout signal
+                if _last_bo:
+                    _bi, _by, _bva = _last_bo
+                    ax.annotate("⚡", (ts[_bi], _by),
+                                color=C_ACCENT3, fontsize=9,
+                                ha='center', va=_bva, fontweight='bold')
+                    _bo_lbl_y = _by + signal_offset * 0.8 if _bva == 'bottom' else _by - signal_offset * 0.8
+                    ax.annotate(ts[_bi].strftime('%H:%M:%S'), (ts[_bi], _bo_lbl_y),
+                                color=C_ACCENT3, fontsize=6, alpha=0.85,
+                                ha='center', va='top' if _bva == 'bottom' else 'bottom')
+                    breakout_drawn = True
 
         # ── 7. Live price line lives in the blit layer (_on_render_complete) ───
         # Excluded from the static render so 1s ticks cost <5ms not ~150ms.
@@ -2760,7 +2787,7 @@ class Dashboard(ctk.CTkFrame):
             _la = _es_key['side']
             _lp = format_price(_es_key['price'])
             try:
-                _lt = datetime.fromtimestamp(_es_key['ts'], timezone.utc).strftime('%m-%d %H:%M')
+                _lt = datetime.fromtimestamp(_es_key['ts'], timezone.utc).strftime('%m-%d  %H:%M:%S')
             except Exception:
                 _lt = ''
             _lc = C_GREEN if _la == 'buy' else C_RED
@@ -4954,15 +4981,27 @@ class Dashboard(ctk.CTkFrame):
                     self.log_message(
                         f"Market order REJECTED {pair} {side.upper()}: {reason}{detail}", "error")
                     return
-                filled_price = price   # best we can do for market fills
+                filled_price = price
                 sr   = (raw.get('success_response', {}) or {})
+                mkt_placed_id = sr.get('order_id') or order_id
                 avg2 = float(sr.get('average_filled_price', 0) or 0)
                 if avg2 > 0 and (price == 0 or abs(avg2 - price) / price < 0.20):
                     filled_price = avg2
-                # Try to extract qty_filled from the market order response
                 qty_f2 = float(sr.get('filled_size', 0) or 0)
                 if qty_f2 > 0:
                     qty_filled = qty_f2
+                else:
+                    # Market orders fill in ~1s; poll for actual filled_size so fees
+                    # are already deducted from the qty (avoids overstating bot_bought_qty
+                    # and getting PREVIEW_INSUFFICIENT_FUND on subsequent sell).
+                    mkt_filled = await self._wait_for_fill(mkt_placed_id, timeout_s=30)
+                    if mkt_filled:
+                        avg3 = float(mkt_filled.get('average_filled_price', 0) or 0)
+                        if avg3 > 0 and (price == 0 or abs(avg3 - price) / price < 0.20):
+                            filled_price = avg3
+                        qty_f3 = float(mkt_filled.get('filled_size', 0) or 0)
+                        if qty_f3 > 0:
+                            qty_filled = qty_f3
 
             if qty_filled is None:
                 qty_filled = amount_usd / filled_price if filled_price else 0
