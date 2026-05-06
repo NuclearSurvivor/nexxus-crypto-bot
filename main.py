@@ -2341,11 +2341,6 @@ class Dashboard(ctk.CTkFrame):
                 _cl        = closes[-_n:]
                 _data_win  = data[-_n:]   # raw candle rows with timestamps
 
-                # Collect all confirmed crossovers; draw only the most recent
-                # BUY and the most recent SELL so the chart stays uncluttered.
-                # All crossovers are kept in _signal_data for hover tooltips.
-                _last_buy_sig  = None
-                _last_sell_sig = None
                 for i in range(1, _n):
                     prev = _mf[i - 1] - _ms[i - 1]
                     curr = _mf[i]     - _ms[i]
@@ -2370,15 +2365,23 @@ class Dashboard(ctk.CTkFrame):
                         color  = C_GREEN
                         marker = "▲"
                         va     = 'top'
-                        _last_buy_sig = (i, y_pos, color, marker, va)
                     else:
                         y_pos  = _hi[i] + signal_offset
                         color  = C_RED
                         marker = "▼"
                         va     = 'bottom'
-                        _last_sell_sig = (i, y_pos, color, marker, va)
 
-                    _ts_str = _ts[i].strftime('%m-%d  %H:%M:%S')
+                    ax.annotate(marker, (_ts[i], y_pos),
+                                color=color, fontsize=10, alpha=1.0,
+                                ha='center', va=va, fontweight='bold')
+                    # Exact time label attached to every signal arrow
+                    _sig_time = _ts[i].strftime('%H:%M:%S')
+                    _lbl_va2  = 'top' if va == 'bottom' else 'bottom'
+                    _lbl_y2   = y_pos + signal_offset * 0.8 if va == 'bottom' else y_pos - signal_offset * 0.8
+                    ax.annotate(_sig_time, (_ts[i], _lbl_y2),
+                                color=color, fontsize=6, alpha=0.8,
+                                ha='center', va=_lbl_va2)
+
                     self._signal_data.append({
                         'ts':           _ts[i],
                         'price':        y_pos,
@@ -2394,24 +2397,8 @@ class Dashboard(ctk.CTkFrame):
                         'p_slow':       p_slow,
                         'atr':          atr,
                     })
-
-                # Draw only the most recent confirmed signal per direction
-                for _sig_draw in filter(None, [_last_buy_sig, _last_sell_sig]):
-                    _di, _dy, _dc, _dm, _dva = _sig_draw
-                    _ts_dt = _ts[_di]
-                    _cl_p  = float(_cl[_di])
-                    ax.annotate(_dm, (_ts_dt, _dy),
-                                color=_dc, fontsize=10, alpha=1.0,
-                                ha='center', va=_dva, fontweight='bold')
-                    # Time label directly below/above the arrow
-                    _time_lbl = _ts_dt.strftime('%H:%M:%S')
-                    _lbl_va   = 'top'    if _dva == 'bottom' else 'bottom'
-                    _lbl_y    = _dy + signal_offset * 0.8 if _dva == 'bottom' else _dy - signal_offset * 0.8
-                    ax.annotate(_time_lbl, (_ts_dt, _lbl_y),
-                                color=_dc, fontsize=6, alpha=0.85,
-                                ha='center', va=_lbl_va)
-                    if _dm == "▲":  buy_signal_drawn  = True
-                    else:            sell_signal_drawn = True
+                    if action == 'buy':  buy_signal_drawn  = True
+                    else:                sell_signal_drawn = True
 
             # ── 6b. Breakout signals (signal TF only — matches calculate_breakout) ─
             if len(data) >= 25:
@@ -3273,7 +3260,7 @@ class Dashboard(ctk.CTkFrame):
         return win
 
     def _open_allocate(self, default_pair: str = None):
-        win = self._popup("Allocate to Bot", 460, 560)
+        win = self._popup("Allocate to Bot", 460, 640)
 
         ctk.CTkLabel(win, text="＋  Allocate to Bot",
                      font=_F15B, text_color=C_TEXT).pack(pady=(18, 0))
@@ -3378,8 +3365,13 @@ class Dashboard(ctk.CTkFrame):
             p    = pair_var.get()
             coin = p.split("-")[0]
             if _usd_bot_lbl_ref[0]:
+                spendable = max(0, _source_balance() - MINIMUM_RESERVE)
+                reserve_note = (f"  ·  spendable after ${MINIMUM_RESERVE:.0f} reserve: "
+                                f"${spendable:.2f}")
                 _usd_bot_lbl_ref[0].configure(
-                    text=f"Bot wallet ({coin}):  ${self.bot_pair_alloc.get(p,0):,.2f}")
+                    text=f"Bot wallet ({coin}):  ${self.bot_pair_alloc.get(p,0):,.2f}"
+                         f"{reserve_note}",
+                    text_color=C_ORANGE if spendable < MINIMUM_RESERVE else C_MUTED)
 
         # ── Coin Holdings ─────────────────────────────────────────────────────
         coin_frame  = ctk.CTkFrame(mode_area, fg_color="transparent")
@@ -4273,8 +4265,9 @@ class Dashboard(ctk.CTkFrame):
             # Capital gates — matched to what _place_order will actually accept.
             # BUY needs USD (bot_balance or bot_pair_alloc >= reserve).
             # SELL needs coins (bot_exposure or bot_coin_qty > 0).
-            _can_buy  = (self.bot_pair_alloc.get(pair, 0) >= MINIMUM_RESERVE
-                         or self.bot_balance >= MINIMUM_RESERVE)
+            _spendable = max(0, max(self.bot_pair_alloc.get(pair, 0),
+                                     self.bot_balance) - MINIMUM_RESERVE)
+            _can_buy  = _spendable >= 5.0
             _can_sell = (self.bot_exposure[pair] > 0
                          or self.bot_coin_qty.get(pair, 0) > 0)
             cap = _can_buy or _can_sell
@@ -4795,11 +4788,11 @@ class Dashboard(ctk.CTkFrame):
                 # 100% of balance leaves nothing for that hold and causes
                 # PREVIEW_INSUFFICIENT_FUND on every attempt.
                 amount_usd = avail_funds - MINIMUM_RESERVE
-                if amount_usd < MINIMUM_RESERVE:
+                if amount_usd < 5.0:
                     self.log_message(
                         f"Buy {pair} skipped — spendable ${amount_usd:.2f} "
                         f"(${avail_funds:.2f} − reserve ${MINIMUM_RESERVE:.2f}) "
-                        f"is below minimum order size ${MINIMUM_RESERVE:.2f}", "warn")
+                        f"below $5.00 minimum", "warn")
                     return
                 total_cap  = avail_funds + sum(self.bot_exposure.values())
                 if self.bot_exposure[pair] + amount_usd > MAX_EXPOSURE_PER_PAIR * total_cap:
