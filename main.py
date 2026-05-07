@@ -1783,7 +1783,7 @@ class Dashboard(ctk.CTkFrame):
                 self.bot_coin_qty.get(p, 0) * self.live_prices.get(p, 0)
                 for p in TRADING_PAIRS
             )
-            bot_display_total = min(bot_total + coin_holdings_val_mc, portfolio)
+            bot_display_total = bot_total + coin_holdings_val_mc
             alloc_lines = []
             for p in TRADING_PAIRS:
                 usd_p  = self.bot_pair_alloc.get(p, 0)
@@ -3729,9 +3729,9 @@ class Dashboard(ctk.CTkFrame):
                     if val > avail + 1e-9:
                         err.configure(text=f"Max from {src}: ${avail:,.2f}")
                         return
-                    # Deduct from overall usd_balance regardless of sub-bucket —
-                    # usdc/usdt are already counted inside usd_balance at fetch time.
-                    self.usd_balance       -= val
+                    # bot_pair_alloc earmarks the budget; the USDC stays in Coinbase.
+                    # _source_balance() subtracts sum(bot_pair_alloc) to prevent
+                    # double-counting — do NOT deduct from usd_balance here.
                     self.bot_pair_alloc[p] += val
                     src_tag = f" [{src}]" if src != "Total" else ""
                     self.log_message(
@@ -4267,6 +4267,12 @@ class Dashboard(ctk.CTkFrame):
                         "warn")
                     self.bot_bought_qty[_pair] = 0.0
                     self.bot_exposure[_pair]   = 0.0
+                    _stale_tids = [k for k, v in self.trade_history.items()
+                                   if v.get('symbol') == _pair]
+                    for _k in _stale_tids:
+                        del self.trade_history[_k]
+                    if _stale_tids:
+                        self.root.after(0, self._refresh_trade_rows)
                     _state_changed = True
             if _state_changed:
                 self._save_bot_state()
