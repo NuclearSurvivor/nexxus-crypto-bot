@@ -492,16 +492,20 @@ class Dashboard(ctk.CTkFrame):
         self.paused          = False
         self.root_alive      = True
 
-        # Seed last_executed_signal from the most recent trade in history so the
-        # key panel shows the last signal immediately on startup without needing
-        # to wait for a new trade to fire in the current session.
+        # Seed last_executed_signal from the MOST RECENT fill across all sources
+        # so the chart badge and key panel always show the correct last order.
+        # Strategy: collect candidates from trade_history AND bot.log, take the newest.
+        # Previously the log scan was skipped when trade_history was non-empty, so a
+        # more-recent SELL in bot.log was silently overridden by an older open BUY.
         self.last_executed_signal = None
         _les_best_ts = -1
+
+        # Source 1: open BUY records in trade_history (in-memory positions)
         for _les_t in self.trade_history.values():
             _les_ts = float(_les_t.get('timestamp', 0))
-            if _les_ts > _les_best_ts:
-                _les_best_ts = _les_ts
-                _les_ms = _les_ts / 1000.0 if _les_ts > 1e12 else _les_ts
+            _les_ms = _les_ts / 1000.0 if _les_ts > 1e12 else _les_ts
+            if _les_ms > _les_best_ts:
+                _les_best_ts = _les_ms
                 self.last_executed_signal = {
                     'pair':   _les_t.get('symbol', _les_t.get('pair', '')),
                     'side':   _les_t.get('side', ''),
@@ -511,29 +515,31 @@ class Dashboard(ctk.CTkFrame):
                     'source': 'history',
                 }
 
-        if self.last_executed_signal is None:
-            _best_fill = None
+        # Source 2: bot.log — always scanned so a recent SELL beats an older open BUY
+        _best_fill = None
+        try:
+            with open(_BOT_LOG_PATH, 'r', errors='replace') as _lf:
+                for _line in _lf:
+                    _m = _FILL_LOG_PAT.search(_line)
+                    if _m:
+                        _best_fill = _m   # last match wins
+        except Exception:
+            pass
+        if _best_fill:
             try:
-                with open(_BOT_LOG_PATH, 'r', errors='replace') as _lf:
-                    for _line in _lf:
-                        _m = _FILL_LOG_PAT.search(_line)
-                        if _m:
-                            _best_fill = _m   # last match wins (latest entry)
-            except Exception:
-                pass
-            if _best_fill:
-                try:
-                    _ts = datetime.strptime(_best_fill.group(1), '%Y-%m-%d %H:%M:%S').timestamp()
+                _log_ts = datetime.strptime(
+                    _best_fill.group(1), '%Y-%m-%d %H:%M:%S').timestamp()
+                if _log_ts > _les_best_ts:
                     self.last_executed_signal = {
                         'pair':   _best_fill.group(3),
                         'side':   _best_fill.group(2).lower(),
                         'price':  float(_best_fill.group(4)),
                         'qty':    0.0,
-                        'ts':     _ts,
+                        'ts':     _log_ts,
                         'source': 'log',
                     }
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
         self.indicator_engine = IndicatorEngine()
         self.strategy         = MACrossover(self.indicator_engine)
@@ -567,11 +573,15 @@ class Dashboard(ctk.CTkFrame):
         # redraw the live price line (restore_region + draw_artist + blit = <5ms).
         self._render_executor  = ThreadPoolExecutor(max_workers=1,
                                                     thread_name_prefix='chart_render')
-        self._chart_rendering  = False   # True while background render in flight
-        self._chart_dirty      = False   # True when new candle data arrived
-        self._chart_bg         = None    # saved region for blit (no price line)
-        self._chart_bg_valid   = False   # False whenever bg needs to be re-saved
-        self._price_line_artist = None   # axhline drawn on blit layer
+        self._chart_rendering  = False
+        self._chart_dirty      = False
+        self._chart_bg         = None
+        self._chart_bg_valid   = False
+        self._price_line_artist = None
+        # Loading animation state
+        self._spinner_running  = False
+        self._spinner_frame    = 0
+        self._pair_loading: set = set()   # pairs currently fetching candles
 
         # ── Pre-populate candle history from disk cache ───────────────────────
         # Charts render immediately on startup; live API fills in newer candles.
@@ -1144,6 +1154,11 @@ class Dashboard(ctk.CTkFrame):
             command=lambda: self._open_allocate(self.chart_pair_var.get())
         ).pack(side="right", padx=(3, 0), pady=10)
 
+        # Spinner — shows while chart renders or candles are loading
+        self._chart_spinner_lbl = ctk.CTkLabel(
+            row, text="", font=(_MON, 11), text_color=C_ACCENT, width=16)
+        self._chart_spinner_lbl.pack(side="right", padx=(0, 6))
+
         ctk.CTkFrame(row, width=1, fg_color=C_BORDER2).pack(
             side="right", fill="y", padx=8, pady=10)
 
@@ -1161,6 +1176,13 @@ class Dashboard(ctk.CTkFrame):
         # ── Chart canvas fills all remaining space ────────────────────────────
         cf = ctk.CTkFrame(page, fg_color=C_CHART_BG, corner_radius=0)
         cf.pack(fill="both", expand=True)
+
+        # Thin animated loading bar — shown while chart is rendering or candles loading
+        self._chart_load_bar = ctk.CTkProgressBar(
+            cf, height=2, corner_radius=0,
+            fg_color=C_CHART_BG, progress_color=C_ACCENT,
+            mode="indeterminate")
+        # Not packed yet — shown dynamically by _start_loading()
 
         self.chart_fig = plt.figure(figsize=(13, 7))
         self.chart_fig.patch.set_facecolor(C_CHART_BG)
@@ -2059,6 +2081,7 @@ class Dashboard(ctk.CTkFrame):
 
     # ── Chart drawing ─────────────────────────────────────────────────────────
     def _refresh_chart(self, _=None):
+        self._start_loading()
         pair = self.chart_pair_var.get()
         tf   = self.chart_tf_var.get()
         data = list(self.candle_history[tf][pair])
@@ -2856,10 +2879,12 @@ class Dashboard(ctk.CTkFrame):
                 self.chart_canvas.blit(self.chart_ax.bbox)
         except Exception:
             self._chart_bg_valid = False
-        # If new candle data arrived while we were rendering, re-render now
+        # If new candle data arrived while rendering, re-render (keeps spinner going)
         if self._chart_dirty:
             self._chart_dirty = False
             self._refresh_chart()
+        else:
+            self._stop_loading()
 
     def _chart_blit_price(self):
         """Sub-5ms price line update: restore saved background + draw line + blit."""
@@ -2873,6 +2898,46 @@ class Dashboard(ctk.CTkFrame):
             self.chart_canvas.blit(self.chart_ax.bbox)
         except Exception:
             self._chart_bg_valid = False
+
+    # ── Loading animation ─────────────────────────────────────────────────────
+    _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def _start_loading(self):
+        """Show the thin progress bar + start braille spinner in the chart header."""
+        if not self.root_alive or self._spinner_running:
+            return
+        self._spinner_running = True
+        try:
+            self._chart_load_bar.pack(
+                fill="x", before=self.chart_canvas.get_tk_widget())
+            self._chart_load_bar.start()
+        except Exception:
+            pass
+        self._spinner_tick()
+
+    def _stop_loading(self):
+        """Hide the progress bar and clear the spinner."""
+        self._spinner_running = False
+        try:
+            self._chart_load_bar.stop()
+            self._chart_load_bar.pack_forget()
+        except Exception:
+            pass
+        try:
+            self._chart_spinner_lbl.configure(text="")
+        except Exception:
+            pass
+
+    def _spinner_tick(self):
+        if not self._spinner_running or not self.root_alive:
+            return
+        try:
+            self._chart_spinner_lbl.configure(
+                text=self._SPINNER[self._spinner_frame % len(self._SPINNER)])
+        except Exception:
+            pass
+        self._spinner_frame += 1
+        self.root.after(80, self._spinner_tick)
 
     # ── Order book popup ──────────────────────────────────────────────────────
     def _open_orderbook(self):
@@ -4172,6 +4237,12 @@ class Dashboard(ctk.CTkFrame):
         capped at COINBASE_MAX_CANDLES (300); we walk backward in time until we
         have enough, pausing 0.35 s between batches to stay inside rate limits.
         """
+        is_active = (pair == self.chart_pair_var.get() and
+                     timeframe == self.chart_tf_var.get())
+        if is_active:
+            self._pair_loading.add(pair)
+            if self.root_alive:
+                self.root.after(0, self._start_loading)
         gran        = TF_TO_GRANULARITY[timeframe]
         seconds_per = {'1m': 60, '5m': 300, '1h': 3600, '1d': 86400}[timeframe]
         target      = FETCH_CANDLES.get(timeframe, COINBASE_MAX_CANDLES)
@@ -4201,6 +4272,8 @@ class Dashboard(ctk.CTkFrame):
                 break                      # exchange has no more history
             if len(all_candles) < target:
                 await asyncio.sleep(0.35)  # rate-limit between batch calls
+
+        self._pair_loading.discard(pair)
 
         if all_candles:
             span_from = datetime.fromtimestamp(all_candles[0][0]  / 1000, timezone.utc).strftime('%Y-%m-%d %H:%M')
