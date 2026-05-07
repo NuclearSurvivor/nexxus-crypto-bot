@@ -482,18 +482,22 @@ class Dashboard(ctk.CTkFrame):
         for _p, _v in _s.get('bot_coin_qty', {}).items():
             if _p in TRADING_PAIRS and float(_v) > 0:
                 self.bot_coin_qty[_p] = float(_v)
-        # bot_exposure: load from config when available (set precisely after every
-        # fill).  Fall back to trade_history reconstruction for old configs that
-        # pre-date persistence (backward compatibility only).
+        # bot_exposure: load from config when available.  Only keep entries where
+        # bot_bought_qty is also > 0 — if bot_bought_qty was cleared (position sold)
+        # but bot_exposure persisted from an old session, the exposure is stale and
+        # would incorrectly show a pair as "deployed" (e.g. ETH after XCN allocation).
         if 'bot_exposure' in _s:
             for _p, _v in _s.get('bot_exposure', {}).items():
-                if _p in TRADING_PAIRS:
-                    self.bot_exposure[_p] = float(_v)
+                if _p in TRADING_PAIRS and float(_v) > 0:
+                    if self.bot_bought_qty.get(_p, 0) > 0:
+                        self.bot_exposure[_p] = float(_v)
+                    # else: stale — bot_bought_qty=0 means position was closed; skip
         else:
+            # Fallback for configs pre-dating bot_exposure persistence
             for _t in self.trade_history.values():
                 if _t.get('event') == 'trade' and _t.get('side') == 'buy':
                     _tp = _t.get('symbol', '')
-                    if _tp in TRADING_PAIRS:
+                    if _tp in TRADING_PAIRS and self.bot_bought_qty.get(_tp, 0) > 0:
                         self.bot_exposure[_tp] += float(_t.get('entry_price', 0)) * float(_t.get('quantity', 0))
 
         self.running         = True
@@ -3784,10 +3788,12 @@ class Dashboard(ctk.CTkFrame):
             for _p in TRADING_PAIRS:
                 self.bot_pair_alloc[_p] = 0.0
                 self.bot_coin_qty[_p]   = 0.0
+                self.bot_bought_qty[_p] = 0.0
+                self.bot_exposure[_p]   = 0.0
             self._save_bot_state()
             self._update_metrics()
             self.log_message(
-                f"Unallocated all bot funds (${total_usd:,.2f} USD + all coin holdings) → default state",
+                f"Unallocated all bot funds (${total_usd:,.2f} USD + all coin/exposure) → default state",
                 "trade")
             win.destroy()
 
