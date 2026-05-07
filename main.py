@@ -470,15 +470,18 @@ class Dashboard(ctk.CTkFrame):
         self.auto_compound_cap      = float(_s.get('auto_compound_cap', 500.0))  # max order USD
 
         # ── Restore persisted bot pool balances ───────────────────────────────
-        # bot_balance and bot_pair_alloc are saved to config.json after every
-        # trade and allocation so cash accumulated from sell cycles survives
-        # restarts and isn't silently lost.
         self.bot_balance = float(_s.get('bot_balance', 0.0))
         for _p, _v in _s.get('bot_pair_alloc', {}).items():
             if _p in TRADING_PAIRS:
                 self.bot_pair_alloc[_p] = float(_v)
-        # Reconstruct bot_exposure from any open BUY trades persisted in trades.json
-        # so the monitor loop has correct state if the bot is restarted mid-position.
+        # bot_bought_qty: exact coin qty from each bot buy — persisted so the
+        # correct sell size survives restarts.
+        for _p, _v in _s.get('bot_bought_qty', {}).items():
+            if _p in TRADING_PAIRS and float(_v) > 0:
+                self.bot_bought_qty[_p] = float(_v)
+        # bot_exposure: reconstruct from open BUY trades in trades.json.
+        # trade_history entries are removed when the position is closed (sell fill
+        # or SL/TP), so this only reflects genuinely open positions.
         for _t in self.trade_history.values():
             if _t.get('event') == 'trade' and _t.get('side') == 'buy':
                 _tp = _t.get('symbol', '')
@@ -3977,19 +3980,15 @@ class Dashboard(ctk.CTkFrame):
             await asyncio.sleep(60)
 
     def _save_bot_state(self):
-        """Persist bot_balance and bot_pair_alloc to config.json.
-
-        Called after every trade fill and every manual allocation so that
-        cash accumulated from sell cycles (partial buybacks, profit) survives
-        restarts. bot_exposure is NOT persisted here — it's reconstructed from
-        trades.json entries on startup.
-        """
         try:
             s = load_user_settings()
             s['bot_balance']    = round(self.bot_balance, 6)
             s['bot_pair_alloc'] = {p: round(v, 6)
                                    for p, v in self.bot_pair_alloc.items()
                                    if v > 0.001}
+            s['bot_bought_qty'] = {p: round(v, 8)
+                                   for p, v in self.bot_bought_qty.items()
+                                   if v > 0}
             save_user_settings(s)
         except Exception as e:
             logger.warning(f"Could not save bot state: {e}")
@@ -4269,7 +4268,8 @@ class Dashboard(ctk.CTkFrame):
                                      self.bot_balance) - MINIMUM_RESERVE)
             _can_buy  = _spendable >= 5.0
             _can_sell = (self.bot_exposure[pair] > 0
-                         or self.bot_coin_qty.get(pair, 0) > 0)
+                         or self.bot_coin_qty.get(pair, 0) > 0
+                         or self.bot_bought_qty.get(pair, 0) > 0)
             cap = _can_buy or _can_sell
             # Log capital state on every signal-TF candle close for full traceability
             self.log_message(
@@ -5038,6 +5038,16 @@ class Dashboard(ctk.CTkFrame):
 
                 # ── Swap-on-sell ──────────────────────────────────────────────
                 await self._execute_swap(pair, spent)
+
+                # Remove any open buy trade_history entries for this pair so that
+                # bot_exposure is not incorrectly reconstructed as non-zero after
+                # restart when the position has already been closed.
+                _closed_tids = [k for k, v in self.trade_history.items()
+                                if v.get('symbol') == pair and v.get('side') == 'buy']
+                for _tid in _closed_tids:
+                    del self.trade_history[_tid]
+                if _closed_tids:
+                    await asyncio.to_thread(save_trade_history, self.trade_history)
 
             # Only BUY fills get a monitored SL/TP trade record.
             # SELL signals liquidate coin holdings to USD — the bot is long-only.
