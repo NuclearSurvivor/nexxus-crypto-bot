@@ -79,6 +79,13 @@ logger = logging.getLogger("nexxus")
 logging.getLogger('websockets').setLevel(logging.WARNING)
 logging.getLogger('websockets.client').setLevel(logging.WARNING)
 
+# ── Windows asyncio event-loop policy ────────────────────────────────────────
+# ProactorEventLoop is the Windows default since Python 3.8, but it has edge-
+# case compatibility issues with websockets and some networking libs.
+# SelectorEventLoop is fully supported on Windows and matches Linux behaviour.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 # ── Theme ─────────────────────────────────────────────────────────────────────
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -216,15 +223,27 @@ except Exception:
 
 # Render budget — throttles hover/drag redraws to the monitor's native refresh rate
 def _detect_monitor_hz() -> float:
-    """Query xrandr for the active display refresh rate; fall back to 60."""
+    """Query the display refresh rate; falls back to 60 Hz on any error."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            dc = ctypes.windll.user32.GetDC(0)
+            hz = ctypes.windll.gdi32.GetDeviceCaps(dc, 116)  # VREFRESH = 116
+            ctypes.windll.user32.ReleaseDC(0, dc)
+            if 24 <= hz <= 500:
+                return float(hz)
+        except Exception:
+            pass
+        return 60.0
+    # Linux / macOS: query xrandr
     try:
-        import subprocess, re
+        import subprocess
         out = subprocess.check_output(['xrandr'], text=True, timeout=2)
         for line in out.splitlines():
             m = re.search(r'([\d.]+)\*', line)
             if m:
                 hz = float(m.group(1))
-                if 24 <= hz <= 500:   # sanity range
+                if 24 <= hz <= 500:
                     return hz
     except Exception:
         pass
