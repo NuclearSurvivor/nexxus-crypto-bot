@@ -479,14 +479,22 @@ class Dashboard(ctk.CTkFrame):
         for _p, _v in _s.get('bot_bought_qty', {}).items():
             if _p in TRADING_PAIRS and float(_v) > 0:
                 self.bot_bought_qty[_p] = float(_v)
-        # bot_exposure: reconstruct from open BUY trades in trades.json.
-        # trade_history entries are removed when the position is closed (sell fill
-        # or SL/TP), so this only reflects genuinely open positions.
-        for _t in self.trade_history.values():
-            if _t.get('event') == 'trade' and _t.get('side') == 'buy':
-                _tp = _t.get('symbol', '')
-                if _tp in TRADING_PAIRS:
-                    self.bot_exposure[_tp] += float(_t.get('entry_price', 0)) * float(_t.get('quantity', 0))
+        for _p, _v in _s.get('bot_coin_qty', {}).items():
+            if _p in TRADING_PAIRS and float(_v) > 0:
+                self.bot_coin_qty[_p] = float(_v)
+        # bot_exposure: load from config when available (set precisely after every
+        # fill).  Fall back to trade_history reconstruction for old configs that
+        # pre-date persistence (backward compatibility only).
+        if 'bot_exposure' in _s:
+            for _p, _v in _s.get('bot_exposure', {}).items():
+                if _p in TRADING_PAIRS:
+                    self.bot_exposure[_p] = float(_v)
+        else:
+            for _t in self.trade_history.values():
+                if _t.get('event') == 'trade' and _t.get('side') == 'buy':
+                    _tp = _t.get('symbol', '')
+                    if _tp in TRADING_PAIRS:
+                        self.bot_exposure[_tp] += float(_t.get('entry_price', 0)) * float(_t.get('quantity', 0))
 
         self.running         = True
         self.paused          = False
@@ -4054,6 +4062,11 @@ class Dashboard(ctk.CTkFrame):
             s['bot_bought_qty'] = {p: round(v, 8)
                                    for p, v in self.bot_bought_qty.items()
                                    if v > 0}
+            s['bot_coin_qty']   = {p: round(v, 8)
+                                   for p, v in self.bot_coin_qty.items()
+                                   if v > 0}
+            s['bot_exposure']   = {p: round(v, 6)
+                                   for p, v in self.bot_exposure.items()}
             save_user_settings(s)
         except Exception as e:
             logger.warning(f"Could not save bot state: {e}")
@@ -5543,8 +5556,13 @@ class App(ctk.CTk):
         self.dashboard = Dashboard(self, key, secret, passphrase)
 
     def _on_close(self):
-        save_trade_history(self.dashboard.trade_history if self.dashboard else {})
-        os._exit(0)   # instant kill — no hanging threads or loops
+        if self.dashboard:
+            save_trade_history(self.dashboard.trade_history)
+            try:
+                self.dashboard._save_bot_state()
+            except Exception:
+                pass
+        os._exit(0)
 
 
 if __name__ == "__main__":
