@@ -8,7 +8,31 @@
 
 ## Version History
 
-### v1.0.7b *(current)*
+### v1.0.16b *(current)*
+
+#### Performance — GUI Responsiveness Overhaul
+
+- **Topbar ticker throttled** — WebSocket ticks were scheduling a `root.after(0, ...)` on every price update (up to 20/s for BTC), hammering the Tk main thread. Now uses a dirty-flag set drained by the 100ms `_ui_tick`, eliminating ~95% of redundant `configure()` calls.
+- **Lazy page build** — all five pages were constructed at startup, building ~200 widgets before the window appeared. Charts, Trades, Settings, and Logs pages are now built on first navigation. Startup only pays for the dashboard (~40 widgets); pages appear instantly when first visited.
+- **Allocate dialog — instant open** — dialog window was hidden while 30+ widgets were built synchronously, making it feel frozen. Now uses `withdraw()` + all-widgets-built + `deiconify()` so it appears fully formed with no flash or lag.
+- **Settings cache — no disk read on every save** — `_save_bot_state()` previously read `config.json` from disk before every write (triggered on every signal, allocation, and balance sync). Now uses an in-memory settings dict, eliminating disk I/O from the hot path.
+- **Log batching** — every `log_message()` call was scheduling an individual `root.after(0, ...)` which caused rapid-fire text inserts during startup candle fetches. Messages now queue to a deque and are flushed in batches of 30 per `_ui_tick` (single `state` toggle and `see("end")` per batch).
+- **Order book bisect** — Coinbase `level2` WS updates were calling `list.sort()` on every single price-level change, O(n log n) per event. Replaced with binary-search insertion (O(log n)) for asks and a custom descending-insert for bids — sorted order maintained without a full sort.
+- **Pair card dirty flag extended** — candle ingest path was calling `root.after(0, _update_pair_cards)` directly; now sets the dirty flag so the 100ms tick coalesces it with other updates.
+
+---
+
+### v1.0.13b–v1.0.14b
+
+#### Bug Fixes
+- **Portfolio shows correct value after USDC allocation** — removed `usd_balance -= val` from allocate confirm; USDC stays in Coinbase, only the earmark changes. `_source_balance()` already prevents double-counting via `bot_pair_alloc`.
+- **BOT BALANCE cap removed** — removed `min(bot_total, portfolio)` ceiling so earmarked funds display correctly before any trade executes.
+- **Ghost ETH/BTC in trade panel** — stale-position auto-clear now also purges matching `trade_history` rows so closed positions no longer appear as active buys.
+- **Topbar P&L cutoff** — topbar height increased from 62px to 78px, badge padding trimmed so all three lines (Portfolio / P&L / Allocated) are fully visible.
+
+---
+
+### v1.0.7b
 
 #### Scalping Mode — Full Port, Strict Alternation
 

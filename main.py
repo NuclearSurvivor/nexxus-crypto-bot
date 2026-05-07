@@ -432,6 +432,10 @@ class Dashboard(ctk.CTkFrame):
         self.live_prices      = defaultdict(float)
         self._price_ts        = defaultdict(float)
         self._pair_cards_dirty = False              # coalesces WS ticks → 100ms UI refresh
+        self._topbar_dirty:    set   = set()       # pairs needing topbar update, drained in _ui_tick
+        self._log_queue:       deque = deque()     # pending log-box entries, drained in _ui_tick
+        self._mon_queue:       deque = deque()     # pending monitor-box entries
+        self._act_queue:       deque = deque()     # pending activity-box entries
         self._base_precision  = {}                   # pair → int decimal places for base_size
         self._quote_precision = {}                   # pair → int decimal places for limit_price
         self.price_history   = defaultdict(partial(deque, maxlen=MAX_HISTORY))
@@ -501,6 +505,12 @@ class Dashboard(ctk.CTkFrame):
                     _tp = _t.get('symbol', '')
                     if _tp in TRADING_PAIRS and self.bot_bought_qty.get(_tp, 0) > 0:
                         self.bot_exposure[_tp] += float(_t.get('entry_price', 0)) * float(_t.get('quantity', 0))
+
+        # In-memory settings cache — avoids re-reading config.json on every save
+        self._settings_cache: dict = dict(_s)
+        # Pre-init log lists so they're populated even before the Logs page is built
+        self._all_logs:    list = []
+        self._all_monitor: list = []
 
         self.running         = True
         self.paused          = False
@@ -818,12 +828,20 @@ class Dashboard(ctk.CTkFrame):
     def _build_content(self):
         self.content = ctk.CTkFrame(self.main_area, fg_color=C_BG, corner_radius=0)
         self.content.pack(fill="both", expand=True)
+        # Page factories — each page is built on first navigation so startup only
+        # constructs the dashboard (~40 widgets) instead of all five pages at once.
+        self._page_factories = {
+            'charts':   self._make_charts_page,
+            'trades':   self._make_trades_page,
+            'settings': self._make_settings_page,
+            'logs':     self._make_logs_page,
+        }
         self.pages = {
             'dashboard': self._make_dashboard_page(),
-            'charts':    self._make_charts_page(),
-            'trades':    self._make_trades_page(),
-            'settings':  self._make_settings_page(),
-            'logs':      self._make_logs_page(),
+            'charts':    None,
+            'trades':    None,
+            'settings':  None,
+            'logs':      None,
         }
         self._show_dashboard()
 
@@ -1593,14 +1611,16 @@ class Dashboard(ctk.CTkFrame):
             text_color=C_TEXT2, font=_FM11, state="disabled")
         self.monitor_box.pack(fill="both", expand=True)
 
-        self._all_logs     = []   # (entry, color, level) — non-monitor messages
-        self._all_monitor  = []   # (entry) — monitor messages
         return page
 
     # ── Page navigation ───────────────────────────────────────────────────────
     def _show_page(self, name, title):
+        # Lazy-build pages on first visit so startup only pays for the dashboard
+        if self.pages.get(name) is None:
+            self.pages[name] = self._page_factories[name]()
         for p in self.pages.values():
-            p.pack_forget()
+            if p is not None:
+                p.pack_forget()
         self.pages[name].pack(fill="both", expand=True)
         self.page_title.configure(text=title)
         self._set_active_nav(name)
@@ -1632,18 +1652,16 @@ class Dashboard(ctk.CTkFrame):
 
         if level == "monitor":
             # Route to Monitor tab — keeps main Logs clean
-            if hasattr(self, '_all_monitor'):
-                self._all_monitor.append(entry)
+            self._all_monitor.append(entry)
             if self.root_alive:
-                self.root.after(0, self._gui_append_monitor, entry)
+                self._mon_queue.append(entry)
         else:
             cmap  = {"error": C_RED, "warn": C_ORANGE, "trade": C_GREEN, "info": C_TEXT}
             color = cmap.get(level, C_TEXT)
-            if hasattr(self, '_all_logs'):
-                self._all_logs.append((entry, color, level))
+            self._all_logs.append((entry, color, level))
             if self.root_alive:
-                self.root.after(0, self._gui_append_log,      entry)
-                self.root.after(0, self._gui_append_activity, entry)
+                self._log_queue.append(entry)
+                self._act_queue.append(entry)
 
     _LOG_MAX_LINES = 2000   # cap textbox content to prevent unbounded memory growth
 
@@ -2091,20 +2109,24 @@ class Dashboard(ctk.CTkFrame):
         self._ticker_labels[pair]['pct'].configure(text=pct_s, text_color=col)
 
     def _ui_tick(self):
-        """100ms coalesced UI refresh: pair cards + live portfolio value.
+        """100ms coalesced UI refresh — drains all dirty flags and queued writes.
 
-        WS ticks arrive at 5-20/s for BTC; calling _update_pair_cards() on every
-        one would hammer the Tk main thread with redundant configure() calls.
-        Instead the WS handler sets _pair_cards_dirty=True and this tick drains it
-        at most 10× per second — smooth to the eye with no perceptible CPU waste.
+        All WS hot-paths just set a flag or append to a deque; this single tick
+        batches the actual Tk widget calls so the main thread is never hammered.
         """
         if not self.root_alive:
             return
         try:
+            # ── Topbar tickers (was 20 root.after/s per BTC tick) ─────────────
+            if self._topbar_dirty:
+                for _pid in self._topbar_dirty:
+                    self._update_topbar_ticker(_pid)
+                self._topbar_dirty.clear()
+
+            # ── Pair cards + live portfolio ───────────────────────────────────
             if self._pair_cards_dirty:
                 self._pair_cards_dirty = False
                 self._update_pair_cards()
-                # Live portfolio: qty × current_price rather than waiting 60s for balance sync
                 live_coin = sum(
                     self._real_coin_qty.get(p, 0) * self.live_prices.get(p, 0)
                     for p in TRADING_PAIRS
@@ -2113,6 +2135,42 @@ class Dashboard(ctk.CTkFrame):
                 self.metric_cards['usd_bal']._val.configure(text=f"${portfolio:,.2f}")
                 self.metric_cards['usd_bal']._sub.configure(
                     text=f"Liquid ${self.usd_balance:,.2f}  ·  Coins ${live_coin:,.2f}")
+
+            # ── Log box (batch ≤30 lines per tick, single state/scroll call) ──
+            if self._log_queue and hasattr(self, 'log_box'):
+                self.log_box.configure(state="normal")
+                text = "".join(self._log_queue.popleft()
+                               for _ in range(min(30, len(self._log_queue))))
+                self.log_box.insert("end", text)
+                if int(self.log_box.index("end-1c").split(".")[0]) > self._LOG_MAX_LINES:
+                    self.log_box.delete("1.0", f"{self._LOG_MAX_LINES // 4}.0")
+                self.log_box.configure(state="disabled")
+                if not self._log_queue:
+                    self.log_box.see("end")
+
+            # ── Monitor box ───────────────────────────────────────────────────
+            if self._mon_queue and hasattr(self, 'monitor_box'):
+                self.monitor_box.configure(state="normal")
+                text = "".join(self._mon_queue.popleft()
+                               for _ in range(min(30, len(self._mon_queue))))
+                self.monitor_box.insert("end", text)
+                if int(self.monitor_box.index("end-1c").split(".")[0]) > self._LOG_MAX_LINES:
+                    self.monitor_box.delete("1.0", f"{self._LOG_MAX_LINES // 4}.0")
+                self.monitor_box.configure(state="disabled")
+                if not self._mon_queue:
+                    self.monitor_box.see("end")
+
+            # ── Activity box (dashboard sidebar feed) ─────────────────────────
+            if self._act_queue and hasattr(self, 'activity_box'):
+                self.activity_box.configure(state="normal")
+                text = "".join(self._act_queue.popleft()
+                               for _ in range(min(30, len(self._act_queue))))
+                self.activity_box.insert("end", text)
+                if int(self.activity_box.index("end-1c").split(".")[0]) > self._LOG_MAX_LINES:
+                    self.activity_box.delete("1.0", f"{self._LOG_MAX_LINES // 4}.0")
+                self.activity_box.configure(state="disabled")
+                if not self._act_queue:
+                    self.activity_box.see("end")
         except Exception:
             pass
         self.root.after(100, self._ui_tick)
@@ -3391,8 +3449,10 @@ class Dashboard(ctk.CTkFrame):
 
     # ── Allocation dialogs ────────────────────────────────────────────────────
     def _popup(self, title: str, w: int, h: int) -> ctk.CTkToplevel:
-        """Create a properly focused modal dialog."""
+        """Create a modal dialog. Window is hidden while the caller builds widgets
+        and is revealed via after(10) so it appears fully formed with no flash."""
         win = ctk.CTkToplevel(self)
+        win.withdraw()   # hide until all widgets are placed by the caller
         win.title(title)
         win.geometry(f"{w}x{h}")
         win.configure(fg_color=C_PANEL)
@@ -3405,6 +3465,8 @@ class Dashboard(ctk.CTkFrame):
         win.lift()
         win.focus_force()
         win.grab_set()
+        # Reveal after the caller's synchronous widget-building code finishes
+        win.after(10, win.deiconify)
         return win
 
     def _open_allocate(self, default_pair: str = None):
@@ -3946,8 +4008,8 @@ class Dashboard(ctk.CTkFrame):
                 for p in TRADING_PAIRS
                 if self.swap_vars[p].get() != 'USD'
             ) or 'none'
-            # ── Persist to config.json (merge so bot_balance etc. are preserved) ──
-            s = load_user_settings()
+            # ── Persist to config.json via in-memory cache ────────────────────
+            s = self._settings_cache
             s.update({
                 'signal_tf':               self.signal_tf,
                 'signal_direction':        self.signal_direction,
@@ -3989,7 +4051,7 @@ class Dashboard(ctk.CTkFrame):
         engine.MA_PERIODS = periods
         self.custom_ma_periods = periods
         self.ma_periods_var.set(", ".join(str(p) for p in periods))
-        s = load_user_settings()
+        s = self._settings_cache
         s['ma_periods'] = list(periods)
         save_user_settings(s)
         self.log_message(f"Moving averages updated: {periods}", "trade")
@@ -4134,7 +4196,7 @@ class Dashboard(ctk.CTkFrame):
 
     def _save_bot_state(self):
         try:
-            s = load_user_settings()
+            s = self._settings_cache   # in-memory — never re-reads config.json
             s['bot_balance']    = round(self.bot_balance, 6)
             s['bot_pair_alloc'] = {p: round(v, 6)
                                    for p, v in self.bot_pair_alloc.items()
@@ -4528,7 +4590,7 @@ class Dashboard(ctk.CTkFrame):
             if (self.chart_pair_var.get() == pair and
                     self.chart_tf_var.get() == timeframe):
                 self._chart_dirty = True
-            self.root.after(0, self._update_pair_cards)
+            self._pair_cards_dirty = True
 
     # ── WebSocket ticker ──────────────────────────────────────────────────────
     async def _websocket_loop(self):
@@ -4602,14 +4664,24 @@ class Dashboard(ctk.CTkFrame):
                                         except (TypeError, ValueError):
                                             continue
                                         _book_side = _ob["bids"] if _side == "bid" else _ob["asks"]
-                                        # Remove stale entry for this price, add new
-                                        _book_side[:] = [
-                                            x for x in _book_side if x[0] != _pp]
+                                        # Remove stale entry for this price level
+                                        _bi = next((i for i, x in enumerate(_book_side)
+                                                    if x[0] == _pp), -1)
+                                        if _bi >= 0:
+                                            _book_side.pop(_bi)
                                         if _qq > 0:
-                                            _book_side.append((_pp, _qq))
-                                    # Keep bids sorted descending, asks ascending
-                                    _ob["bids"].sort(key=lambda x: -x[0])
-                                    _ob["asks"].sort(key=lambda x:  x[0])
+                                            if _side == "bid":
+                                                # bids: descending — binary search in neg-price space
+                                                _lo, _hi = 0, len(_book_side)
+                                                while _lo < _hi:
+                                                    _m = (_lo + _hi) // 2
+                                                    if _book_side[_m][0] > _pp:
+                                                        _lo = _m + 1
+                                                    else:
+                                                        _hi = _m
+                                                _book_side.insert(_lo, (_pp, _qq))
+                                            else:
+                                                bisect.insort(_book_side, (_pp, _qq))
                                     # Cap to top 50 levels each side
                                     _ob["bids"] = _ob["bids"][:50]
                                     _ob["asks"] = _ob["asks"][:50]
@@ -4656,9 +4728,7 @@ class Dashboard(ctk.CTkFrame):
                                                     _fc[3] = min(_fc[3], p)  # low
                                                     _fc[4] = p               # close
                                         self._pair_cards_dirty = True
-                                        # Fast path: update only the topbar ticker immediately
-                                        if self.root_alive:
-                                            self.root.after(0, self._update_topbar_ticker, pid)
+                                        self._topbar_dirty.add(pid)
                                         if chan == "ticker":
                                             await self._check_surge(pid)
 
@@ -4716,8 +4786,7 @@ class Dashboard(ctk.CTkFrame):
                             self.live_prices[pid] = mid
                             self._price_ts[pid]   = time.time()
                             self._pair_cards_dirty = True
-                            if self.root_alive:
-                                self.root.after(0, self._update_topbar_ticker, pid)
+                            self._topbar_dirty.add(pid)
             except Exception as e:
                 logger.warning(f"Price poll error: {e}")
             await asyncio.sleep(8)
