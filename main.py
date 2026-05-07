@@ -2496,11 +2496,23 @@ class Dashboard(ctk.CTkFrame):
                 else:
                     _marker_y = _les_price - _offset
                     _va       = 'top'
-                if _xl[0] <= _les_x <= _xl[1]:
+                # Draw when the signal is within or right of the visible window.
+                # clip_on=True handles the case where the candle sits exactly at the
+                # xlim boundary — the old _xl[1] guard silently suppressed it there.
+                if _les_x >= _xl[0]:
                     ax.annotate(_les_marker, (_les_dt, _marker_y),
                                 color=_les_color, fontsize=11, alpha=1.0,
                                 ha='center', va=_va, fontweight='bold',
                                 clip_on=True)
+                    # When signal is beyond the visible right edge, add a right-edge cue
+                    if _les_x > _xl[1]:
+                        _bl_r = mtransforms.blended_transform_factory(
+                            ax.transAxes, ax.transData)
+                        ax.annotate(f"{_les_marker} →",
+                                    xy=(0.98, _marker_y), xycoords=_bl_r,
+                                    fontsize=8, color=_les_color, alpha=0.85,
+                                    ha='right', va=_va, fontweight='bold',
+                                    clip_on=False, annotation_clip=False)
                 _les_ma_fast = float(ma_lines.get(p_fast, [0])[-1]) if ma_lines.get(p_fast, []) else 0
                 _les_ma_slow = float(ma_lines.get(p_slow, [0])[-1]) if ma_lines.get(p_slow, []) else 0
                 self._signal_data.append({
