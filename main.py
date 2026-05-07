@@ -3372,13 +3372,19 @@ class Dashboard(ctk.CTkFrame):
         usd_source_var     = ctk.StringVar(value="Total")  # "Liquid USD" | "USDC" | "USDT" | "Total"
 
         def _source_balance() -> float:
-            """Return the balance of the currently selected USD source."""
+            """Return the AVAILABLE balance after subtracting already-earmarked bot funds.
+
+            Without this deduction the dialog shows the full Coinbase balance even
+            when a prior session already allocated that money, causing the user to
+            allocate the same funds twice and balloon bot_pair_alloc beyond reality.
+            """
+            already = self.bot_balance + sum(self.bot_pair_alloc.values())
             raw_usd = max(0.0, self.usd_balance - self.usdc_balance - self.usdt_balance)
             src = usd_source_var.get()
-            if src == "Liquid USD": return raw_usd
-            if src == "USDC":       return self.usdc_balance
-            if src == "USDT":       return self.usdt_balance
-            return self.usd_balance   # "Total"
+            if src == "Liquid USD": return max(0.0, raw_usd - already)
+            if src == "USDC":       return max(0.0, self.usdc_balance - already)
+            if src == "USDT":       return max(0.0, self.usdt_balance - already)
+            return max(0.0, self.usd_balance - already)
 
         def _highlight_source_cards():
             sel = usd_source_var.get()
@@ -3417,8 +3423,12 @@ class Dashboard(ctk.CTkFrame):
                 btn.pack(side="left", expand=True, fill="x", padx=(0, 6))
                 _usd_source_cards.append((lbl, btn, val))
 
+            _already = self.bot_balance + sum(self.bot_pair_alloc.values())
+            _net_avail = max(0.0, self.usd_balance - _already)
+            _avail_str = (f"  ·  available: ${_net_avail:,.2f}"
+                          if _already > 0.01 else "")
             ctk.CTkLabel(usd_frame,
-                         text=f"Total liquid:  ${self.usd_balance:,.2f}",
+                         text=f"Total liquid:  ${self.usd_balance:,.2f}{_avail_str}",
                          font=_F11, text_color=C_MUTED).pack(anchor="w", pady=(2, 6))
 
             prow = ctk.CTkFrame(usd_frame, fg_color="transparent")
@@ -4166,17 +4176,35 @@ class Dashboard(ctk.CTkFrame):
             self.usdc_balance = usdc
             self.usdt_balance = usdt
 
-            # Clamp bot accounting to actual liquid USD — the bot can't be
-            # managing more USD than exists on the exchange.  Drift happens when
-            # sell proceeds update bot_balance without reducing the pair budget,
-            # or when coins are sold externally.  Scale proportionally so the
-            # relative split between bot_balance and each pair_alloc is preserved.
+            # Clamp bot_balance + bot_pair_alloc to actual liquid USD.
             _bot_usd = self.bot_balance + sum(self.bot_pair_alloc.values())
             if _bot_usd > usd and _bot_usd > 0:
                 _scale = usd / _bot_usd
                 self.bot_balance = self.bot_balance * _scale
                 for _p in list(self.bot_pair_alloc.keys()):
                     self.bot_pair_alloc[_p] *= _scale
+
+            # Auto-clear stale bot positions: if the bot thinks it holds coins
+            # (bot_bought_qty > 0) but the exchange shows < 5% of that value,
+            # the position was closed externally or state drifted — clear it.
+            _state_changed = False
+            for _pair in TRADING_PAIRS:
+                _price    = self.live_prices.get(_pair, 0)
+                _bot_qty  = self.bot_bought_qty.get(_pair, 0)
+                if _price <= 0 or _bot_qty <= 0:
+                    continue
+                _bot_val  = _bot_qty * _price
+                _real_val = self.real_exposure.get(_pair, 0)
+                if _bot_val > 1.0 and _real_val < _bot_val * 0.05:
+                    self.log_message(
+                        f"Stale position cleared: {_pair}  "
+                        f"bot_tracked=${_bot_val:.2f}  exchange=${_real_val:.2f}",
+                        "warn")
+                    self.bot_bought_qty[_pair] = 0.0
+                    self.bot_exposure[_pair]   = 0.0
+                    _state_changed = True
+            if _state_changed:
+                self._save_bot_state()
 
             coin_str = "  |  ".join(coin_log) if coin_log else "none"
             self.log_message(
