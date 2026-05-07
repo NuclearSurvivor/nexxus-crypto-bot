@@ -428,8 +428,10 @@ class Dashboard(ctk.CTkFrame):
         self.initial_balance = 0.0
         self.bot_exposure    = defaultdict(float)
         self.real_exposure   = defaultdict(float)
+        self._real_coin_qty  = defaultdict(float)   # actual qty from last balance fetch (for live portfolio)
         self.live_prices      = defaultdict(float)
-        self._price_ts        = defaultdict(float)   # C4: timestamp of last price update
+        self._price_ts        = defaultdict(float)
+        self._pair_cards_dirty = False              # coalesces WS ticks → 100ms UI refresh
         self._base_precision  = {}                   # pair → int decimal places for base_size
         self._quote_precision = {}                   # pair → int decimal places for limit_price
         self.price_history   = defaultdict(partial(deque, maxlen=MAX_HISTORY))
@@ -616,7 +618,9 @@ class Dashboard(ctk.CTkFrame):
         self._start_backend()
         self._start_webhook()
         self.root.after(1000, self._tick_status)
-        self.root.after(1000, self._chart_live_tick)   # 1-second live chart refresh
+        self.root.after(1000, self._chart_live_tick)
+        self.root.after(100,  self._ui_tick)       # 100ms coalesced pair-card + portfolio refresh
+        self.root.after(2000, self._trade_pl_tick) # 2s live P&L for open trades
 
         self._resize_timer_id = None
         self.root.bind("<Configure>", self._on_root_configure, add="+")
@@ -1749,7 +1753,11 @@ class Dashboard(ctk.CTkFrame):
     def _update_metrics(self):
         try:
             liquid_usd = self.usd_balance
-            coin_value = sum(self.real_exposure[p] for p in TRADING_PAIRS)
+            # Live coin value: qty × current_price (updates on every 100ms tick)
+            coin_value = sum(
+                self._real_coin_qty.get(p, 0) * self.live_prices.get(p, 0)
+                for p in TRADING_PAIRS
+            )
             pair_alloc = sum(self.bot_pair_alloc[p] for p in TRADING_PAIRS)
             bot_total  = self.bot_balance + pair_alloc
             bot_exp    = sum(self.bot_exposure[p] for p in TRADING_PAIRS)
@@ -1943,8 +1951,12 @@ class Dashboard(ctk.CTkFrame):
                 self._bs_sig_src_lbl.configure(text=sig.get('source', ''))
                 self._bs_sig_price_lbl.configure(
                     text=format_price(sig['price']))
-                self._bs_sig_spent_lbl.configure(
-                    text=f"  ${sig['spent']:,.2f}  ·  {sig['qty']:.6f} {sig['pair'].split('-')[0]}")
+                _spent = sig.get('spent', 0) or 0
+                _qty   = sig.get('qty', 0) or 0
+                _coin  = sig['pair'].split('-')[0]
+                _spent_txt = (f"  ${_spent:,.2f}  ·  {_qty:.6f} {_coin}"
+                              if _spent > 0 else f"  (loaded from history)")
+                self._bs_sig_spent_lbl.configure(text=_spent_txt)
                 self._bs_sig_time_lbl.configure(text=ts_str)
                 self._last_sig_frame.pack(fill="x", pady=(0, 4))
             else:
@@ -2043,10 +2055,10 @@ class Dashboard(ctk.CTkFrame):
             self.log_message(f"Copy trades error: {e}", "warn")
 
     def _update_pair_cards(self):
+        """Update dashboard pair cards. Called from _ui_tick (100ms coalesce)."""
         for pair in TRADING_PAIRS:
             pc    = self.pair_cards.get(pair)
             price = self.live_prices.get(pair, 0)
-            # Use true 24h change (last vs prior daily close); fall back to 1h span
             pct24 = self.pct_24h.get(pair)
             if pct24 is not None:
                 pct, label = pct24, "24h"
@@ -2058,24 +2070,76 @@ class Dashboard(ctk.CTkFrame):
                 pc._price.configure(text=format_price(price))
                 pct_str = f"  {'▲' if pct >= 0 else '▼'} {abs(pct):.2f}%  {label}  "
                 pc._pct.configure(text=pct_str, text_color=col)
-                pc._pct_badge.configure(
-                    fg_color="#0d2a1a" if pct >= 0 else "#2a0d0d")
-                # H/L from most recent daily candle
-                day_data = list(self.candle_history['1d'][pair])
-                if day_data:
-                    d = day_data[-1]
-                    pc._high.configure(
-                        text=f"H  {format_price(d[2])}", text_color="#64b88a")
-                    pc._low.configure(
-                        text=f"L  {format_price(d[3])}", text_color="#b86464")
-            # Update topbar ticker (labels only — never reconfigure the frame border,
-            # as CTkFrame.configure() causes a full widget redraw that produces flicker)
-            if pair in self._ticker_labels and price:
-                pct_str = f"{'▲' if pct >= 0 else '▼'} {abs(pct):.2f}%"
-                self._ticker_labels[pair]['price'].configure(
-                    text=format_price(price), text_color=col)
-                self._ticker_labels[pair]['pct'].configure(
-                    text=pct_str, text_color=col)
+                pc._pct_badge.configure(fg_color="#0d2a1a" if pct >= 0 else "#2a0d0d")
+                # Daily H/L — read deque[-1] directly (O(1), no list copy)
+                day_deque = self.candle_history['1d'][pair]
+                if day_deque:
+                    d = day_deque[-1]
+                    pc._high.configure(text=f"H  {format_price(d[2])}", text_color="#64b88a")
+                    pc._low.configure(text=f"L  {format_price(d[3])}", text_color="#b86464")
+
+    def _update_topbar_ticker(self, pair: str):
+        """Update ONLY the topbar price/pct label for one pair — fast path on WS tick."""
+        price = self.live_prices.get(pair, 0)
+        if not price or pair not in self._ticker_labels:
+            return
+        pct24 = self.pct_24h.get(pair)
+        pct   = pct24 if pct24 is not None else self.percent_change.get('1h', {}).get(pair, 0.0)
+        col   = C_GREEN if pct >= 0 else C_RED
+        pct_s = f"{'▲' if pct >= 0 else '▼'} {abs(pct):.2f}%"
+        self._ticker_labels[pair]['price'].configure(text=format_price(price), text_color=col)
+        self._ticker_labels[pair]['pct'].configure(text=pct_s, text_color=col)
+
+    def _ui_tick(self):
+        """100ms coalesced UI refresh: pair cards + live portfolio value.
+
+        WS ticks arrive at 5-20/s for BTC; calling _update_pair_cards() on every
+        one would hammer the Tk main thread with redundant configure() calls.
+        Instead the WS handler sets _pair_cards_dirty=True and this tick drains it
+        at most 10× per second — smooth to the eye with no perceptible CPU waste.
+        """
+        if not self.root_alive:
+            return
+        try:
+            if self._pair_cards_dirty:
+                self._pair_cards_dirty = False
+                self._update_pair_cards()
+                # Live portfolio: qty × current_price rather than waiting 60s for balance sync
+                live_coin = sum(
+                    self._real_coin_qty.get(p, 0) * self.live_prices.get(p, 0)
+                    for p in TRADING_PAIRS
+                )
+                portfolio = self.usd_balance + live_coin
+                self.metric_cards['usd_bal']._val.configure(text=f"${portfolio:,.2f}")
+                self.metric_cards['usd_bal']._sub.configure(
+                    text=f"Liquid ${self.usd_balance:,.2f}  ·  Coins ${live_coin:,.2f}")
+        except Exception:
+            pass
+        self.root.after(100, self._ui_tick)
+
+    def _trade_pl_tick(self):
+        """2s live P&L update for open trades — keeps the Trades tab current."""
+        if not self.root_alive:
+            return
+        try:
+            if self.trade_history:
+                updated = False
+                for trade in self.trade_history.values():
+                    if trade.get('event') != 'trade':
+                        continue
+                    pair = trade['symbol']
+                    cur  = self.live_prices.get(pair, 0)
+                    if cur > 0:
+                        new_pl = (cur - trade['entry_price']) * trade['quantity']
+                        if abs(new_pl - trade.get('pl', 0)) > 0.001:
+                            trade['current_price'] = cur
+                            trade['pl']            = new_pl
+                            updated = True
+                if updated and self._active_page == 'trades':
+                    self._refresh_trade_rows()
+        except Exception:
+            pass
+        self.root.after(2000, self._trade_pl_tick)
 
     def _on_chart_pair_change(self, _=None):
         """Update chart header, trigger on-demand fetch for watchlist pairs, refresh."""
@@ -4166,6 +4230,7 @@ class Dashboard(ctk.CTkFrame):
                 elif cur in pair_coins:
                     pair  = pair_coins[cur]
                     price = self.live_prices.get(pair, 0)
+                    self._real_coin_qty[pair] = val   # store qty for live portfolio calc
                     if price > 0:
                         self.real_exposure[pair] = val * price
                         coin_log.append(f"{cur}={val:.4f} (${val*price:,.2f})")
@@ -4216,7 +4281,7 @@ class Dashboard(ctk.CTkFrame):
                 "monitor")
             if self.root_alive:
                 self.root.after(0, self._update_metrics)
-                self.root.after(0, self._update_pair_cards)
+                self._pair_cards_dirty = True
         except Exception as e:
             self.log_message(f"Balance error: {e}", "warn")
             logger.error("Unhandled exception", exc_info=True)
@@ -4584,8 +4649,10 @@ class Dashboard(ctk.CTkFrame):
                                                     _fc[2] = max(_fc[2], p)  # high
                                                     _fc[3] = min(_fc[3], p)  # low
                                                     _fc[4] = p               # close
+                                        self._pair_cards_dirty = True
+                                        # Fast path: update only the topbar ticker immediately
                                         if self.root_alive:
-                                            self.root.after(0, self._update_pair_cards)
+                                            self.root.after(0, self._update_topbar_ticker, pid)
                                         if chan == "ticker":
                                             await self._check_surge(pid)
 
@@ -4642,8 +4709,9 @@ class Dashboard(ctk.CTkFrame):
                             mid = (bid + ask) / 2
                             self.live_prices[pid] = mid
                             self._price_ts[pid]   = time.time()
+                            self._pair_cards_dirty = True
                             if self.root_alive:
-                                self.root.after(0, self._update_pair_cards)
+                                self.root.after(0, self._update_topbar_ticker, pid)
             except Exception as e:
                 logger.warning(f"Price poll error: {e}")
             await asyncio.sleep(8)
