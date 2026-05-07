@@ -756,7 +756,7 @@ class Dashboard(ctk.CTkFrame):
             )
 
     def _build_topbar(self):
-        top = ctk.CTkFrame(self.main_area, height=62, fg_color=C_PANEL, corner_radius=0)
+        top = ctk.CTkFrame(self.main_area, height=78, fg_color=C_PANEL, corner_radius=0)
         top.pack(fill="x")
         top.pack_propagate(False)
 
@@ -801,9 +801,9 @@ class Dashboard(ctk.CTkFrame):
         # Right: portfolio + P&L — glass badge background
         right_bg = ctk.CTkFrame(top, fg_color=C_GLASS, corner_radius=10,
                                 border_width=1, border_color=C_BORDER2)
-        right_bg.pack(side="right", fill="y", padx=20, pady=10)
+        right_bg.pack(side="right", fill="y", padx=20, pady=8)
         right = ctk.CTkFrame(right_bg, fg_color="transparent")
-        right.pack(fill="both", expand=True, padx=12, pady=4)
+        right.pack(fill="both", expand=True, padx=12, pady=3)
 
         self.bal_label = ctk.CTkLabel(right, text="Portfolio  —",
                                        font=_F11, text_color=C_MUTED)
