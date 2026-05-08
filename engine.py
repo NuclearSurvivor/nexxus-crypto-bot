@@ -42,6 +42,7 @@ MINIMUM_RESERVE      = 50
 WEBHOOK_PORT         = 8000
 STOP_LOSS_PCT        = 0.02
 TAKE_PROFIT_PCT      = 0.05
+FEE_PCT              = 0.006  # Coinbase Advanced Trade maker fee per side (0.6%)
 TRAIL_STOP_PCT       = 0.04   # trailing stop activates once in profit; 4% pullback from peak
 ATR_PERIOD           = 14
 COOLDOWN_SECONDS     = 300

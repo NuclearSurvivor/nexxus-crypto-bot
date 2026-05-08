@@ -56,7 +56,7 @@ from engine import (
     make_client, make_ws_jwt,
     TRADING_PAIRS, WATCHLIST_PAIRS, COINBASE_WS_URL, MAX_HISTORY, DISPLAY_CANDLES, FETCH_CANDLES,
     MA_PERIODS, TIMEFRAMES, ORDER_AMOUNT_USD, MINIMUM_RESERVE, WEBHOOK_PORT,
-    STOP_LOSS_PCT, TAKE_PROFIT_PCT, TRAIL_STOP_PCT, ATR_PERIOD, COOLDOWN_SECONDS,
+    STOP_LOSS_PCT, TAKE_PROFIT_PCT, TRAIL_STOP_PCT, ATR_PERIOD, COOLDOWN_SECONDS, FEE_PCT,
     SURGE_WINDOW, SURGE_PCT, SURGE_COOLDOWN,
     MAX_EXPOSURE_PER_PAIR, TF_TO_GRANULARITY, COINBASE_MAX_CANDLES, CONFIG_FILE
 )
@@ -605,6 +605,9 @@ class Dashboard(ctk.CTkFrame):
         # Order book — updated from level2 WS channel.
         self._order_book: dict = defaultdict(lambda: {'bids': [], 'asks': []})
         self._ob_window = None
+        self._ob_update_pending = False   # throttle: at most 1 queued update at a time
+        self._modal_open = 0              # counter of open modal dialogs
+        self._ui_tick_count = 0           # for coarser periodic tasks inside _ui_tick
 
         # Active page name — used to gate chart live-refresh to chart tab only
         self._active_page: str = 'dashboard'
@@ -644,6 +647,10 @@ class Dashboard(ctk.CTkFrame):
                             self.pct_24h[pair] = ((lc2 - pc) / pc * 100) if pc else 0
 
         self._build_layout()
+        # Initialize chart selection vars before backend loops start so
+        # _fetch_pair_tf can read them even before the Charts page is built.
+        self.chart_pair_var = ctk.StringVar(value=TRADING_PAIRS[0])
+        self.chart_tf_var   = ctk.StringVar(value="5m")
         self._start_backend()
         self._start_webhook()
         self.root.after(1000, self._tick_status)
@@ -1119,8 +1126,7 @@ class Dashboard(ctk.CTkFrame):
     def _make_charts_page(self):
         page = ctk.CTkFrame(self.content, fg_color=C_CHART_BG, corner_radius=0)
 
-        self.chart_pair_var = ctk.StringVar(value=TRADING_PAIRS[0])
-        self.chart_tf_var   = ctk.StringVar(value="5m")
+        # vars already created in __init__ before backend starts; don't reset them
 
         # ── Single compact toolbar (everything in one 52px strip) ────────────
         tb = ctk.CTkFrame(page, fg_color=C_GLASS, corner_radius=0, height=52)
@@ -1818,8 +1824,7 @@ class Dashboard(ctk.CTkFrame):
             # Bot balance card — include coin holdings managed by the bot
             coin_holdings_val_mc = sum(
                 self.bot_coin_qty.get(p, 0) * self.live_prices.get(p, 0)
-                for p in TRADING_PAIRS
-            )
+                for p in TRADING_PAIRS)
             bot_display_total = bot_total + coin_holdings_val_mc
             alloc_lines = []
             for p in TRADING_PAIRS:
@@ -1859,10 +1864,7 @@ class Dashboard(ctk.CTkFrame):
             self.pnl_label.configure(
                 text=f"P&L  {sign}${abs(pnl):,.2f}", text_color=pcolor)
             # Allocated line — only show when bot has funds under management
-            _ch_val = sum(
-                self.bot_coin_qty.get(p, 0) * self.live_prices.get(p, 0)
-                for p in TRADING_PAIRS)
-            _alloc_total = bot_total + _ch_val
+            _alloc_total = bot_total + coin_holdings_val_mc   # reuse already-computed sum
             if _alloc_total >= 0.01:
                 _parts = []
                 for p in TRADING_PAIRS:
@@ -2136,60 +2138,68 @@ class Dashboard(ctk.CTkFrame):
         if not self.root_alive:
             return
         try:
-            # ── Topbar tickers (was 20 root.after/s per BTC tick) ─────────────
-            if self._topbar_dirty:
-                for _pid in self._topbar_dirty:
-                    self._update_topbar_ticker(_pid)
-                self._topbar_dirty.clear()
+            # While a modal dialog is open, skip all heavy widget work so the
+            # Tk event queue stays clear and popup clicks feel instant.
+            # Data keeps accumulating in deques and flushes when the modal closes.
+            if not self._modal_open:
+                # ── Topbar tickers ────────────────────────────────────────────
+                if self._topbar_dirty:
+                    for _pid in self._topbar_dirty:
+                        self._update_topbar_ticker(_pid)
+                    self._topbar_dirty.clear()
 
-            # ── Pair cards + live portfolio ───────────────────────────────────
-            if self._pair_cards_dirty:
-                self._pair_cards_dirty = False
-                self._update_pair_cards()
-                live_coin = sum(
-                    self._real_coin_qty.get(p, 0) * self.live_prices.get(p, 0)
-                    for p in TRADING_PAIRS
-                )
-                portfolio = self.usd_balance + live_coin
-                self.metric_cards['usd_bal']._val.configure(text=f"${portfolio:,.2f}")
-                self.metric_cards['usd_bal']._sub.configure(
-                    text=f"Liquid ${self.usd_balance:,.2f}  ·  Coins ${live_coin:,.2f}")
+                # ── Pair cards + live portfolio ───────────────────────────────
+                if self._pair_cards_dirty:
+                    self._pair_cards_dirty = False
+                    self._update_pair_cards()
+                    live_coin = sum(
+                        self._real_coin_qty.get(p, 0) * self.live_prices.get(p, 0)
+                        for p in TRADING_PAIRS
+                    )
+                    portfolio = self.usd_balance + live_coin
+                    self.metric_cards['usd_bal']._val.configure(text=f"${portfolio:,.2f}")
+                    self.metric_cards['usd_bal']._sub.configure(
+                        text=f"Liquid ${self.usd_balance:,.2f}  ·  Coins ${live_coin:,.2f}")
 
-            # ── Log box (batch ≤30 lines per tick, single state/scroll call) ──
-            if self._log_queue and hasattr(self, 'log_box'):
-                self.log_box.configure(state="normal")
-                text = "".join(self._log_queue.popleft()
-                               for _ in range(min(30, len(self._log_queue))))
-                self.log_box.insert("end", text)
-                if int(self.log_box.index("end-1c").split(".")[0]) > self._LOG_MAX_LINES:
-                    self.log_box.delete("1.0", f"{self._LOG_MAX_LINES // 4}.0")
-                self.log_box.configure(state="disabled")
-                if not self._log_queue:
-                    self.log_box.see("end")
+                # ── Log box (batch ≤30 lines per tick) ───────────────────────
+                if self._log_queue and hasattr(self, 'log_box'):
+                    self.log_box.configure(state="normal")
+                    text = "".join(self._log_queue.popleft()
+                                   for _ in range(min(30, len(self._log_queue))))
+                    self.log_box.insert("end", text)
+                    if int(self.log_box.index("end-1c").split(".")[0]) > self._LOG_MAX_LINES:
+                        self.log_box.delete("1.0", f"{self._LOG_MAX_LINES // 4}.0")
+                    self.log_box.configure(state="disabled")
+                    if not self._log_queue:
+                        self.log_box.see("end")
 
-            # ── Monitor box ───────────────────────────────────────────────────
-            if self._mon_queue and hasattr(self, 'monitor_box'):
-                self.monitor_box.configure(state="normal")
-                text = "".join(self._mon_queue.popleft()
-                               for _ in range(min(30, len(self._mon_queue))))
-                self.monitor_box.insert("end", text)
-                if int(self.monitor_box.index("end-1c").split(".")[0]) > self._LOG_MAX_LINES:
-                    self.monitor_box.delete("1.0", f"{self._LOG_MAX_LINES // 4}.0")
-                self.monitor_box.configure(state="disabled")
-                if not self._mon_queue:
-                    self.monitor_box.see("end")
+                # ── Monitor box ───────────────────────────────────────────────
+                if self._mon_queue and hasattr(self, 'monitor_box'):
+                    self.monitor_box.configure(state="normal")
+                    text = "".join(self._mon_queue.popleft()
+                                   for _ in range(min(30, len(self._mon_queue))))
+                    self.monitor_box.insert("end", text)
+                    if int(self.monitor_box.index("end-1c").split(".")[0]) > self._LOG_MAX_LINES:
+                        self.monitor_box.delete("1.0", f"{self._LOG_MAX_LINES // 4}.0")
+                    self.monitor_box.configure(state="disabled")
+                    if not self._mon_queue:
+                        self.monitor_box.see("end")
 
-            # ── Activity box (dashboard sidebar feed) ─────────────────────────
-            if self._act_queue and hasattr(self, 'activity_box'):
-                self.activity_box.configure(state="normal")
-                text = "".join(self._act_queue.popleft()
-                               for _ in range(min(30, len(self._act_queue))))
-                self.activity_box.insert("end", text)
-                if int(self.activity_box.index("end-1c").split(".")[0]) > self._LOG_MAX_LINES:
-                    self.activity_box.delete("1.0", f"{self._LOG_MAX_LINES // 4}.0")
-                self.activity_box.configure(state="disabled")
-                if not self._act_queue:
-                    self.activity_box.see("end")
+                # ── Activity box ──────────────────────────────────────────────
+                if self._act_queue and hasattr(self, 'activity_box'):
+                    self.activity_box.configure(state="normal")
+                    text = "".join(self._act_queue.popleft()
+                                   for _ in range(min(30, len(self._act_queue))))
+                    self.activity_box.insert("end", text)
+                    if int(self.activity_box.index("end-1c").split(".")[0]) > self._LOG_MAX_LINES:
+                        self.activity_box.delete("1.0", f"{self._LOG_MAX_LINES // 4}.0")
+                    self.activity_box.configure(state="disabled")
+                    if not self._act_queue:
+                        self.activity_box.see("end")
+            # ── Bot status refresh every 2s (20 × 100ms ticks) ──────────────
+            self._ui_tick_count += 1
+            if self._ui_tick_count % 20 == 0:
+                self._update_metrics()
         except Exception:
             pass
         self.root.after(100, self._ui_tick)
@@ -2991,7 +3001,7 @@ class Dashboard(ctk.CTkFrame):
     # ── Live chart 1-second refresh ──────────────────────────────────────────
     def _chart_live_tick(self):
         """1s heartbeat: full redraw only when needed, blit otherwise."""
-        if self.root_alive and self._active_page == 'charts':
+        if self.root_alive and self._active_page == 'charts' and not self._modal_open:
             try:
                 if self._chart_dirty and not self._chart_rendering:
                     self._chart_dirty = False
@@ -3176,6 +3186,7 @@ class Dashboard(ctk.CTkFrame):
 
     def _update_ob_display(self):
         """Rebuild order book in a single tk.Text write — fast and flicker-free."""
+        self._ob_update_pending = False   # allow next WS update to queue again
         if self._ob_window is None:
             return
         pair = getattr(self, '_ob_pair', '')
@@ -3481,11 +3492,24 @@ class Dashboard(ctk.CTkFrame):
         px = self.winfo_rootx() + (self.winfo_width()  - w) // 2
         py = self.winfo_rooty() + (self.winfo_height() - h) // 2
         win.geometry(f"{w}x{h}+{px}+{py}")
-        win.lift()
-        win.focus_force()
-        win.grab_set()
-        # Reveal after the caller's synchronous widget-building code finishes
-        win.after(10, win.deiconify)
+        # Reveal + grab deferred together — grab_set() on a withdrawn window
+        # raises TclError on Linux/X11 ("window not viewable"), so we must
+        # deiconify first, then grab.
+        def _show_and_grab():
+            self._modal_open += 1
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+            try:
+                win.grab_set()
+            except Exception:
+                pass
+
+        def _on_destroy(_evt=None):
+            self._modal_open = max(0, self._modal_open - 1)
+
+        win.after(10, _show_and_grab)
+        win.bind("<Destroy>", _on_destroy)
         return win
 
     def _open_allocate(self, default_pair: str = None):
@@ -3835,8 +3859,8 @@ class Dashboard(ctk.CTkFrame):
                     self.log_message(
                         f"Allocated {val:.6f} {coin} holdings → bot", "trade")
                 self._save_bot_state()
-                self._update_metrics()
                 win.destroy()
+                self.root.after(0, self._update_metrics)
             except ValueError:
                 err.configure(text="Enter a valid number")
 
@@ -3946,11 +3970,11 @@ class Dashboard(ctk.CTkFrame):
                 self.bot_bought_qty[_p] = 0.0
                 self.bot_exposure[_p]   = 0.0
             self._save_bot_state()
-            self._update_metrics()
             self.log_message(
                 f"Unallocated all bot funds (${total_usd:,.2f} USD + all coin/exposure) → default state",
                 "trade")
             win.destroy()
+            self.root.after(0, self._update_metrics)
 
         ctk.CTkButton(outer, text="Unallocate Everything  ·  Reset to Default",
                       height=44, corner_radius=10,
@@ -4480,14 +4504,50 @@ class Dashboard(ctk.CTkFrame):
             self.log_message(
                 f"Candles fetched  {pair}/{timeframe}  "
                 f"count={len(all_candles)}  span={span_from} → {span_to}", "monitor")
-            if self.root_alive:
-                self.root.after(0, self._ingest_candles, pair, all_candles, timeframe)
+            await self._process_candles(pair, all_candles, timeframe)
 
-    def _ingest_candles(self, pair: str, candles: list, timeframe: str):
-        ha       = heikin_ashi(candles)
+    # ── Off-thread helpers (CPU work that must not block Tk) ──────────────────
+
+    def _run_indicators(self, pair: str, ha: list):
+        """CPU-heavy indicator batch — runs in thread pool, never on main thread."""
+        self.indicator_engine.calculate_atr(pair, ha)
+        self.indicator_engine.calculate_support_resistance(pair, ha)
+        self.indicator_engine.calculate_order_blocks(pair, ha)
+        self.indicator_engine.calculate_fair_value_gaps(pair, ha)
+        self.indicator_engine.calculate_rsi(pair, ha)
+        self.indicator_engine.calculate_adx(pair, ha)
+
+    def _compute_ma_cache(self, ha: list) -> dict:
+        """Build SMA lookup table — runs in thread pool."""
+        arr = np.array([c[4] for c in ha])
+        cached = {}
+        for _p in MA_PERIODS:
+            if len(arr) >= _p:
+                cached[_p] = np.convolve(arr, np.ones(_p) / _p, mode='valid')
+        return cached
+
+    def _mark_chart_dirty(self, pair: str, timeframe: str):
+        """Tiny main-thread callback — just sets dirty flags after off-thread processing."""
+        if (self.chart_pair_var.get() == pair and self.chart_tf_var.get() == timeframe):
+            self._chart_dirty = True
+        self._pair_cards_dirty = True
+
+    async def _process_candles(self, pair: str, candles: list, timeframe: str):
+        """Process fetched candles entirely off the main Tk thread.
+
+        Heavy CPU work (heikin_ashi, indicators, MA cache) runs in a thread-pool
+        worker via asyncio.to_thread so neither the Tk event loop nor the asyncio
+        event loop is blocked.  Only a tiny dirty-flag callback is dispatched to
+        the main thread at the end.
+        """
+        # ── Step 1: Heikin Ashi transform (O(N) Python loop) ─────────────────
+        ha = await asyncio.to_thread(heikin_ashi, candles)
         if not ha:
-            self.log_message(f"Candle ingest  {pair}/{timeframe}  heikin_ashi returned empty — skipped", "warn")
+            self.log_message(
+                f"Candle ingest  {pair}/{timeframe}  heikin_ashi returned empty — skipped", "warn")
             return
+
+        # ── Step 2: Update shared candle history (GIL-safe dict/deque ops) ───
         existing = self.candle_history[timeframe][pair]
         last_ts  = existing[-1][0] if existing else 0
         new_ones = [c for c in ha if c[0] > last_ts]
@@ -4501,41 +4561,24 @@ class Dashboard(ctk.CTkFrame):
         if len(ha) >= 2:
             op, np_ = ha[0][4], ha[-1][4]
             self.percent_change[timeframe][pair] = ((np_ - op) / op * 100) if op else 0
-            # True 24h change: last close vs prior close on daily candles
             if timeframe == '1d':
                 prev_c, last_c = ha[-2][4], ha[-1][4]
                 self.pct_24h[pair] = ((last_c - prev_c) / prev_c * 100) if prev_c else 0
 
-        # Watchlist-only pairs: skip indicator calculations and signal checks —
-        # they are view/cache only; bot does not trade them.
         is_trading_pair = pair in TRADING_PAIRS
-        # Recalculate ALL indicators here (on actual new candle data) so
-        # _refresh_chart can read cached values without re-running O(N) maths
-        # every second.  This cuts chart CPU by ~90% on 1s live refresh.
+
+        # ── Step 3: Indicator calculations (O(N²) order blocks etc.) ─────────
         if is_trading_pair and (timeframe == self.signal_tf or timeframe == '1h'):
-            self.indicator_engine.calculate_atr(pair, ha)            # ATR first (FVG uses it)
-            self.indicator_engine.calculate_support_resistance(pair, ha)
-            self.indicator_engine.calculate_order_blocks(pair, ha)
-            self.indicator_engine.calculate_fair_value_gaps(pair, ha)
-            self.indicator_engine.calculate_rsi(pair, ha)
-            self.indicator_engine.calculate_adx(pair, ha)
+            await asyncio.to_thread(self._run_indicators, pair, ha)
 
-        # Cache warmed SMA arrays for all MA periods so _refresh_chart reads O(1).
-        # Computed from the full HA history (same source as chart's compute_data).
-        _ha_closes = np.array([c[4] for c in ha])
-        _cached_mas = {}
-        for _p in MA_PERIODS:
-            if len(_ha_closes) >= _p:
-                _cached_mas[_p] = np.convolve(
-                    _ha_closes, np.ones(_p) / _p, mode='valid')
-        if _cached_mas:
-            self._ma_cache[(pair, timeframe)] = _cached_mas
+        # ── Step 4: MA cache (np.convolve × N_periods) ───────────────────────
+        ma_cache = await asyncio.to_thread(self._compute_ma_cache, ha)
+        if ma_cache:
+            self._ma_cache[(pair, timeframe)] = ma_cache
 
+        # ── Step 5: Signal check + order fire (asyncio thread — uses ensure_future) ──
         if is_trading_pair and timeframe == self.signal_tf and self.running and not self.paused:
             conf_tf = _CONF_TF_MAP.get(self.signal_tf, '1m')
-            # Capital gates — matched to what _place_order will actually accept.
-            # BUY needs USD (bot_balance or bot_pair_alloc >= reserve).
-            # SELL needs coins (bot_exposure or bot_coin_qty > 0).
             _spendable = max(0, max(self.bot_pair_alloc.get(pair, 0),
                                      self.bot_balance) - MINIMUM_RESERVE)
             _can_buy  = _spendable >= 5.0
@@ -4543,7 +4586,6 @@ class Dashboard(ctk.CTkFrame):
                          or self.bot_coin_qty.get(pair, 0) > 0
                          or self.bot_bought_qty.get(pair, 0) > 0)
             cap = _can_buy or _can_sell
-            # Log capital state on every signal-TF candle close for full traceability
             self.log_message(
                 f"Candle close  {pair}/{timeframe}  "
                 f"can_buy={_can_buy}  can_sell={_can_sell}  locked={pair in self.order_locks}  "
@@ -4559,12 +4601,10 @@ class Dashboard(ctk.CTkFrame):
                 sig = (self.strategy.calculate_signals(pair, ha, conf_candles) or
                        self.strategy.calculate_breakout(pair, ha))
                 raw_sig = sig['action'] if sig else 'none'
-                # Filter by user's signal direction setting
                 if sig and self.signal_direction == 'Buy Only'  and sig['action'] != 'buy':
                     sig = None
                 if sig and self.signal_direction == 'Sell Only' and sig['action'] != 'sell':
                     sig = None
-                # Drop signals for which we have no matching capital
                 if sig and sig['action'] == 'buy'  and not _can_buy:
                     self.log_message(
                         f"Signal {pair} BUY suppressed — no USD capital  "
@@ -4584,32 +4624,31 @@ class Dashboard(ctk.CTkFrame):
                         "info")
                 if sig:
                     self.order_locks[pair] = time.time()
-                    self._last_signal_source  = sig['source']
+                    self._last_signal_source = sig['source']
                     self.log_message(
                         f"► SIGNAL [{sig['source']}] {sig['action'].upper()} {pair} "
                         f"@ {format_price(sig['price'])}  "
                         f"conf_candles={len(conf_candles)}  tf={timeframe}→{conf_tf}",
                         "trade")
-                    async def _place_with_timeout(_pair=pair, _action=sig['action']):
+                    _action = sig['action']
+                    async def _place_with_timeout(_pair=pair, _act=_action):
                         try:
                             await asyncio.wait_for(
-                                self._place_order(_pair, _action, fast_exec=True),
+                                self._place_order(_pair, _act, fast_exec=True),
                                 timeout=300)
                         except asyncio.TimeoutError:
                             logger.error(
                                 f"_place_order hard timeout 300s — releasing lock for {_pair}")
                             self.order_locks.pop(_pair, None)
-                    asyncio.run_coroutine_threadsafe(_place_with_timeout(), self.loop)
+                    asyncio.ensure_future(_place_with_timeout())
             elif pair in self.order_locks:
                 self.log_message(
                     f"Signal check skipped — {pair} order lock active", "info")
 
-        # Signal chart needs redraw — picked up by _chart_live_tick (no after() storm)
+        # ── Step 6: Notify Tk of dirty state (tiny callback — no heavy work) ─
+        self._pair_cards_dirty = True   # GIL-safe bool; asyncio thread is fine
         if self.root_alive:
-            if (self.chart_pair_var.get() == pair and
-                    self.chart_tf_var.get() == timeframe):
-                self._chart_dirty = True
-            self._pair_cards_dirty = True
+            self.root.after(0, self._mark_chart_dirty, pair, timeframe)
 
     # ── WebSocket ticker ──────────────────────────────────────────────────────
     async def _websocket_loop(self):
@@ -4704,10 +4743,12 @@ class Dashboard(ctk.CTkFrame):
                                     # Cap to top 50 levels each side
                                     _ob["bids"] = _ob["bids"][:50]
                                     _ob["asks"] = _ob["asks"][:50]
-                                    # Update order book popup if open for this pair
+                                    # Update order book popup if open — throttled to 1 pending update
                                     if (self._ob_window is not None and
-                                            getattr(self, '_ob_pair', '') == _ev_pid):
+                                            getattr(self, '_ob_pair', '') == _ev_pid and
+                                            not self._ob_update_pending):
                                         if self.root_alive:
+                                            self._ob_update_pending = True
                                             self.root.after(0, self._update_ob_display)
                                 continue
 
@@ -4829,9 +4870,8 @@ class Dashboard(ctk.CTkFrame):
         history = self.price_history[pair]
         if len(history) < SURGE_WINDOW:
             return
-        ticks   = list(history)
-        oldest  = ticks[-SURGE_WINDOW]
-        newest  = ticks[-1]
+        oldest  = history[-SURGE_WINDOW]
+        newest  = history[-1]
         if oldest <= 0:
             return
         move = (newest - oldest) / oldest   # signed % move
@@ -5003,10 +5043,14 @@ class Dashboard(ctk.CTkFrame):
                         await self._close_trade(tid, cur, reason)
 
                 # Clean up state for closed trades
-                for gone in set(_last_log) - {tid for tid, _ in active}:
+                _prev_tids = set(_last_log)
+                for gone in _prev_tids - {tid for tid, _ in active}:
                     _last_log.pop(gone, None)
 
-                if self.root_alive:
+                # Only push Tk updates when trade state or metrics actually changed.
+                _active_tids = {tid for tid, _ in active}
+                _tids_changed = _active_tids != _prev_tids
+                if self.root_alive and (active or _tids_changed):
                     self.root.after(0, self._refresh_trade_rows)
                     self.root.after(0, self._update_metrics)
                 await asyncio.sleep(5)
@@ -5075,6 +5119,19 @@ class Dashboard(ctk.CTkFrame):
                         f"Buy {pair} skipped — spendable ${amount_usd:.2f} "
                         f"(${avail_funds:.2f} − reserve ${MINIMUM_RESERVE:.2f}) "
                         f"below $5.00 minimum", "warn")
+                    return
+                # Fee guard: TP profit must beat the round-trip maker fee (buy + sell).
+                # Uses the actual 0.6%/side fee so the threshold scales naturally
+                # with position size — a $500 position needs $6 TP, a $200 needs $2.40.
+                # Blocks entries where ATR is too tight to clear fees.
+                _round_trip_fee = 2.0 * FEE_PCT * amount_usd
+                _tp_profit_usd  = tp_pct * amount_usd
+                if _tp_profit_usd <= _round_trip_fee:
+                    self.log_message(
+                        f"Buy {pair} skipped — TP ${_tp_profit_usd:.2f} "
+                        f"≤ round-trip fee ${_round_trip_fee:.2f} "
+                        f"(tp={tp_pct*100:.2f}%  fee floor={FEE_PCT*2*100:.1f}%)",
+                        "warn")
                     return
                 total_cap  = avail_funds + sum(self.bot_exposure.values())
                 if self.bot_exposure[pair] + amount_usd > MAX_EXPOSURE_PER_PAIR * total_cap:
@@ -5586,13 +5643,11 @@ class Dashboard(ctk.CTkFrame):
                 bot_bought = self.bot_bought_qty.get(pair, 0)
                 bot_exp    = self.bot_exposure.get(pair, 0)
                 total_q    = coin_qty + bot_bought
-                if total_q > 0:
-                    user_frac = coin_qty / total_q
-                    bot_frac  = 1.0 - user_frac
-                    self.bot_balance          += proceeds * user_frac
-                    self.bot_pair_alloc[pair] += proceeds * bot_frac
-                else:
-                    self.bot_pair_alloc[pair] += proceeds
+                # All proceeds return to this pair's allocation regardless of
+                # whether the coins were user-allocated or bot-bought.  This
+                # prevents proceeds from an XCN sell cross-deploying into BTC/ETH
+                # via the shared bot_balance pool.
+                self.bot_pair_alloc[pair] += proceeds
                 drained_user = min(qty, coin_qty)
                 drained_bot  = min(qty - drained_user, bot_bought)
                 self.bot_coin_qty[pair]   = max(0, coin_qty - drained_user)
