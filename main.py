@@ -2009,14 +2009,18 @@ class Dashboard(ctk.CTkFrame):
             else:
                 self._last_sig_frame.pack_forget()
 
-            # Charts header allocation
-            cur_pair = self.chart_pair_var.get()
-            pa = self.bot_pair_alloc.get(cur_pair, 0)
-            self.chart_liquid_lbl.configure(text=f"Liquid  ${liquid_usd:,.2f}")
-            self.chart_bot_lbl.configure(
-                text=f"{cur_pair.split('-')[0]}  ${pa:,.2f}" if pa > 0 else
-                     f"{cur_pair.split('-')[0]}  —",
-                text_color=C_ACCENT2 if pa > 0 else C_MUTED)
+            # Charts header allocation — guarded separately; page is lazy-loaded
+            if hasattr(self, 'chart_liquid_lbl') and hasattr(self, 'chart_bot_lbl'):
+                try:
+                    cur_pair = self.chart_pair_var.get()
+                    pa = self.bot_pair_alloc.get(cur_pair, 0)
+                    self.chart_liquid_lbl.configure(text=f"Liquid  ${liquid_usd:,.2f}")
+                    self.chart_bot_lbl.configure(
+                        text=f"{cur_pair.split('-')[0]}  ${pa:,.2f}" if pa > 0 else
+                             f"{cur_pair.split('-')[0]}  —",
+                        text_color=C_ACCENT2 if pa > 0 else C_MUTED)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -2145,11 +2149,9 @@ class Dashboard(ctk.CTkFrame):
         """
         if not self.root_alive:
             return
-        try:
-            # While a modal dialog is open, skip all heavy widget work so the
-            # Tk event queue stays clear and popup clicks feel instant.
-            # Data keeps accumulating in deques and flushes when the modal closes.
-            if not self._modal_open:
+        # ── Heavy widget updates (skipped while any modal is open) ──────────
+        if not self._modal_open:
+            try:
                 # ── Topbar tickers ────────────────────────────────────────────
                 if self._topbar_dirty:
                     for _pid in self._topbar_dirty:
@@ -2204,12 +2206,19 @@ class Dashboard(ctk.CTkFrame):
                     self.activity_box.configure(state="disabled")
                     if not self._act_queue:
                         self.activity_box.see("end")
-            # ── Bot status refresh every 2s (20 × 100ms ticks) ──────────────
+            except Exception:
+                pass
+
+        # ── Bot status refresh every 2s — runs unconditionally, own try block ──
+        # Isolated from the widget block above so a widget exception can never
+        # prevent the counter from incrementing or _update_metrics from firing.
+        try:
             self._ui_tick_count += 1
             if self._ui_tick_count % 20 == 0:
                 self._update_metrics()
         except Exception:
             pass
+
         self.root.after(100, self._ui_tick)
 
     def _trade_pl_tick(self):
