@@ -4616,8 +4616,10 @@ class Dashboard(ctk.CTkFrame):
         # ── Step 5: Signal check + order fire (asyncio thread — uses ensure_future) ──
         if is_trading_pair and timeframe == self.signal_tf and self.running and not self.paused:
             conf_tf = _CONF_TF_MAP.get(self.signal_tf, '1m')
-            _spendable = max(0, max(self.bot_pair_alloc.get(pair, 0),
-                                     self.bot_balance) - MINIMUM_RESERVE)
+            # Only pair-specific allocation gates a buy — bot_balance is a
+            # staging pool that requires explicit per-pair allocation before
+            # the bot can deploy it.  Prevents XCN allocation funding BTC trades.
+            _spendable = max(0, self.bot_pair_alloc.get(pair, 0) - MINIMUM_RESERVE)
             _can_buy  = _spendable >= 5.0
             _can_sell = (self.bot_exposure[pair] > 0
                          or self.bot_coin_qty.get(pair, 0) > 0
@@ -5148,15 +5150,13 @@ class Dashboard(ctk.CTkFrame):
 
             sell_qty_base = 0  # actual coins to sell; set in sell branch below
             if side == 'buy':
-                # Prefer per-coin allocation; fall back to general bot_balance
-                pair_funds    = self.bot_pair_alloc.get(pair, 0)
-                general_funds = self.bot_balance
+                # Only pair-specific allocation can fund a buy.
+                # bot_balance is a staging pool — must be explicitly moved to a
+                # pair via the Allocate dialog before the bot can deploy it.
+                pair_funds = self.bot_pair_alloc.get(pair, 0)
                 if pair_funds >= MINIMUM_RESERVE:
                     avail_funds    = pair_funds
                     use_pair_alloc = True
-                elif general_funds >= MINIMUM_RESERVE:
-                    avail_funds    = general_funds
-                    use_pair_alloc = False
                 else:
                     self.log_message(
                         f"No funds allocated for {pair} — allocate via Dashboard or Charts",
@@ -5402,28 +5402,17 @@ class Dashboard(ctk.CTkFrame):
 
             spent = qty_filled * filled_price
             if side == 'buy':
-                if use_pair_alloc:
-                    self.bot_pair_alloc[pair] = max(0, self.bot_pair_alloc[pair] - spent)
-                else:
-                    self.bot_balance = max(0, self.bot_balance - spent)
+                # Always pair-specific — use_pair_alloc is always True now
+                self.bot_pair_alloc[pair] = max(0, self.bot_pair_alloc[pair] - spent)
                 self.bot_exposure[pair]   += spent
                 self.bot_bought_qty[pair] += qty_filled
             else:
-                # Route proceeds to the correct bucket based on coin source:
-                # bot_coin_qty (user-allocated coins) → bot_balance
-                # bot_bought_qty (bot-purchased coins) → bot_pair_alloc / bot_balance
+                # All sell proceeds return to the pair's own allocation bucket.
+                # Never credit bot_balance — that would let a different pair
+                # spend the proceeds without an explicit user re-allocation.
                 coin_qty   = self.bot_coin_qty.get(pair, 0)
                 bot_bought = self.bot_bought_qty.get(pair, 0)
-                bot_exp    = self.bot_exposure.get(pair, 0)
-                total_qty  = coin_qty + bot_bought
-                if total_qty > 0:
-                    user_frac = coin_qty / total_qty
-                    bot_frac  = 1.0 - user_frac
-                    self.bot_balance          += spent * user_frac
-                    self.bot_pair_alloc[pair] += spent * bot_frac
-                else:
-                    self.bot_balance += spent
-                    bot_frac = 1.0
+                self.bot_pair_alloc[pair] += spent
                 # Drain user coins first, then bot-bought coins
                 drained_user = min(qty_filled, coin_qty)
                 drained_bot  = min(qty_filled - drained_user, bot_bought)
