@@ -347,7 +347,7 @@ class IndicatorEngine:
             'adx':             0.0,
         })
 
-    def calculate_support_resistance(self, pair, candles, bin_width=0.001, min_volume=1000):
+    def calculate_support_resistance(self, pair, candles, bin_width=0.001):
         if len(candles) < 10:
             return
         closes  = np.array([c[4] for c in candles])
@@ -355,6 +355,9 @@ class IndicatorEngine:
         price_range = closes.max() - closes.min()
         if price_range == 0:
             return
+        # Scale min_volume threshold to 10% of median candle volume so S/R
+        # zones work for low-volume pairs (XCN) and high-volume ones (BTC) alike.
+        min_volume = float(np.median(volumes)) * 0.10 if len(volumes) else 1.0
         bins = max(2, int(1 / bin_width))
         hist, edges = np.histogram(closes, bins=bins, weights=volumes)
         peaks = [

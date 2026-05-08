@@ -631,20 +631,28 @@ class Dashboard(ctk.CTkFrame):
 
         # ── Pre-populate candle history from disk cache ───────────────────────
         # Charts render immediately on startup; live API fills in newer candles.
+        # Discard cached TFs whose last candle is stale (>48h for daily, >6h for others).
+        _STALE_LIMITS = {'1d': 48 * 3600, '1h': 6 * 3600, '5m': 6 * 3600, '1m': 6 * 3600}
+        _now_ts = int(time.time() * 1000)
         _cache = load_candle_cache()
         for tf, pairs in _cache.items():
             if tf not in self.candle_history:
                 continue
+            _stale_limit_ms = _STALE_LIMITS.get(tf, 6 * 3600) * 1000
             for pair, rows in pairs.items():
-                if rows:
-                    self.candle_history[tf][pair].extend(rows)
-                    # Seed percent_change and pct_24h from cached data
-                    if len(rows) >= 2:
-                        op, lc = rows[0][4], rows[-1][4]
-                        self.percent_change[tf][pair] = ((lc - op) / op * 100) if op else 0
-                        if tf == '1d':
-                            pc, lc2 = rows[-2][4], rows[-1][4]
-                            self.pct_24h[pair] = ((lc2 - pc) / pc * 100) if pc else 0
+                if not rows:
+                    continue
+                _last_candle_ts = rows[-1][0]   # ms timestamp
+                if _now_ts - _last_candle_ts > _stale_limit_ms:
+                    continue   # too old — skip, live fetch will repopulate
+                self.candle_history[tf][pair].extend(rows)
+                # Seed percent_change and pct_24h from cached data
+                if len(rows) >= 2:
+                    op, lc = rows[0][4], rows[-1][4]
+                    self.percent_change[tf][pair] = ((lc - op) / op * 100) if op else 0
+                    if tf == '1d':
+                        pc, lc2 = rows[-2][4], rows[-1][4]
+                        self.pct_24h[pair] = ((lc2 - pc) / pc * 100) if pc else 0
 
         self._build_layout()
         # Initialize chart selection vars before backend loops start so
@@ -667,7 +675,7 @@ class Dashboard(ctk.CTkFrame):
             return
         if self._resize_timer_id is not None:
             self.root.after_cancel(self._resize_timer_id)
-        self._resize_timer_id = self.root.after(80, self.root.update_idletasks)
+        self._resize_timer_id = self.root.after(200, self.root.update_idletasks)
 
     # ── Layout ────────────────────────────────────────────────────────────────
     def _build_layout(self):
@@ -1238,7 +1246,7 @@ class Dashboard(ctk.CTkFrame):
 
         # Thin animated loading bar — shown while chart is rendering or candles loading
         self._chart_load_bar = ctk.CTkProgressBar(
-            cf, height=2, corner_radius=0,
+            cf, height=4, corner_radius=0,
             fg_color=C_CHART_BG, progress_color=C_ACCENT,
             mode="indeterminate")
         # Not packed yet — shown dynamically by _start_loading()
@@ -2205,25 +2213,13 @@ class Dashboard(ctk.CTkFrame):
         self.root.after(100, self._ui_tick)
 
     def _trade_pl_tick(self):
-        """2s live P&L update for open trades — keeps the Trades tab current."""
+        """2s display refresh for the Trades tab — reads cached P&L from _monitor_loop.
+        Does NOT write trade['pl']; _monitor_loop is the sole authoritative writer."""
         if not self.root_alive:
             return
         try:
-            if self.trade_history:
-                updated = False
-                for trade in self.trade_history.values():
-                    if trade.get('event') != 'trade':
-                        continue
-                    pair = trade['symbol']
-                    cur  = self.live_prices.get(pair, 0)
-                    if cur > 0:
-                        new_pl = (cur - trade['entry_price']) * trade['quantity']
-                        if abs(new_pl - trade.get('pl', 0)) > 0.001:
-                            trade['current_price'] = cur
-                            trade['pl']            = new_pl
-                            updated = True
-                if updated and self._active_page == 'trades':
-                    self._refresh_trade_rows()
+            if self.trade_history and self._active_page == 'trades':
+                self._refresh_trade_rows()
         except Exception:
             pass
         self.root.after(2000, self._trade_pl_tick)
@@ -3018,12 +3014,18 @@ class Dashboard(ctk.CTkFrame):
         canvas.draw() does the expensive CPU rasterization here, then
         schedules the Tk display update via after(0, _show) internally.
         """
+        ok = False
         try:
             self.chart_canvas.draw()
-        except Exception:
-            pass
+            ok = True
+        except Exception as e:
+            logger.error(f"Chart render failed: {e}", exc_info=True)
         if self.root_alive:
-            self.root.after(0, self._on_render_complete)
+            if ok:
+                self.root.after(0, self._on_render_complete)
+            else:
+                # Release the rendering lock so future ticks can retry
+                self.root.after(0, self._on_render_failed)
 
     def _on_render_complete(self):
         """Main thread callback: save blit background then draw price line."""
@@ -3048,6 +3050,12 @@ class Dashboard(ctk.CTkFrame):
             self._refresh_chart()
         else:
             self._stop_loading()
+
+    def _on_render_failed(self):
+        """Main-thread callback when _bg_render's canvas.draw() throws — release lock."""
+        self._chart_rendering = False
+        self._chart_bg_valid  = False
+        self._stop_loading()
 
     def _chart_blit_price(self):
         """Sub-5ms price line update: restore saved background + draw line + blit."""
@@ -3100,7 +3108,9 @@ class Dashboard(ctk.CTkFrame):
         except Exception:
             pass
         self._spinner_frame += 1
-        self.root.after(80, self._spinner_tick)
+        # Step one braille frame per monitor refresh (~16ms @60Hz, ~7ms @144Hz)
+        _spin_ms = max(16, int(1000 / _MONITOR_HZ))
+        self.root.after(_spin_ms, self._spinner_tick)
 
     # ── Order book popup ──────────────────────────────────────────────────────
     def _open_orderbook(self):
@@ -3194,31 +3204,32 @@ class Dashboard(ctk.CTkFrame):
         bids = ob['bids'][:20]
         asks = ob['asks'][:20]
 
-        def _build_lines(levels, reverse=False):
+        def _build_lines(levels, reverse=False, negate=False):
             rows  = list(reversed(levels)) if reverse else levels
             lines = []
             cum   = 0.0
-            for p, q in rows:
+            for raw_p, q in rows:
+                p = -raw_p if negate else raw_p
                 cum += q
                 lines.append(f"  {format_price(p):<18}  {q:>10.4f}  {cum:>12.4f}\n")
             return "".join(lines)
 
         # Single delete+insert per widget — far cheaper than 20 .configure() calls
-        for widget, levels, rev in (
-            (self._ob_ask_text, asks, True),
-            (self._ob_bid_text, bids, False),
+        for widget, levels, rev, neg in (
+            (self._ob_ask_text, asks, True,  False),
+            (self._ob_bid_text, bids, False, True),   # bids stored as neg-price
         ):
             try:
                 widget.configure(state="normal")
                 widget.delete("1.0", "end")
-                widget.insert("end", _build_lines(levels, rev))
+                widget.insert("end", _build_lines(levels, rev, neg))
                 widget.configure(state="disabled")
             except Exception:
                 pass
 
         try:
-            best_ask = asks[0][0] if asks else 0
-            best_bid = bids[0][0] if bids else 0
+            best_ask = asks[0][0]  if asks else 0
+            best_bid = -bids[0][0] if bids else 0   # bids stored as neg-price
             mid    = (best_bid + best_ask) / 2 if best_bid and best_ask else 0
             spread = best_ask - best_bid if best_bid and best_ask else 0
             self._ob_mid_lbl.configure(text=format_price(mid) if mid else "—")
@@ -4285,21 +4296,28 @@ class Dashboard(ctk.CTkFrame):
 
     async def _wait_for_fill(self, order_id: str, timeout_s: int = 90) -> dict | None:
         """Poll get_order every 5s until FILLED or timeout.
-        Returns order dict on fill, None on timeout/cancel/error."""
+        Returns order dict on fill, None on timeout/cancel/permanent error."""
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             await asyncio.sleep(5)
             try:
-                resp = await asyncio.to_thread(self.client.get_order, order_id=order_id)
-                raw  = resp.to_dict()
+                resp  = await asyncio.to_thread(self.client.get_order, order_id=order_id)
+                raw   = resp.to_dict()
                 order = raw.get('order', raw)
                 status = (order.get('status') or '').upper()
                 if status == 'FILLED':
                     return order
                 if status in ('CANCELLED', 'EXPIRED', 'FAILED'):
+                    self.log_message(f"Order {order_id} terminal status: {status}", "warn")
                     return None
             except Exception as e:
-                self.log_message(f"Order poll {order_id}: {e}", "warn")
+                err_str = str(e).lower()
+                # Permanent errors (auth, not-found) — no point retrying
+                if any(code in err_str for code in ('403', '404', 'forbidden', 'not found', 'unauthorized')):
+                    self.log_message(f"Order poll {order_id} permanent error — aborting: {e}", "error")
+                    return None
+                # Transient errors (network, 5xx) — keep polling
+                self.log_message(f"Order poll {order_id} transient error — retrying: {e}", "warn")
         return None
 
     async def _fetch_balance(self):
@@ -4346,13 +4364,22 @@ class Dashboard(ctk.CTkFrame):
             self.usdc_balance = usdc
             self.usdt_balance = usdt
 
-            # Clamp bot_balance + bot_pair_alloc to actual liquid USD.
+            # Clamp bot funds to actual liquid USD — drain general pool first,
+            # then pair allocs proportionally.  Avoids the precision-loss of
+            # multiplying every allocation by a scale factor on every fetch.
             _bot_usd = self.bot_balance + sum(self.bot_pair_alloc.values())
-            if _bot_usd > usd and _bot_usd > 0:
-                _scale = usd / _bot_usd
-                self.bot_balance = self.bot_balance * _scale
-                for _p in list(self.bot_pair_alloc.keys()):
-                    self.bot_pair_alloc[_p] *= _scale
+            if _bot_usd > usd + 0.01 and _bot_usd > 0:
+                _excess = _bot_usd - usd
+                _drain  = min(_excess, self.bot_balance)
+                self.bot_balance = max(0.0, self.bot_balance - _drain)
+                _excess -= _drain
+                if _excess > 0.01:
+                    # General pool exhausted — trim pair allocs proportionally
+                    _pair_total = sum(self.bot_pair_alloc.values())
+                    if _pair_total > 0:
+                        _scale = (_pair_total - _excess) / _pair_total
+                        for _p in list(self.bot_pair_alloc.keys()):
+                            self.bot_pair_alloc[_p] = max(0.0, self.bot_pair_alloc[_p] * _scale)
 
             # Auto-clear stale bot positions: if the bot thinks it holds coins
             # (bot_bought_qty > 0) but the exchange shows < 5% of that value,
@@ -4553,10 +4580,9 @@ class Dashboard(ctk.CTkFrame):
         new_ones = [c for c in ha if c[0] > last_ts]
         if new_ones:
             existing.extend(new_ones)
-        self.log_message(
-            f"Candle ingest  {pair}/{timeframe}  "
-            f"raw={len(candles)}  ha={len(ha)}  new={len(new_ones)}  "
-            f"total_stored={len(existing)}", "monitor")
+            self.log_message(
+                f"Candle ingest  {pair}/{timeframe}  "
+                f"new={len(new_ones)}  total={len(existing)}", "monitor")
 
         if len(ha) >= 2:
             op, np_ = ha[0][4], ha[-1][4]
@@ -4568,7 +4594,9 @@ class Dashboard(ctk.CTkFrame):
         is_trading_pair = pair in TRADING_PAIRS
 
         # ── Step 3: Indicator calculations (O(N²) order blocks etc.) ─────────
-        if is_trading_pair and (timeframe == self.signal_tf or timeframe == '1h'):
+        # Run for all trading-pair TFs so every chart view (1m, 5m, 1h, 1d)
+        # shows live RSI / ADX / S-R / OBs / FVGs, not just signal_tf + 1h.
+        if is_trading_pair:
             await asyncio.to_thread(self._run_indicators, pair, ha)
 
         # ── Step 4: MA cache (np.convolve × N_periods) ───────────────────────
@@ -4598,6 +4626,12 @@ class Dashboard(ctk.CTkFrame):
                 "monitor")
             if cap and pair not in self.order_locks:
                 conf_candles = list(self.candle_history[conf_tf][pair])
+                _p_slow = sorted(MA_PERIODS)[:2][1] if len(MA_PERIODS) >= 2 else MA_PERIODS[0]
+                if len(conf_candles) < _p_slow:
+                    self.log_message(
+                        f"Signal check skipped — {conf_tf} only has {len(conf_candles)} candles "
+                        f"(need {_p_slow})", "monitor")
+                    conf_candles = []   # force calculate_signals to return None
                 sig = (self.strategy.calculate_signals(pair, ha, conf_candles) or
                        self.strategy.calculate_breakout(pair, ha))
                 raw_sig = sig['action'] if sig else 'none'
@@ -4687,7 +4721,8 @@ class Dashboard(ctk.CTkFrame):
                         f"channels=[ticker, ticker_batch, level2]", "trade")
 
                     _ws_ticks = 0
-                    _ws_last_log = time.time()
+                    _ws_last_log  = time.time()
+                    _ws_last_data = time.time()   # track last real ticker/l2 message
                     while self.running:
                         try:
                             raw  = await asyncio.wait_for(ws.recv(), timeout=30)
@@ -4698,10 +4733,18 @@ class Dashboard(ctk.CTkFrame):
                                     f"WS bad JSON (skipping frame): {_je}", "warn")
                                 continue
 
-                            # Renew JWT every 90s (token valid for 120s)
+                            # Renew JWT every 90s (token valid for 120s) and
+                            # re-subscribe so the new token is active before expiry.
                             if time.time() - self._ws_jwt_ts > 90:
                                 jwt = make_ws_jwt(self.api_key, self.api_secret)
                                 self._ws_jwt_ts = time.time()
+                                for _ch in ("ticker", "ticker_batch", "level2"):
+                                    await ws.send(json.dumps({
+                                        "type":        "subscribe",
+                                        "product_ids": TRADING_PAIRS,
+                                        "channel":     _ch,
+                                        "jwt":         jwt,
+                                    }))
 
                             chan = data.get("channel", "")
 
@@ -4721,28 +4764,26 @@ class Dashboard(ctk.CTkFrame):
                                             _qq = float(upd.get("new_quantity", 0))
                                         except (TypeError, ValueError):
                                             continue
-                                        _book_side = _ob["bids"] if _side == "bid" else _ob["asks"]
+                                        # bids stored desc (highest first) as neg-price tuples
+                                        # asks stored asc (lowest first) as pos-price tuples
+                                        # bisect.insort used consistently for both sides
+                                        if _side == "bid":
+                                            _book_side = _ob["bids"]
+                                            _key = (-_pp, _qq)
+                                        else:
+                                            _book_side = _ob["asks"]
+                                            _key = (_pp, _qq)
                                         # Remove stale entry for this price level
                                         _bi = next((i for i, x in enumerate(_book_side)
-                                                    if x[0] == _pp), -1)
+                                                    if x[0] == _key[0]), -1)
                                         if _bi >= 0:
                                             _book_side.pop(_bi)
                                         if _qq > 0:
-                                            if _side == "bid":
-                                                # bids: descending — binary search in neg-price space
-                                                _lo, _hi = 0, len(_book_side)
-                                                while _lo < _hi:
-                                                    _m = (_lo + _hi) // 2
-                                                    if _book_side[_m][0] > _pp:
-                                                        _lo = _m + 1
-                                                    else:
-                                                        _hi = _m
-                                                _book_side.insert(_lo, (_pp, _qq))
-                                            else:
-                                                bisect.insort(_book_side, (_pp, _qq))
+                                            bisect.insort(_book_side, _key)
                                     # Cap to top 50 levels each side
                                     _ob["bids"] = _ob["bids"][:50]
                                     _ob["asks"] = _ob["asks"][:50]
+                                    _ws_last_data = time.time()
                                     # Update order book popup if open — throttled to 1 pending update
                                     if (self._ob_window is not None and
                                             getattr(self, '_ob_pair', '') == _ev_pid and
@@ -4789,6 +4830,7 @@ class Dashboard(ctk.CTkFrame):
                                                     _fc[4] = p               # close
                                         self._pair_cards_dirty = True
                                         self._topbar_dirty.add(pid)
+                                        _ws_last_data = time.time()
                                         if chan == "ticker":
                                             await self._check_surge(pid)
 
@@ -4808,6 +4850,11 @@ class Dashboard(ctk.CTkFrame):
                         except asyncio.TimeoutError:
                             self.log_message("WS recv timeout — sending ping", "info")
                             await ws.ping()
+                            # Force reconnect if no real data for >90s — subscription may have lapsed
+                            if time.time() - _ws_last_data > 90:
+                                self.log_message(
+                                    "WS: no ticker/l2 data for >90s — reconnecting to refresh subscription", "warn")
+                                break
                         except Exception as e:
                             self.log_message(f"WS recv error: {e}", "warn")
                             logger.error("Unhandled exception", exc_info=True)
